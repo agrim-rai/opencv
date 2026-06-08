@@ -2,11 +2,12 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
+#ifndef OPENCV_SLAM_TEST_PRECOMP_HPP
+#define OPENCV_SLAM_TEST_PRECOMP_HPP
 
-#ifndef __OPENCV_TEST_SLAM_PRECOMP_HPP__
-#define __OPENCV_TEST_SLAM_PRECOMP_HPP__
+#include "opencv2/ts.hpp"
+#include "opencv2/slam.hpp"
+#include "opencv2/3d.hpp"
+#include "opencv2/features.hpp"
 
-#include <opencv2/ts.hpp>
-#include <opencv2/slam.hpp>
-
-#endif // __OPENCV_TEST_SLAM_PRECOMP_HPP__
+#endif

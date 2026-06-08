@@ -2,6 +2,6 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-#include "perf_precomp.hpp"
+#include "test_precomp.hpp"
 
-CV_PERF_TEST_MAIN(slam)
+CV_TEST_MAIN("cv")

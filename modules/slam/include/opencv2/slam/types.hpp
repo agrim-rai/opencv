@@ -2,69 +2,76 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-
 #ifndef OPENCV_SLAM_TYPES_HPP
 #define OPENCV_SLAM_TYPES_HPP
 
-#include <opencv2/core.hpp>
+#include "opencv2/core.hpp"
+#include "opencv2/core/types.hpp"
+
 #include <map>
 #include <vector>
 
-namespace cv { namespace slam {
+namespace cv {
+namespace slam {
 
-/** @brief Current state of the VisualOdometry pipeline.
-    @ingroup slam_odometry
-*/
+//! @addtogroup slam
+//! @{
+
+/** @brief Lifecycle state of the visual odometry pipeline. */
 enum OdometryState
 {
-    NOT_INITIALIZED = 0, //!< No frames processed yet.
-    INITIALIZING    = 1, //!< Reference frame set; waiting for bootstrap.
-    TRACKING        = 2  //!< Map initialised; localising via PnP.
+    NOT_INITIALIZED = 0, //!< First frame ever, or just after a reset.
+    INITIALIZING    = 1, //!< Reference frame held; waiting for a second view with parallax.
+    TRACKING        = 2  //!< Map exists; localizing frame by frame.
 };
 
-/** @brief Feature data for one image frame.
-    @ingroup slam_odometry
-*/
-struct CV_EXPORTS_W_SIMPLE FrameFeatures
-{
-    std::vector<KeyPoint> keypoints;
-    Mat                   descriptors;
-    Size                  imageSize;
-};
-
+// Forward declarations (MapPoint and KeyFrame reference each other via pointers).
 struct MapPoint;
 struct KeyFrame;
 
-/** @brief A triangulated 3-D landmark owned by Map.
-    @ingroup slam_odometry
+/** @brief A 3D landmark in world coordinates, observed by one or more keyframes.
+
+Owned and lifetime-managed by @ref Map.  Raw pointers remain valid until the
+point is removed via @ref Map::removeMapPoint or @ref Map::clear.
 */
-struct CV_EXPORTS_W_SIMPLE MapPoint
+struct CV_EXPORTS MapPoint
 {
     int     id  = -1;
-    Point3d pos;
-    bool    bad = false;
+    Point3d pos { 0, 0, 0 };                      //!< World coordinates (x, y, z).
+    Mat     ref_desc;                              //!< Best descriptor across all observations.
 
-    std::map<KeyFrame*, int> observations; //!< Observing keyframe → keypoint index.
+    std::map<KeyFrame*, size_t> observations;      //!< keyframe -> keypoint index.
+
+    int  visible_count = 0;  //!< Times this point was projected into a tracking frame.
+    int  found_count   = 0;  //!< Times it was actually matched (quality = found/visible).
+    bool bad           = false; //!< Soft-delete flag; always check before use.
 };
 
-/** @brief A frame whose pose has been committed to the map.
-    @ingroup slam_odometry
+/** @brief A keyframe: 6-DoF pose, keypoints/descriptors, per-keypoint MapPoint links,
+and covisibility graph edges.
+
+Owned and lifetime-managed by @ref Map.
 */
-struct CV_EXPORTS_W_SIMPLE KeyFrame
+struct CV_EXPORTS KeyFrame
 {
-    int     id = -1;
-    Matx44d pose_cw; //!< World-to-camera transform (row-major 4x4).
+    int     id      = -1;
+    Matx44d pose_cw = Matx44d::eye();              //!< World -> camera 4×4 transform.
 
-    std::vector<KeyPoint> keypoints;
-    Mat                   descriptors;
-    std::vector<Point2f>  undist_kpts;
-    Size                  imageSize;
+    std::vector<KeyPoint>  keypoints;
+    Mat                    descriptors;            //!< NxD matrix; row i = descriptor for keypoints[i].
+    std::vector<Point2f>   undist_kpts;            //!< Undistorted pixel coords, parallel to keypoints.
+    Size                   imageSize;
 
-    std::vector<int>       kpt_to_mp;  //!< Map-point id per keypoint, -1 if unmatched.
-    std::vector<MapPoint*> mappoints;  //!< Direct pointer per keypoint, nullptr if unmatched.
+    std::vector<MapPoint*> mappoints;              //!< Parallel to keypoints; null = no 3D match yet.
 
-    std::vector<std::pair<KeyFrame*, int>> ordered_covisibility; //!< Neighbours by shared point count.
+    std::map<KeyFrame*, int>               covisibility;          //!< KF -> shared MapPoint count.
+    std::vector<std::pair<KeyFrame*, int>> ordered_covisibility;  //!< Same, sorted descending.
+
+    KeyFrame* parent = nullptr;  //!< Spanning-tree parent (used by pose-graph in M3).
+    Mat       global_desc;       //!< Place-recognition descriptor (filled by CosPlace in M3).
 };
+
+//! @}
 
 }} // namespace cv::slam
 

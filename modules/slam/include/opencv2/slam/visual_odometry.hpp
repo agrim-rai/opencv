@@ -2,100 +2,137 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-
 #ifndef OPENCV_SLAM_VISUAL_ODOMETRY_HPP
 #define OPENCV_SLAM_VISUAL_ODOMETRY_HPP
 
-#include "types.hpp"
-#include "map.hpp"
-#include "odometry_params.hpp"
-#include <opencv2/core.hpp>
-#include <opencv2/features.hpp>
+#include "opencv2/core.hpp"
+#include "opencv2/features.hpp"
 
-namespace cv { namespace slam {
+#include "opencv2/slam/types.hpp"
+#include "opencv2/slam/map.hpp"
+#include "opencv2/slam/odometry_params.hpp"
+
+#include <vector>
+
+namespace cv {
+namespace slam {
+
+//! @addtogroup slam
+//! @{
 
 /** @brief Monocular visual odometry pipeline.
 
-    Use in batch mode (process a whole folder) or frame-by-frame:
+Construct with @ref create supplying a folder of images, an output folder for
+artifacts, and the camera intrinsics; call @ref run to process the whole
+sequence and write outputs to disk. For incremental use, @ref processFrame
+feeds one frame at a time.
 
-    @code
-    auto vo = cv::slam::VisualOdometry::create(
-        detector, matcher, imagesFolder, outputFolder, K, dist, params);
-    vo->run();                  // batch
-    vo->processFrame(img);      // or incremental
-    @endcode
+State machine:
+- `NOT_INITIALIZED` -> first frame stored as reference, state advances to
+  `INITIALIZING`.
+- `INITIALIZING` -> for each subsequent frame, attempt H/F two-view
+  bootstrap (homography vs. fundamental scored by RH = nH/(nH+nE),
+  decomposed and triangulated). On success, two keyframes and the initial
+  map points are committed; state advances to `TRACKING`.
+- `TRACKING` -> per-frame localisation via motion-model (Stage B),
+  reference-KF descriptor match (Stage C), optical-flow (Stage D), and
+  local-map refinement (Stage E). Keyframes are promoted when the inlier
+  ratio drops or rotation/timeout conditions trigger. Tracking failure
+  rewinds the state to `INITIALIZING`.
 
-    Output files written by run() to outputFolder:
-    - trajectory.bin  — binary T_cw pose stream
-    - trajectory.txt  — camera centres in world coords
-    - images.txt      — COLMAP-compatible pose file
-    - map_points.txt  — 3-D point cloud
-    - keypoints.txt   — per-keyframe observations
-    - vo.log          — per-frame processing trace
-
-    All poses are world-to-camera (T_cw). Camera centre = -R^T * t.
-
-    @ingroup slam_odometry
+@ref run writes the following files into `outputFolder` (created if missing):
+- `trajectory.txt` — one camera center (Cx Cy Cz, world coordinates) per
+  successfully tracked frame.
+- `trajectory.bin` — binary dump: 4-byte magic "VOTR", int32 version, int32
+  pose count, then 16 doubles (T_cw row-major) per pose.
+- `images.txt` — COLMAP-style pose dump, one row per emitted pose:
+  `IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME` followed by an empty
+  POINTS2D[] line.
+- `map_points.txt` — `id X Y Z` per persisted map point.
+- `keypoints.txt` — keypoints for every keyframe (id, position, score).
+- `vo.log` — per-frame textual log of state transitions and map growth.
 */
-class CV_EXPORTS_W VisualOdometry : public Algorithm
+class CV_EXPORTS VisualOdometry
 {
 public:
-    VisualOdometry();
     virtual ~VisualOdometry();
 
     /** @brief Create a VisualOdometry instance.
-        @param detector      Feature detector + descriptor extractor.
-        @param matcher       Descriptor matcher.
-        @param imagesFolder  Input image folder used by run(). May be empty.
-        @param outputFolder  Artifact output folder. May be empty.
-        @param cameraMatrix  3x3 intrinsic matrix K.
-        @param distCoeffs    Distortion coefficients. Pass empty Mat for rectified input.
-        @param params        Odometry parameters.
+
+    @param detector       Feature detector/descriptor (e.g. @ref ALIKED).
+    @param matcher        Descriptor matcher (e.g. @ref LightGlueMatcher).
+    @param imagesFolder   Directory containing input images. Files are
+                          processed in sorted order; image extensions
+                          (.jpg/.jpeg/.png/.bmp/.tif/.tiff/.pgm/.ppm) are
+                          auto-detected.
+    @param outputFolder   Directory where @ref run will write its artifacts.
+                          Created if it does not exist. Pass an empty string
+                          to disable file output.
+    @param cameraMatrix   3x3 camera intrinsic matrix.
+    @param distCoeffs     Distortion coefficients (empty for no distortion).
+    @param params         Tunable parameters; see @ref OdometryParams.
     */
-    CV_WRAP static Ptr<VisualOdometry> create(
-        const Ptr<Feature2D>&         detector,
+    static Ptr<VisualOdometry> create(
+        const Ptr<Feature2D>& detector,
         const Ptr<DescriptorMatcher>& matcher,
-        const String&                 imagesFolder,
-        const String&                 outputFolder,
-        InputArray                    cameraMatrix,
-        InputArray                    distCoeffs,
-        const OdometryParams&         params = OdometryParams());
+        const String& imagesFolder,
+        const String& outputFolder,
+        InputArray cameraMatrix,
+        InputArray distCoeffs = noArray(),
+        const OdometryParams& params = OdometryParams());
 
-    /** @brief Process all images in imagesFolder and write output artifacts.
-        @return true if at least one pose was emitted.
-    */
-    CV_WRAP virtual bool run() = 0;
+    /** @brief Run the pipeline over every image in the configured folder,
+    writing trajectory / map / keypoints / log into the output folder.
 
-    /** @brief Process a single frame.
-        @return true if a pose was emitted.
-    */
-    CV_WRAP virtual bool processFrame(InputArray image) = 0;
+    @return true if at least one image was processed successfully. */
+    virtual bool run() = 0;
 
-    /** @brief Reset to NOT_INITIALIZED state and clear the map. */
-    CV_WRAP virtual void reset() = 0;
+    // --- Incremental API (for streaming use) --------------------------------
 
-    CV_WRAP virtual OdometryState                  getState()      const = 0;
-    CV_WRAP virtual Matx44d                        getLastPose()   const = 0;
-    CV_WRAP virtual Map&                           getMap()              = 0;
-    CV_WRAP virtual const std::vector<Matx44d>&   getTrajectory() const = 0;
+    /** Feed the next image into the pipeline.
+        @return true if a world->camera pose was emitted for this frame. */
+    virtual bool processFrame(InputArray image) = 0;
 
-    CV_WRAP virtual OdometryParams getParams() const = 0;
-    CV_WRAP virtual void           setParams(const OdometryParams& params) = 0;
+    /** Reset to NOT_INITIALIZED. Clears the map and trajectory. */
+    virtual void reset() = 0;
 
-    /** @brief Enable/disable pose-only BA after each PnP step. No-op without g2o. Default: true. */
-    CV_WRAP virtual void setPoseOptimization(bool enable) = 0;
-    CV_WRAP virtual bool getPoseOptimization() const = 0;
+    // --- Accessors ----------------------------------------------------------
 
-    /** @brief Enable/disable local BA at each keyframe. No-op without g2o. Default: true. */
-    CV_WRAP virtual void setLocalBA(bool enable) = 0;
-    CV_WRAP virtual bool getLocalBA() const = 0;
+    virtual OdometryState getState() const = 0;
+    virtual Matx44d getLastPose() const = 0;
+    virtual const Map& getMap() const = 0;
+    virtual const std::vector<Matx44d>& getTrajectory() const = 0;
 
-    CV_WRAP virtual String getImagesFolder() const = 0;
-    CV_WRAP virtual void   setImagesFolder(const String& path) = 0;
+    virtual const OdometryParams& getParams() const = 0;
+    virtual void setParams(const OdometryParams& params) = 0;
 
-    CV_WRAP virtual String getOutputFolder() const = 0;
-    CV_WRAP virtual void   setOutputFolder(const String& path) = 0;
+    // --- Modular backend toggles --------------------------------------------
+    // The front-end (bootstrap, PnP tracking, map growth) always runs; these
+    // switches decide whether the g2o refinement runs on top of it. Both
+    // default to enabled and may be flipped at any time between frames. They
+    // have no effect if the module was built without g2o.
+
+    /** Enable/disable g2o pose-only optimization in the tracking stages.
+        When off, the PnP pose is used directly with a reprojection-only
+        inlier check (no 6-DoF refinement). Default: enabled. */
+    virtual void setPoseOptimization(bool enable) = 0;
+    virtual bool getPoseOptimization() const = 0;
+
+    /** Enable/disable local bundle adjustment at each keyframe promotion.
+        When off, the map still grows but keyframe poses and map points are
+        not jointly refined. Default: enabled. */
+    virtual void setLocalBA(bool enable) = 0;
+    virtual bool getLocalBA() const = 0;
+
+    virtual const String& getImagesFolder() const = 0;
+    virtual const String& getOutputFolder() const = 0;
+    virtual void setOutputFolder(const String& outputFolder) = 0;
+
+protected:
+    VisualOdometry();
 };
+
+//! @}
 
 }} // namespace cv::slam
 

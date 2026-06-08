@@ -2,6 +2,10 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-#include "perf_precomp.hpp"
+// Compatibility shim: prefer #include <opencv2/slam.hpp>.
+#ifndef OPENCV_SLAM_SLAM_HPP
+#define OPENCV_SLAM_SLAM_HPP
 
-CV_PERF_TEST_MAIN(slam)
+#include "opencv2/slam.hpp"
+
+#endif

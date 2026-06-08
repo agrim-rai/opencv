@@ -2,71 +2,96 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-
 #ifndef OPENCV_SLAM_MAP_HPP
 #define OPENCV_SLAM_MAP_HPP
 
-#include "types.hpp"
-#include <opencv2/core.hpp>
+#include "opencv2/slam/types.hpp"
+
+#include <set>
 #include <vector>
 
-namespace cv { namespace slam {
+namespace cv {
+namespace slam {
 
-/** @brief Container for keyframes, map points, and the per-frame trajectory.
+//! @addtogroup slam
+//! @{
 
-    Map owns all KeyFrame and MapPoint objects. External code holds only
-    raw non-owning pointers. Ids are assigned automatically when the
-    incoming id field is negative.
+/** @brief Thread-safe container for all persistent SLAM state.
 
-    @ingroup slam_odometry
+Owns (allocates and destroys) every @ref KeyFrame and @ref MapPoint object.
+Raw pointers returned by @ref addKeyframe / @ref addMapPoint remain valid until
+the object is removed via @ref removeMapPoint / @ref clear.
+
+Map is pure storage — no algorithm logic lives here.  It is designed to be
+shared between the odometry front-end (M1), local-mapping thread (M2), and
+loop-closure / relocalization modules (M3).
 */
-class CV_EXPORTS_W Map
+class CV_EXPORTS Map
 {
 public:
-    CV_WRAP Map();
+    Map();
     ~Map();
 
-    /** @brief Add a keyframe; assigns id if kf.id < 0. Returns the assigned id. */
-    CV_WRAP int addKeyframe(KeyFrame& kf);
+    Map(const Map&)            = delete;
+    Map& operator=(const Map&) = delete;
 
-    /** @brief Return keyframe by id, or nullptr. */
-    CV_WRAP KeyFrame* getKeyframe(int id);
+    // --- Keyframes ---------------------------------------------------------
 
-    /** @brief All keyframes in insertion order. */
-    CV_WRAP const std::vector<KeyFrame*>& keyframes() const;
+    /** Takes ownership of @p kf, assigns a fresh id if kf->id < 0.
+        Returns @p kf (same pointer, now owned by the map). */
+    KeyFrame* addKeyframe(KeyFrame* kf);
 
-    CV_WRAP int numKeyframes() const;
+    /** Returns the keyframe with @p id, or nullptr if not found. */
+    KeyFrame* getKeyframe(int id) const;
 
-    /** @brief Add a map point; assigns id if mp.id < 0. Returns the assigned id. */
-    CV_WRAP int addMapPoint(MapPoint& mp);
+    const std::set<KeyFrame*>& keyframes() const;
+    int numKeyframes() const;
 
-    /** @brief Return map point by id, or nullptr. */
-    CV_WRAP MapPoint* getMapPoint(int id);
+    // --- Map points --------------------------------------------------------
 
-    /** @brief All live (non-bad) map points. */
-    CV_WRAP std::vector<MapPoint*> mapPoints() const;
+    /** Takes ownership of @p mp, assigns a fresh id if mp->id < 0.
+        Returns @p mp (same pointer, now owned by the map). */
+    MapPoint* addMapPoint(MapPoint* mp);
 
-    CV_WRAP int numMapPoints() const;
+    /** Returns the map point with @p id, or nullptr if not found. */
+    MapPoint* getMapPoint(int id) const;
 
-    /** @brief Wire a bidirectional KF-MP observation. */
-    CV_WRAP void addObservation(KeyFrame* kf, int kp_idx, MapPoint* mp);
+    const std::set<MapPoint*>& mapPoints() const;
+    int numMapPoints() const;
 
-    /** @brief Mark a map point bad and remove all cross-references. */
-    CV_WRAP void removeMapPoint(int mp_id);
+    /** Wires a 2D-3D correspondence: sets kf->mappoints[kp_idx] = mp and
+        mp->observations[kf] = kp_idx.  A no-op if kp_idx is already occupied. */
+    void addObservation(KeyFrame* kf, size_t kp_idx, MapPoint* mp);
 
-    /** @brief Append a world-to-camera pose to the trajectory. */
-    CV_WRAP void appendPose(const Matx44d& T_cw);
+    /** Removes the single observation link between @p kf and @p mp. */
+    void removeObservation(KeyFrame* kf, MapPoint* mp);
 
-    /** @brief All emitted world-to-camera poses in order. */
-    CV_WRAP const std::vector<Matx44d>& trajectory() const;
+    /** Erases @p mp from the map, unlinks it from all keyframes, and deletes it. */
+    void removeMapPoint(MapPoint* mp);
 
-    /** @brief Reset to empty state. */
-    CV_WRAP void clear();
+    // --- Reference / current keyframes ------------------------------------
+
+    void      setRefKeyframe    (KeyFrame* kf);
+    KeyFrame* getRefKeyframe    () const;
+
+    void      setCurrentKeyframe(KeyFrame* kf);
+    KeyFrame* getCurrentKeyframe() const;
+
+    // --- Trajectory (ordered per-frame poses stored for output) -----------
+
+    void appendPose(const Matx44d& T_cw);
+    const std::vector<Matx44d>& trajectory() const;
+
+    // --- Lifecycle ---------------------------------------------------------
+
+    void clear();
 
 private:
     struct Impl;
     Ptr<Impl> impl_;
 };
+
+//! @}
 
 }} // namespace cv::slam
 
