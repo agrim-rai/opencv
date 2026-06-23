@@ -209,6 +209,9 @@ OCV_OPTION(WITH_NVCUVENC "Include NVidia Video Encoding library support" ON
 OCV_OPTION(WITH_EIGEN "Include Eigen2/Eigen3 support" (NOT CV_DISABLE_OPTIMIZATION AND NOT CMAKE_CROSSCOMPILING)
   VISIBLE_IF NOT WINRT
   VERIFY HAVE_EIGEN)
+OCV_OPTION(WITH_G2O "Build g2o graph optimizer (requires Eigen3)" ON
+  VISIBLE_IF NOT WINRT
+  VERIFY HAVE_G2O)
 OCV_OPTION(WITH_FFMPEG "Include FFMPEG support" (NOT ANDROID)
   VISIBLE_IF NOT IOS AND NOT XROS AND NOT WINRT
   VERIFY HAVE_FFMPEG)
@@ -775,6 +778,7 @@ include(cmake/OpenCVFindHarfBuzz.cmake)
 include(cmake/OpenCVFindLibsGUI.cmake)
 include(cmake/OpenCVFindLibsVideo.cmake)
 include(cmake/OpenCVFindLibsPerf.cmake)
+include(cmake/OpenCVFindG2O.cmake)
 include(cmake/OpenCVFindLAPACK.cmake)
 if(WITH_LAPACK)
   ocv_assert(HAVE_LAPACK)  # Lapack is required for OpenCV 5.0+
@@ -1868,6 +1872,10 @@ endif()
 
 if(WITH_EIGEN OR HAVE_EIGEN)
   status("    Eigen:"      HAVE_EIGEN       THEN "YES (ver ${EIGEN_WORLD_VERSION}.${EIGEN_MAJOR_VERSION}.${EIGEN_MINOR_VERSION})" ELSE NO)
+endif()
+
+if(WITH_G2O OR HAVE_G2O)
+  status("    g2o:"        HAVE_G2O         THEN "YES" ELSE NO)
 endif()
 
 if(WITH_CLP OR HAVE_CLP)
