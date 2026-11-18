@@ -179,7 +179,7 @@ OCV_OPTION(WITH_CAP_IOS "Enable iOS video capture" ON
 OCV_OPTION(WITH_CAROTENE "Use NVidia carotene acceleration library for ARM platform" (NOT CV_DISABLE_OPTIMIZATION)
   VISIBLE_IF (ARM OR AARCH64) AND NOT IOS AND NOT XROS)
 OCV_OPTION(WITH_KLEIDICV "Use KleidiCV library for ARM platforms" (NOT CV_DISABLE_OPTIMIZATION)
-  VISIBLE_IF (AARCH64 AND (ANDROID OR UNIX)))
+  VISIBLE_IF (AARCH64 AND (ANDROID OR UNIX OR CV_CLANG_CL)))
 OCV_OPTION(WITH_NDSRVP "Use Andes RVP extension" (NOT CV_DISABLE_OPTIMIZATION)
   VISIBLE_IF RISCV)
 OCV_OPTION(WITH_HAL_RVV "Use HAL RVV optimizations" (NOT CV_DISABLE_OPTIMIZATION)
@@ -204,6 +204,9 @@ OCV_OPTION(WITH_CUBLAS "Include NVidia Cuda Basic Linear Algebra Subprograms (BL
 OCV_OPTION(WITH_CUDNN "Include NVIDIA CUDA Deep Neural Network (cuDNN) library support" WITH_CUDA
   VISIBLE_IF WITH_CUDA
   VERIFY HAVE_CUDNN)
+OCV_OPTION(WITH_CUDNNJIT "Include NVIDIA CUDA Deep Neural Network (cuDNN) graph API support with runtime compiled (JIT) engines, used only when WITH_CUDNN is off" OFF
+  VISIBLE_IF WITH_CUDA
+  VERIFY HAVE_CUDNNJIT OR HAVE_CUDNN)
 OCV_OPTION(WITH_NVCUVID "Include NVidia Video Decoding library support" ON
   VISIBLE_IF WITH_CUDA
   VERIFY HAVE_NVCUVID)
@@ -213,6 +216,9 @@ OCV_OPTION(WITH_NVCUVENC "Include NVidia Video Encoding library support" ON
 OCV_OPTION(WITH_EIGEN "Include Eigen2/Eigen3 support" (NOT CV_DISABLE_OPTIMIZATION AND NOT CMAKE_CROSSCOMPILING)
   VISIBLE_IF NOT WINRT
   VERIFY HAVE_EIGEN)
+OCV_OPTION(WITH_G2O "Include g2o graph-optimization support (for SLAM loop closing / bundle adjustment)" WITH_EIGEN
+  VISIBLE_IF WITH_EIGEN
+  VERIFY HAVE_G2O)
 OCV_OPTION(WITH_FFMPEG "Include FFMPEG support" (NOT ANDROID)
   VISIBLE_IF NOT IOS AND NOT XROS AND NOT WINRT
   VERIFY HAVE_FFMPEG)
@@ -513,7 +519,12 @@ OCV_OPTION(ENABLE_CUDA_FIRST_CLASS_LANGUAGE "Enable CUDA as a first class langua
 OCV_OPTION(ENABLE_PYLINT              "Add target with Pylint checks"                            (BUILD_DOCS OR BUILD_EXAMPLES) IF (NOT CMAKE_CROSSCOMPILING AND NOT APPLE_FRAMEWORK) )
 OCV_OPTION(ENABLE_FLAKE8              "Add target with Python flake8 checker"                    (BUILD_DOCS OR BUILD_EXAMPLES) IF (NOT CMAKE_CROSSCOMPILING AND NOT APPLE_FRAMEWORK) )
 
-OCV_OPTION(WITH_UNIFONT               "Build 'uni' font (WQY MicroHei) into OpenCV"              (NOT BUILD_opencv_js)
+# Optional built-in fonts. Only the "sans" font (Rubik) is always compiled into imgproc;
+# the others cost ~150 KB (italic) and ~2 MB (uni) of library size and can instead be
+# supplied at run time as external files via cv::FontFace::setBuiltinFont().
+OCV_OPTION(WITH_ITALICFONT            "Build 'italic' font (Rubik Italic) into OpenCV"           OFF
+           VERIFY HAVE_ITALICFONT)
+OCV_OPTION(WITH_UNIFONT               "Build 'uni' font (WQY MicroHei) into OpenCV"              OFF
            VERIFY HAVE_UNIFONT)
 
 if(ENABLE_IMPL_COLLECTION)
@@ -780,6 +791,10 @@ include(cmake/OpenCVFindLibsGUI.cmake)
 include(cmake/OpenCVFindLibsVideo.cmake)
 include(cmake/OpenCVFindLibsPerf.cmake)
 include(cmake/OpenCVFindLAPACK.cmake)
+
+if(WITH_G2O)
+  include(cmake/OpenCVFindG2O.cmake)
+endif()
 if(WITH_LAPACK)
   ocv_assert(HAVE_LAPACK)  # Lapack is required for OpenCV 5.0+
 endif()
@@ -1449,8 +1464,15 @@ if(WITH_VTK OR HAVE_VTK)
   status("    VTK support:" HAVE_VTK THEN "YES (ver ${VTK_VERSION})" ELSE NO)
 endif()
 
-if(WITH_UNIFONT OR HAVE_UNIFONT)
-  status("    Built-in Unicode font:" HAVE_UNIFONT THEN "YES" ELSE "NO")
+if(HAVE_HARFBUZZ)
+  set(_builtin_fonts "sans")
+  if(HAVE_ITALICFONT)
+    set(_builtin_fonts "${_builtin_fonts} italic")
+  endif()
+  if(HAVE_UNIFONT)
+    set(_builtin_fonts "${_builtin_fonts} uni")
+  endif()
+  status("    Built-in fonts:" "${_builtin_fonts}")
 endif()
 
 # ========================== MEDIA IO ==========================
@@ -1487,11 +1509,7 @@ if(WITH_WEBP OR HAVE_WEBP)
 endif()
 
 if(WITH_AVIF OR HAVE_AVIF)
-  if(libavif_VERSION)
-    status("    AVIF:" AVIF_FOUND THEN "${AVIF_LIBRARY} (ver ${libavif_VERSION})" ELSE "NO")
-  else()
-    status("    AVIF:" AVIF_FOUND THEN "${AVIF_LIBRARY}" ELSE "NO")
-  endif()
+  status("    AVIF:" AVIF_FOUND THEN "${AVIF_LIBRARY} (ver ${AVIF_VERSION})" ELSE "NO")
 endif()
 
 if(WITH_SPNG)
@@ -1760,6 +1778,8 @@ if(WITH_IPP AND HAVE_IPP)
   else()
     status("    Intel IPP IW:"   NO)
   endif()
+elseif(DEFINED WITH_IPP)
+  status("    Intel IPP:" WITH_IPP THEN "NO (download/detection failed)" ELSE "NO")
 endif()
 
 if(WITH_ARMPL AND HAVE_ARMPL)
@@ -1874,6 +1894,10 @@ if(WITH_EIGEN OR HAVE_EIGEN)
   status("    Eigen:"      HAVE_EIGEN       THEN "YES (ver ${EIGEN_WORLD_VERSION}.${EIGEN_MAJOR_VERSION}.${EIGEN_MINOR_VERSION})" ELSE NO)
 endif()
 
+if(WITH_G2O OR HAVE_G2O)
+  status("    g2o:"        HAVE_G2O         THEN "YES" ELSE NO)
+endif()
+
 if(WITH_CLP OR HAVE_CLP)
   status("    CLP:"        HAVE_CLP         THEN "YES" ELSE NO)
 endif()
@@ -1910,6 +1934,11 @@ if(WITH_CUDA OR HAVE_CUDA)
  if(WITH_CUDNN OR HAVE_CUDNN)
     status("")
     status("  cuDNN:" HAVE_CUDNN THEN "YES (ver ${CUDNN_VERSION})" ELSE NO)
+endif()
+
+ if(WITH_CUDNNJIT OR HAVE_CUDNNJIT)
+    status("")
+    status("  cuDNN JIT:" HAVE_CUDNNJIT THEN "YES (ver ${CUDNN_VERSION})" ELSE NO)
 endif()
 
 if(WITH_VULKAN OR HAVE_VULKAN)

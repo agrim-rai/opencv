@@ -222,6 +222,12 @@ static void histPrepareImages( const Mat* images, int nimages, const int* channe
 
 ////////////////////////////////// C A L C U L A T E    H I S T O G R A M ////////////////////////////////////
 
+// Unsaturated floor: safe only once the caller has confirmed v0 is within [v0_lo, v0_hi).
+static inline int histBinFloor(double value)
+{
+    return cv::detail::cvFloorUnsaturated(value);
+}
+
 template<typename T> static void
 calcHist_( std::vector<uchar*>& _ptrs, const std::vector<int>& _deltas,
            Size imsize, Mat& hist, int dims, const float** _ranges,
@@ -258,25 +264,81 @@ calcHist_( std::vector<uchar*>& _ptrs, const std::vector<int>& _deltas,
             for( ; imsize.height--; p0 += step0, mask += mstep )
             {
                 if( !mask )
-                    for( x = 0; x < imsize.width; x++, p0 += d0 )
+                {
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+                    if( d0 == 1 && sizeof(T) == 2 )
                     {
-                        double v0 = (double)*p0;
-                        int idx = cvFloor(v0*a + b);
-                        if (v0 < v0_lo || v0 >= v0_hi)
-                            continue;
-                        idx = CV_CLAMP_INT(idx, 0, sz - 1);
-                        CV_DbgAssert((unsigned)idx < (unsigned)sz);
-                        ((int*)H)[idx]++;
+                        const ushort* p  = (const ushort*)p0;
+                        const int nlanes = VTraits<v_uint16>::vlanes();
+
+                        const v_float32 va   = vx_setall_f32((float)a);
+                        const v_float32 vb   = vx_setall_f32((float)b);
+                        const v_float32 vlo  = vx_setall_f32((float)v0_lo);
+                        const v_float32 vhi  = vx_setall_f32((float)v0_hi);
+                        const v_int32   vi0  = vx_setall_s32(0);
+                        const v_int32   visz = vx_setall_s32(sz - 1);
+
+                        x = 0;
+                        for( ; x <= imsize.width - nlanes; x += nlanes )
+                        {
+                            v_uint16 pix = vx_load(&p[x]);
+                            v_uint32 lo32, hi32;
+                            v_expand(pix, lo32, hi32);
+                            v_float32 flo = v_cvt_f32(v_reinterpret_as_s32(lo32));
+                            v_float32 fhi = v_cvt_f32(v_reinterpret_as_s32(hi32));
+                            v_uint32 rlo = v_reinterpret_as_u32(v_and(v_ge(flo, vlo), v_lt(flo, vhi)));
+                            v_uint32 rhi = v_reinterpret_as_u32(v_and(v_ge(fhi, vlo), v_lt(fhi, vhi)));
+
+                            v_int32 idx_lo = v_max(vi0, v_min(visz, v_floor(v_fma(flo, va, vb))));
+                            v_int32 idx_hi = v_max(vi0, v_min(visz, v_floor(v_fma(fhi, va, vb))));
+
+                            int idxbuf[2 * VTraits<v_int32>::max_nlanes];
+                            v_store(idxbuf, idx_lo);
+                            v_store(idxbuf + nlanes / 2, idx_hi);
+
+                            if( v_check_all(v_reinterpret_as_s32(rlo)) && v_check_all(v_reinterpret_as_s32(rhi)) )
+                            {
+                                for( int k = 0; k < nlanes; k++ )
+                                    ((int*)H)[idxbuf[k]]++;
+                            }
+                            else
+                            {
+                                int deltabuf[2 * VTraits<v_int32>::max_nlanes];
+                                v_store(deltabuf, v_reinterpret_as_s32(rlo));
+                                v_store(deltabuf + nlanes / 2, v_reinterpret_as_s32(rhi));
+                                for( int k = 0; k < nlanes; k++ )
+                                    ((int*)H)[idxbuf[k]] += (deltabuf[k] != 0);
+                            }
+                        }
+                        for( ; x < imsize.width; x++ )
+                        {
+                            double v0 = (double)p[x];
+                            int delta = int(v0_lo <= v0) & int(v0 < v0_hi);
+                            int idx   = CV_CLAMP_INT(cvFloor(v0*a + b), 0, sz-1);
+                            ((int*)H)[idx] += delta;
+                        }
+                        p0 = (const T*)(p + imsize.width);
                     }
+                    else
+#endif
+                        for( x = 0; x < imsize.width; x++, p0 += d0 )
+                        {
+                            double v0 = (double)*p0;
+                            if (v0 < v0_lo || v0 >= v0_hi)
+                                continue;
+                            int idx = CV_CLAMP_INT(histBinFloor(v0*a + b), 0, sz - 1);
+                            CV_DbgAssert((unsigned)idx < (unsigned)sz);
+                            ((int*)H)[idx]++;
+                        }
+                }
                 else
                     for( x = 0; x < imsize.width; x++, p0 += d0 )
                         if( mask[x] )
                         {
                             double v0 = (double)*p0;
-                            int idx = cvFloor(v0*a + b);
                             if (v0 < v0_lo || v0 >= v0_hi)
                                 continue;
-                            idx = CV_CLAMP_INT(idx, 0, sz - 1);
+                            int idx = CV_CLAMP_INT(histBinFloor(v0*a + b), 0, sz - 1);
                             CV_DbgAssert((unsigned)idx < (unsigned)sz);
                             ((int*)H)[idx]++;
                         }
@@ -305,14 +367,12 @@ calcHist_( std::vector<uchar*>& _ptrs, const std::vector<int>& _deltas,
                     {
                         double v0 = (double)*p0;
                         double v1 = (double)*p1;
-                        int idx0 = cvFloor(v0*a0 + b0);
-                        int idx1 = cvFloor(v1*a1 + b1);
                         if (v0 < v0_lo || v0 >= v0_hi)
                             continue;
                         if (v1 < v1_lo || v1 >= v1_hi)
                             continue;
-                        idx0 = CV_CLAMP_INT(idx0, 0, sz0 - 1);
-                        idx1 = CV_CLAMP_INT(idx1, 0, sz1 - 1);
+                        int idx0 = CV_CLAMP_INT(histBinFloor(v0*a0 + b0), 0, sz0 - 1);
+                        int idx1 = CV_CLAMP_INT(histBinFloor(v1*a1 + b1), 0, sz1 - 1);
                         CV_DbgAssert((unsigned)idx0 < (unsigned)sz0 && (unsigned)idx1 < (unsigned)sz1);
                         ((int*)(H + hstep0*idx0))[idx1]++;
                     }
@@ -322,14 +382,12 @@ calcHist_( std::vector<uchar*>& _ptrs, const std::vector<int>& _deltas,
                         {
                             double v0 = (double)*p0;
                             double v1 = (double)*p1;
-                            int idx0 = cvFloor(v0*a0 + b0);
-                            int idx1 = cvFloor(v1*a1 + b1);
                             if (v0 < v0_lo || v0 >= v0_hi)
                                 continue;
                             if (v1 < v1_lo || v1 >= v1_hi)
                                 continue;
-                            idx0 = CV_CLAMP_INT(idx0, 0, sz0 - 1);
-                            idx1 = CV_CLAMP_INT(idx1, 0, sz1 - 1);
+                            int idx0 = CV_CLAMP_INT(histBinFloor(v0*a0 + b0), 0, sz0 - 1);
+                            int idx1 = CV_CLAMP_INT(histBinFloor(v1*a1 + b1), 0, sz1 - 1);
                             CV_DbgAssert((unsigned)idx0 < (unsigned)sz0 && (unsigned)idx1 < (unsigned)sz1);
                             ((int*)(H + hstep0*idx0))[idx1]++;
                         }
@@ -365,18 +423,15 @@ calcHist_( std::vector<uchar*>& _ptrs, const std::vector<int>& _deltas,
                         double v0 = (double)*p0;
                         double v1 = (double)*p1;
                         double v2 = (double)*p2;
-                        int idx0 = cvFloor(v0*a0 + b0);
-                        int idx1 = cvFloor(v1*a1 + b1);
-                        int idx2 = cvFloor(v2*a2 + b2);
                         if (v0 < v0_lo || v0 >= v0_hi)
                             continue;
                         if (v1 < v1_lo || v1 >= v1_hi)
                             continue;
                         if (v2 < v2_lo || v2 >= v2_hi)
                             continue;
-                        idx0 = CV_CLAMP_INT(idx0, 0, sz0 - 1);
-                        idx1 = CV_CLAMP_INT(idx1, 0, sz1 - 1);
-                        idx2 = CV_CLAMP_INT(idx2, 0, sz2 - 1);
+                        int idx0 = CV_CLAMP_INT(histBinFloor(v0*a0 + b0), 0, sz0 - 1);
+                        int idx1 = CV_CLAMP_INT(histBinFloor(v1*a1 + b1), 0, sz1 - 1);
+                        int idx2 = CV_CLAMP_INT(histBinFloor(v2*a2 + b2), 0, sz2 - 1);
                         CV_DbgAssert(
                             (unsigned)idx0 < (unsigned)sz0 &&
                             (unsigned)idx1 < (unsigned)sz1 &&
@@ -390,18 +445,15 @@ calcHist_( std::vector<uchar*>& _ptrs, const std::vector<int>& _deltas,
                             double v0 = (double)*p0;
                             double v1 = (double)*p1;
                             double v2 = (double)*p2;
-                            int idx0 = cvFloor(v0*a0 + b0);
-                            int idx1 = cvFloor(v1*a1 + b1);
-                            int idx2 = cvFloor(v2*a2 + b2);
                             if (v0 < v0_lo || v0 >= v0_hi)
                                 continue;
                             if (v1 < v1_lo || v1 >= v1_hi)
                                 continue;
                             if (v2 < v2_lo || v2 >= v2_hi)
                                 continue;
-                            idx0 = CV_CLAMP_INT(idx0, 0, sz0 - 1);
-                            idx1 = CV_CLAMP_INT(idx1, 0, sz1 - 1);
-                            idx2 = CV_CLAMP_INT(idx2, 0, sz2 - 1);
+                            int idx0 = CV_CLAMP_INT(histBinFloor(v0*a0 + b0), 0, sz0 - 1);
+                            int idx1 = CV_CLAMP_INT(histBinFloor(v1*a1 + b1), 0, sz1 - 1);
+                            int idx2 = CV_CLAMP_INT(histBinFloor(v2*a2 + b2), 0, sz2 - 1);
                             CV_DbgAssert(
                                 (unsigned)idx0 < (unsigned)sz0 &&
                                 (unsigned)idx1 < (unsigned)sz1 &&
@@ -691,12 +743,19 @@ calcHist_8u( std::vector<uchar*>& _ptrs, const std::vector<int>& _deltas,
 typedef IppStatus(CV_STDCALL * IppiHistogram_C1)(const void* pSrc, int srcStep,
     IppiSize roiSize, Ipp32u* pHist, const IppiHistogramSpec* pSpec, Ipp8u* pBuffer);
 
+template<typename T, IppStatus (CV_STDCALL *fn)(const T*, int, IppiSize, Ipp32u*, const IppiHistogramSpec*, Ipp8u*)>
+static IppStatus CV_STDCALL ippiHistogram_C1_Wrap(const void* pSrc, int srcStep,
+    IppiSize roiSize, Ipp32u* pHist, const IppiHistogramSpec* pSpec, Ipp8u* pBuffer)
+{
+    return fn((const T*)pSrc, srcStep, roiSize, pHist, pSpec, pBuffer);
+}
+
 static IppiHistogram_C1 getIppiHistogramFunction_C1(int type)
 {
     IppiHistogram_C1 ippFunction =
-        (type == CV_8UC1) ? (IppiHistogram_C1)ippiHistogram_8u_C1R :
-        (type == CV_16UC1) ? (IppiHistogram_C1)ippiHistogram_16u_C1R :
-        (type == CV_32FC1) ? (IppiHistogram_C1)ippiHistogram_32f_C1R :
+        (type == CV_8UC1) ? ippiHistogram_C1_Wrap<Ipp8u, ippiHistogram_8u_C1R> :
+        (type == CV_16UC1) ? ippiHistogram_C1_Wrap<Ipp16u, ippiHistogram_16u_C1R> :
+        (type == CV_32FC1) ? ippiHistogram_C1_Wrap<Ipp32f, ippiHistogram_32f_C1R> :
         NULL;
 
     return ippFunction;
@@ -886,6 +945,86 @@ static bool ipp_calchist(const Mat &image, Mat &hist, int histSize, const float*
 }
 #endif
 
+namespace cv
+{
+
+// Splits the image across threads, each accumulating into a private histogram
+// that is summed at the end. nstripes = cvRound(N*0.001/M), at least 1 and
+// capped by getNumThreads(); inputs below 256K elements stay single-threaded.
+template<typename CalcFunc>
+static void calcHistRunParallel( std::vector<uchar*>& ptrs, const std::vector<int>& deltas,
+                                 Size imsize, Mat& hist, int dims, const float** ranges,
+                                 const double* uniranges, bool uniform, int esz1, CalcFunc calcFunc )
+{
+    const int64 N = (int64)imsize.width * imsize.height;
+    const size_t M = hist.total();
+
+    if( N < (int64)256 * 1024 )
+    {
+        calcFunc( ptrs, deltas, imsize, hist, dims, ranges, uniranges, uniform );
+        return;
+    }
+
+    int nstripes = M > 0 ? std::max(1, std::min(8, cvRound((double)N * 1e-3 / (double)M))) : 1;
+    nstripes = std::min( nstripes, getNumThreads() );
+    if( nstripes <= 1 )
+    {
+        calcFunc( ptrs, deltas, imsize, hist, dims, ranges, uniranges, uniform );
+        return;
+    }
+
+    const bool splitByRows = imsize.height > 1;
+    const int splitDim = splitByRows ? imsize.height : imsize.width;
+    nstripes = std::min( nstripes, splitDim );
+
+    std::vector<Mat> local_hists( nstripes );
+
+    parallel_for_( Range( 0, nstripes ), [&]( const Range& r )
+    {
+        for( int s = r.start; s < r.end; s++ )
+        {
+            const int start = (int)((int64)s * splitDim / nstripes);
+            const int end   = (int)((int64)(s + 1) * splitDim / nstripes);
+            if( start >= end )
+                continue;
+
+            std::vector<uchar*> local_ptrs = ptrs;
+            Size local_size;
+
+            if( splitByRows )
+            {
+                for( int i = 0; i < dims; i++ )
+                {
+                    size_t row_step = ((size_t)imsize.width * deltas[i*2] + deltas[i*2 + 1]) * esz1;
+                    local_ptrs[i] = (uchar*)((const uchar*)local_ptrs[i] + (size_t)start * row_step);
+                }
+                if( local_ptrs[dims] )
+                    local_ptrs[dims] = (uchar*)((const uchar*)local_ptrs[dims] + (size_t)start * deltas[dims*2 + 1]);
+                local_size = Size( imsize.width, end - start );
+            }
+            else
+            {
+                for( int i = 0; i < dims; i++ )
+                    local_ptrs[i] = (uchar*)((const uchar*)local_ptrs[i] + (size_t)start * deltas[i*2] * esz1);
+                if( local_ptrs[dims] )
+                    local_ptrs[dims] = (uchar*)((const uchar*)local_ptrs[dims] + (size_t)start * deltas[dims*2]);
+                local_size = Size( end - start, 1 );
+            }
+
+            local_hists[s] = Mat::zeros( hist.size, hist.type() );
+            calcFunc( local_ptrs, deltas, local_size, local_hists[s], dims, ranges, uniranges, uniform );
+        }
+    });
+
+    for( int s = 0; s < nstripes; s++ )
+    {
+        if( !local_hists[s].empty() )
+            hist += local_hists[s];
+    }
+}
+
+} // namespace cv
+
 void cv::calcHist( const Mat* images, int nimages, const int* channels,
                    InputArray _mask, OutputArray _hist, int dims, const int* histSize,
                    const float** ranges, bool uniform, bool accumulate )
@@ -934,13 +1073,14 @@ void cv::calcHist( const Mat* images, int nimages, const int* channels,
     const double* _uniranges = uniform ? &uniranges[0] : 0;
 
     int depth = images[0].depth();
+    int esz1 = (int)images[0].elemSize1();
 
     if( depth == CV_8U )
-        calcHist_8u(ptrs, deltas, imsize, ihist, dims, ranges, _uniranges, uniform );
+        calcHistRunParallel( ptrs, deltas, imsize, ihist, dims, ranges, _uniranges, uniform, esz1, &calcHist_8u );
     else if( depth == CV_16U )
-        calcHist_<ushort>(ptrs, deltas, imsize, ihist, dims, ranges, _uniranges, uniform );
+        calcHistRunParallel( ptrs, deltas, imsize, ihist, dims, ranges, _uniranges, uniform, esz1, &calcHist_<ushort> );
     else if( depth == CV_32F )
-        calcHist_<float>(ptrs, deltas, imsize, ihist, dims, ranges, _uniranges, uniform );
+        calcHistRunParallel( ptrs, deltas, imsize, ihist, dims, ranges, _uniranges, uniform, esz1, &calcHist_<float> );
     else
         CV_Error(cv::Error::StsUnsupportedFormat, "");
 
@@ -1227,7 +1367,7 @@ void cv::calcHist( InputArrayOfArrays images, const std::vector<int>& channels,
     int i, dims = (int)histSize.size(), rsz = (int)ranges.size(), csz = (int)channels.size();
     int nimages = (int)images.total();
 
-    CV_Assert(nimages > 0 && dims > 0);
+    CV_Assert(nimages > 0 && dims > 0 && dims <= CV_MAX_DIM);
     CV_Assert(rsz == dims*2 || (rsz == 0 && images.depth(0) == CV_8U));
     CV_Assert(csz == 0 || csz == dims);
     float* _ranges[CV_MAX_DIM];
@@ -1943,7 +2083,7 @@ void cv::calcBackProject( InputArrayOfArrays images, const std::vector<int>& cha
     int i, dims = H.dims, rsz = (int)ranges.size(), csz = (int)channels.size();
     int nimages = (int)images.total();
 
-    CV_Assert(nimages > 0);
+    CV_Assert(nimages > 0 && dims <= CV_MAX_DIM);
     CV_Assert(rsz == dims*2 || (rsz == 2 && _1d) || (rsz == 0 && images.depth(0) == CV_8U));
     CV_Assert(csz == 0 || csz == dims || (csz == 1 && _1d));
 
@@ -2255,6 +2395,21 @@ double cv::compareHist( const SparseMat& H1, const SparseMat& H2, int method )
             double b = (method == cv::HISTCMP_CHISQR) ? v1 : v1 + v2;
             if( fabs(b) > DBL_EPSILON )
                 result += a*a/b;
+        }
+        if( method == cv::HISTCMP_CHISQR_ALT )
+        {
+            // Include bins present only in H2; bins stored in H1 were counted above.
+            it = PH2->begin();
+            for( i = 0; i < N2; i++, ++it )
+            {
+                const SparseMat::Node* node = it.node();
+                if( !PH1->find<float>(node->idx, (size_t*)&node->hashval) )
+                {
+                    double v2 = it.value<float>();
+                    if( fabs(v2) > DBL_EPSILON )
+                        result += v2;
+                }
+            }
         }
     }
     else if( method == cv::HISTCMP_CORREL )

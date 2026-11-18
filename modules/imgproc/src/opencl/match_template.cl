@@ -29,6 +29,14 @@
 // or tort (including negligence or otherwise) arising in any way out of
 // the use of this software, even if advised of the possibility of such damage.
 
+#ifdef DOUBLE_SUPPORT
+#ifdef cl_amd_fp64
+#pragma OPENCL EXTENSION cl_amd_fp64:enable
+#elif defined (cl_khr_fp64)
+#pragma OPENCL EXTENSION cl_khr_fp64:enable
+#endif
+#endif
+
 #if cn != 3
 #define loadpix(addr) *(__global const T *)(addr)
 #define TSIZE (int)sizeof(T)
@@ -465,7 +473,7 @@ __kernel void matchTemplate_CCOEFF_NORMED(__global const uchar * src_sums, int s
         T value_sum   = sum[mad24(t_rows, step, t_cols)] - sum[mad24(t_rows, step, 0)] - sum[t_cols] + sum[0];
         T value_sqsum = sqsum[mad24(t_rows, step, t_cols)] - sqsum[mad24(t_rows, step, 0)] - sqsum[t_cols] + sqsum[0];
 
-        float num = convertToDT(mad(value_sum, template_sum, (float)0));
+        float num = convertToDT(value_sum * template_sum);
 
         value_sqsum -= weight * value_sum * value_sum;
         float denum = sqrt(mad(template_sqsum, convertToDT(value_sqsum), (float)0));

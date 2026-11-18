@@ -890,8 +890,8 @@ TEST(Calib3d_SolvePnP, input_type)
     points3d_.push_back(Point3d(-l, l, l));
     points3dF_.push_back(Point3f(-l, l, l));
 
-    Mat trueRvec = (Mat_<double>(3,1) << 0.1, -0.25, 0.467);
-    Mat trueTvec = (Mat_<double>(3,1) << -0.21, 0.12, 0.746);
+    Mat trueRvec = Mat_<double>({3, 1}, {0.1, -0.25, 0.467});
+    Mat trueTvec = Mat_<double>({3, 1}, {-0.21, 0.12, 0.746});
 
     for (int method = 0; method < SOLVEPNP_MAX_COUNT; method++)
     {
@@ -1247,15 +1247,15 @@ TEST(Calib3d_SolvePnP, translation)
     projectPoints(p3d, crvec, ctvec, cameraIntrinsic, noArray(), p2d);
     Mat rvec;
     Mat tvec;
-    rvec =(Mat_<float>(3,1) << 0, 0, 0);
-    tvec = (Mat_<float>(3,1) << 100, 100, 0);
+    rvec =Mat_<float>({3, 1}, {0, 0, 0});
+    tvec = Mat_<float>({3, 1}, {100, 100, 0});
 
     solvePnP(p3d, p2d, cameraIntrinsic, noArray(), rvec, tvec, true);
     EXPECT_TRUE(checkRange(rvec));
     EXPECT_TRUE(checkRange(tvec));
 
-    rvec =(Mat_<double>(3,1) << 0, 0, 0);
-    tvec = (Mat_<double>(3,1) << 100, 100, 0);
+    rvec =Mat_<double>({3, 1}, {0, 0, 0});
+    tvec = Mat_<double>({3, 1}, {100, 100, 0});
     solvePnP(p3d, p2d, cameraIntrinsic, noArray(), rvec, tvec, true);
     EXPECT_TRUE(checkRange(rvec));
     EXPECT_TRUE(checkRange(tvec));
@@ -1278,14 +1278,14 @@ TEST(Calib3d_SolvePnP, iterativeInitialGuess3pts)
         p3d.push_back(Point3d(L, -L, 0.0));
         p3d.push_back(Point3d(L, L, 0.0));
 
-        Mat rvec_ground_truth = (Mat_<double>(3,1) << 0.3, -0.2, 0.75);
-        Mat tvec_ground_truth = (Mat_<double>(3,1) << 0.15, -0.2, 1.5);
+        Mat rvec_ground_truth = Mat_<double>({3, 1}, {0.3, -0.2, 0.75});
+        Mat tvec_ground_truth = Mat_<double>({3, 1}, {0.15, -0.2, 1.5});
 
         vector<Point2d> p2d;
         projectPoints(p3d, rvec_ground_truth, tvec_ground_truth, intrinsics, noArray(), p2d);
 
-        Mat rvec_est = (Mat_<double>(3,1) << 0.2, -0.1, 0.6);
-        Mat tvec_est = (Mat_<double>(3,1) << 0.05, -0.05, 1.0);
+        Mat rvec_est = Mat_<double>({3, 1}, {0.2, -0.1, 0.6});
+        Mat tvec_est = Mat_<double>({3, 1}, {0.05, -0.05, 1.0});
 
         solvePnP(p3d, p2d, intrinsics, noArray(), rvec_est, tvec_est, true, SOLVEPNP_ITERATIVE);
 
@@ -1312,14 +1312,14 @@ TEST(Calib3d_SolvePnP, iterativeInitialGuess3pts)
         p3d.push_back(Point3f(L, -L, 0.0f));
         p3d.push_back(Point3f(L, L, 0.0f));
 
-        Mat rvec_ground_truth = (Mat_<float>(3,1) << -0.75f, 0.4f, 0.34f);
-        Mat tvec_ground_truth = (Mat_<float>(3,1) << -0.15f, 0.35f, 1.58f);
+        Mat rvec_ground_truth = Mat_<float>({3, 1}, {-0.75f, 0.4f, 0.34f});
+        Mat tvec_ground_truth = Mat_<float>({3, 1}, {-0.15f, 0.35f, 1.58f});
 
         vector<Point2f> p2d;
         projectPoints(p3d, rvec_ground_truth, tvec_ground_truth, intrinsics, noArray(), p2d);
 
-        Mat rvec_est = (Mat_<float>(3,1) << -0.5f, 0.2f, 0.2f);
-        Mat tvec_est = (Mat_<float>(3,1) << 0.0f, 0.2f, 1.0f);
+        Mat rvec_est = Mat_<float>({3, 1}, {-0.5f, 0.2f, 0.2f});
+        Mat tvec_est = Mat_<float>({3, 1}, {0.0f, 0.2f, 1.0f});
 
         solvePnP(p3d, p2d, intrinsics, noArray(), rvec_est, tvec_est, true, SOLVEPNP_ITERATIVE);
 
@@ -1351,14 +1351,14 @@ TEST(Calib3d_SolvePnP, iterativeInitialGuess)
         p3d.push_back(Point3d(-L, L, L/2));
         p3d.push_back(Point3d(0, 0, -L/2));
 
-        Mat rvec_ground_truth = (Mat_<double>(3,1) << 0.3, -0.2, 0.75);
-        Mat tvec_ground_truth = (Mat_<double>(3,1) << 0.15, -0.2, 1.5);
+        Mat rvec_ground_truth = Mat_<double>({3, 1}, {0.3, -0.2, 0.75});
+        Mat tvec_ground_truth = Mat_<double>({3, 1}, {0.15, -0.2, 1.5});
 
         vector<Point2d> p2d;
         projectPoints(p3d, rvec_ground_truth, tvec_ground_truth, intrinsics, noArray(), p2d);
 
-        Mat rvec_est = (Mat_<double>(3,1) << 0.1, -0.1, 0.1);
-        Mat tvec_est = (Mat_<double>(3,1) << 0.0, -0.5, 1.0);
+        Mat rvec_est = Mat_<double>({3, 1}, {0.1, -0.1, 0.1});
+        Mat tvec_est = Mat_<double>({3, 1}, {0.0, -0.5, 1.0});
 
         solvePnP(p3d, p2d, intrinsics, noArray(), rvec_est, tvec_est, true, SOLVEPNP_ITERATIVE);
 
@@ -1387,14 +1387,14 @@ TEST(Calib3d_SolvePnP, iterativeInitialGuess)
         p3d.push_back(Point3f(-L, L, L/2));
         p3d.push_back(Point3f(0, 0, -L/2));
 
-        Mat rvec_ground_truth = (Mat_<float>(3,1) << -0.75f, 0.4f, 0.34f);
-        Mat tvec_ground_truth = (Mat_<float>(3,1) << -0.15f, 0.35f, 1.58f);
+        Mat rvec_ground_truth = Mat_<float>({3, 1}, {-0.75f, 0.4f, 0.34f});
+        Mat tvec_ground_truth = Mat_<float>({3, 1}, {-0.15f, 0.35f, 1.58f});
 
         vector<Point2f> p2d;
         projectPoints(p3d, rvec_ground_truth, tvec_ground_truth, intrinsics, noArray(), p2d);
 
-        Mat rvec_est = (Mat_<float>(3,1) << -0.1f, 0.1f, 0.1f);
-        Mat tvec_est = (Mat_<float>(3,1) << 0.0f, 0.0f, 1.0f);
+        Mat rvec_est = Mat_<float>({3, 1}, {-0.1f, 0.1f, 0.1f});
+        Mat tvec_est = Mat_<float>({3, 1}, {0.0f, 0.0f, 1.0f});
 
         solvePnP(p3d, p2d, intrinsics, noArray(), rvec_est, tvec_est, true, SOLVEPNP_ITERATIVE);
 
@@ -1563,15 +1563,15 @@ TEST(Calib3d_SolvePnP, refine3pts)
         p3d.push_back(Point3d(L, -L, 0.0));
         p3d.push_back(Point3d(L, L, 0.0));
 
-        Mat rvec_ground_truth = (Mat_<double>(3,1) << 0.3, -0.2, 0.75);
-        Mat tvec_ground_truth = (Mat_<double>(3,1) << 0.15, -0.2, 1.5);
+        Mat rvec_ground_truth = Mat_<double>({3, 1}, {0.3, -0.2, 0.75});
+        Mat tvec_ground_truth = Mat_<double>({3, 1}, {0.15, -0.2, 1.5});
 
         vector<Point2d> p2d;
         projectPoints(p3d, rvec_ground_truth, tvec_ground_truth, intrinsics, noArray(), p2d);
 
         {
-            Mat rvec_est = (Mat_<double>(3,1) << 0.2, -0.1, 0.6);
-            Mat tvec_est = (Mat_<double>(3,1) << 0.05, -0.05, 1.0);
+            Mat rvec_est = Mat_<double>({3, 1}, {0.2, -0.1, 0.6});
+            Mat tvec_est = Mat_<double>({3, 1}, {0.05, -0.05, 1.0});
 
             solvePnPRefineLM(p3d, p2d, intrinsics, noArray(), rvec_est, tvec_est);
 
@@ -1585,8 +1585,8 @@ TEST(Calib3d_SolvePnP, refine3pts)
             EXPECT_LE(cvtest::norm(tvec_ground_truth, tvec_est, NORM_INF), 1e-6);
         }
         {
-            Mat rvec_est = (Mat_<double>(3,1) << 0.2, -0.1, 0.6);
-            Mat tvec_est = (Mat_<double>(3,1) << 0.05, -0.05, 1.0);
+            Mat rvec_est = Mat_<double>({3, 1}, {0.2, -0.1, 0.6});
+            Mat tvec_est = Mat_<double>({3, 1}, {0.05, -0.05, 1.0});
 
             solvePnPRefineVVS(p3d, p2d, intrinsics, noArray(), rvec_est, tvec_est);
 
@@ -1612,15 +1612,15 @@ TEST(Calib3d_SolvePnP, refine3pts)
         p3d.push_back(Point3f(L, -L, 0.0f));
         p3d.push_back(Point3f(L, L, 0.0f));
 
-        Mat rvec_ground_truth = (Mat_<float>(3,1) << -0.75f, 0.4f, 0.34f);
-        Mat tvec_ground_truth = (Mat_<float>(3,1) << -0.15f, 0.35f, 1.58f);
+        Mat rvec_ground_truth = Mat_<float>({3, 1}, {-0.75f, 0.4f, 0.34f});
+        Mat tvec_ground_truth = Mat_<float>({3, 1}, {-0.15f, 0.35f, 1.58f});
 
         vector<Point2f> p2d;
         projectPoints(p3d, rvec_ground_truth, tvec_ground_truth, intrinsics, noArray(), p2d);
 
         {
-            Mat rvec_est = (Mat_<float>(3,1) << -0.5f, 0.2f, 0.2f);
-            Mat tvec_est = (Mat_<float>(3,1) << 0.0f, 0.2f, 1.0f);
+            Mat rvec_est = Mat_<float>({3, 1}, {-0.5f, 0.2f, 0.2f});
+            Mat tvec_est = Mat_<float>({3, 1}, {0.0f, 0.2f, 1.0f});
 
             solvePnPRefineLM(p3d, p2d, intrinsics, noArray(), rvec_est, tvec_est);
 
@@ -1634,8 +1634,8 @@ TEST(Calib3d_SolvePnP, refine3pts)
             EXPECT_LE(cvtest::norm(tvec_ground_truth, tvec_est, NORM_INF), 1e-6);
         }
         {
-            Mat rvec_est = (Mat_<float>(3,1) << -0.5f, 0.2f, 0.2f);
-            Mat tvec_est = (Mat_<float>(3,1) << 0.0f, 0.2f, 1.0f);
+            Mat rvec_est = Mat_<float>({3, 1}, {-0.5f, 0.2f, 0.2f});
+            Mat tvec_est = Mat_<float>({3, 1}, {0.0f, 0.2f, 1.0f});
 
             solvePnPRefineVVS(p3d, p2d, intrinsics, noArray(), rvec_est, tvec_est);
 
@@ -1667,15 +1667,15 @@ TEST(Calib3d_SolvePnP, refine)
         p3d.push_back(Point3d(-L, L, L/2));
         p3d.push_back(Point3d(0, 0, -L/2));
 
-        Mat rvec_ground_truth = (Mat_<double>(3,1) << 0.3, -0.2, 0.75);
-        Mat tvec_ground_truth = (Mat_<double>(3,1) << 0.15, -0.2, 1.5);
+        Mat rvec_ground_truth = Mat_<double>({3, 1}, {0.3, -0.2, 0.75});
+        Mat tvec_ground_truth = Mat_<double>({3, 1}, {0.15, -0.2, 1.5});
 
         vector<Point2d> p2d;
         projectPoints(p3d, rvec_ground_truth, tvec_ground_truth, intrinsics, noArray(), p2d);
 
         {
-            Mat rvec_est = (Mat_<double>(3,1) << 0.1, -0.1, 0.1);
-            Mat tvec_est = (Mat_<double>(3,1) << 0.0, -0.5, 1.0);
+            Mat rvec_est = Mat_<double>({3, 1}, {0.1, -0.1, 0.1});
+            Mat tvec_est = Mat_<double>({3, 1}, {0.0, -0.5, 1.0});
 
             solvePnP(p3d, p2d, intrinsics, noArray(), rvec_est, tvec_est, true, SOLVEPNP_ITERATIVE);
 
@@ -1689,8 +1689,8 @@ TEST(Calib3d_SolvePnP, refine)
             EXPECT_LE(cvtest::norm(tvec_ground_truth, tvec_est, NORM_INF), 1e-6);
         }
         {
-            Mat rvec_est = (Mat_<double>(3,1) << 0.1, -0.1, 0.1);
-            Mat tvec_est = (Mat_<double>(3,1) << 0.0, -0.5, 1.0);
+            Mat rvec_est = Mat_<double>({3, 1}, {0.1, -0.1, 0.1});
+            Mat tvec_est = Mat_<double>({3, 1}, {0.0, -0.5, 1.0});
 
             solvePnPRefineLM(p3d, p2d, intrinsics, noArray(), rvec_est, tvec_est);
 
@@ -1704,8 +1704,8 @@ TEST(Calib3d_SolvePnP, refine)
             EXPECT_LE(cvtest::norm(tvec_ground_truth, tvec_est, NORM_INF), 1e-6);
         }
         {
-            Mat rvec_est = (Mat_<double>(3,1) << 0.1, -0.1, 0.1);
-            Mat tvec_est = (Mat_<double>(3,1) << 0.0, -0.5, 1.0);
+            Mat rvec_est = Mat_<double>({3, 1}, {0.1, -0.1, 0.1});
+            Mat tvec_est = Mat_<double>({3, 1}, {0.0, -0.5, 1.0});
 
             solvePnPRefineVVS(p3d, p2d, intrinsics, noArray(), rvec_est, tvec_est);
 
@@ -1734,15 +1734,15 @@ TEST(Calib3d_SolvePnP, refine)
         p3d.push_back(Point3f(-L, L, L/2));
         p3d.push_back(Point3f(0, 0, -L/2));
 
-        Mat rvec_ground_truth = (Mat_<float>(3,1) << -0.75f, 0.4f, 0.34f);
-        Mat tvec_ground_truth = (Mat_<float>(3,1) << -0.15f, 0.35f, 1.58f);
+        Mat rvec_ground_truth = Mat_<float>({3, 1}, {-0.75f, 0.4f, 0.34f});
+        Mat tvec_ground_truth = Mat_<float>({3, 1}, {-0.15f, 0.35f, 1.58f});
 
         vector<Point2f> p2d;
         projectPoints(p3d, rvec_ground_truth, tvec_ground_truth, intrinsics, noArray(), p2d);
 
         {
-            Mat rvec_est = (Mat_<float>(3,1) << -0.1f, 0.1f, 0.1f);
-            Mat tvec_est = (Mat_<float>(3,1) << 0.0f, 0.0f, 1.0f);
+            Mat rvec_est = Mat_<float>({3, 1}, {-0.1f, 0.1f, 0.1f});
+            Mat tvec_est = Mat_<float>({3, 1}, {0.0f, 0.0f, 1.0f});
 
             solvePnP(p3d, p2d, intrinsics, noArray(), rvec_est, tvec_est, true, SOLVEPNP_ITERATIVE);
 
@@ -1756,8 +1756,8 @@ TEST(Calib3d_SolvePnP, refine)
             EXPECT_LE(cvtest::norm(tvec_ground_truth, tvec_est, NORM_INF), 1e-6);
         }
         {
-            Mat rvec_est = (Mat_<float>(3,1) << -0.1f, 0.1f, 0.1f);
-            Mat tvec_est = (Mat_<float>(3,1) << 0.0f, 0.0f, 1.0f);
+            Mat rvec_est = Mat_<float>({3, 1}, {-0.1f, 0.1f, 0.1f});
+            Mat tvec_est = Mat_<float>({3, 1}, {0.0f, 0.0f, 1.0f});
 
             solvePnPRefineLM(p3d, p2d, intrinsics, noArray(), rvec_est, tvec_est);
 
@@ -1771,8 +1771,8 @@ TEST(Calib3d_SolvePnP, refine)
             EXPECT_LE(cvtest::norm(tvec_ground_truth, tvec_est, NORM_INF), 1e-6);
         }
         {
-            Mat rvec_est = (Mat_<float>(3,1) << -0.1f, 0.1f, 0.1f);
-            Mat tvec_est = (Mat_<float>(3,1) << 0.0f, 0.0f, 1.0f);
+            Mat rvec_est = Mat_<float>({3, 1}, {-0.1f, 0.1f, 0.1f});
+            Mat tvec_est = Mat_<float>({3, 1}, {0.0f, 0.0f, 1.0f});
 
             solvePnPRefineVVS(p3d, p2d, intrinsics, noArray(), rvec_est, tvec_est);
 
@@ -1801,8 +1801,8 @@ TEST(Calib3d_SolvePnP, refine)
         p3d.push_back(Point3d(-L, L, L/2));
         p3d.push_back(Point3d(0, 0, -L/2));
 
-        Mat rvec_ground_truth = (Mat_<double>(3,1) << 0.3, -0.2, 0.75);
-        Mat tvec_ground_truth = (Mat_<double>(3,1) << 0.15, -0.2, 1.5);
+        Mat rvec_ground_truth = Mat_<double>({3, 1}, {0.3, -0.2, 0.75});
+        Mat tvec_ground_truth = Mat_<double>({3, 1}, {0.15, -0.2, 1.5});
 
         vector<Point2d> p2d;
         projectPoints(p3d, rvec_ground_truth, tvec_ground_truth, intrinsics, noArray(), p2d);
@@ -1886,11 +1886,14 @@ TEST(Calib3d_SolvePnPRansac, minPoints)
 
     {
         //nb points = 5 --> ransac_kernel_method = SOLVEPNP_EPNP
-        Mat keypoints13D = (Mat_<float>(5, 3) << 12.00604, -2.8654366, 18.472504,
-                                                 7.6863389, 4.9355154, 11.146358,
-                                                 14.260933, 2.8320458, 12.582781,
-                                                 3.4562225, 8.2668982, 11.300434,
-                                                 15.316854, 3.7486348, 12.491116);
+        Mat keypoints13D;
+        Mat_<double>({5, 3}, {
+                12.00604, -2.8654366, 18.472504,
+                7.6863389, 4.9355154, 11.146358,
+                14.260933, 2.8320458, 12.582781,
+                3.4562225, 8.2668982, 11.300434,
+                15.316854, 3.7486348, 12.491116
+        }).convertTo(keypoints13D, CV_32F);
         vector<Point2f> imagesPoints;
         projectPoints(keypoints13D, true_rvec, true_tvec, matK, distCoeff, imagesPoints);
 
@@ -1917,10 +1920,13 @@ TEST(Calib3d_SolvePnPRansac, minPoints)
     }
     {
         //nb points = 4 --> ransac_kernel_method = SOLVEPNP_P3P
-        Mat keypoints13D = (Mat_<float>(4, 3) << 12.00604, -2.8654366, 18.472504,
-                                                 7.6863389, 4.9355154, 11.146358,
-                                                 14.260933, 2.8320458, 12.582781,
-                                                 3.4562225, 8.2668982, 11.300434);
+        Mat keypoints13D;
+        Mat_<double>({4, 3}, {
+                12.00604, -2.8654366, 18.472504,
+                7.6863389, 4.9355154, 11.146358,
+                14.260933, 2.8320458, 12.582781,
+                3.4562225, 8.2668982, 11.300434
+        }).convertTo(keypoints13D, CV_32F);
         vector<Point2f> imagesPoints;
         projectPoints(keypoints13D, true_rvec, true_tvec, matK, distCoeff, imagesPoints);
 
@@ -1958,12 +1964,15 @@ TEST(Calib3d_SolvePnPRansac, inputShape)
 
     {
         //Nx3 1-channel
-        Mat keypoints13D = (Mat_<float>(6, 3) << 12.00604, -2.8654366, 18.472504,
-                                                 7.6863389, 4.9355154, 11.146358,
-                                                 14.260933, 2.8320458, 12.582781,
-                                                 3.4562225, 8.2668982, 11.300434,
-                                                 10.00604,  2.8654366, 15.472504,
-                                                 -4.6863389, 5.9355154, 13.146358);
+        Mat keypoints13D;
+        Mat_<double>({6, 3}, {
+                12.00604, -2.8654366, 18.472504,
+                7.6863389, 4.9355154, 11.146358,
+                14.260933, 2.8320458, 12.582781,
+                3.4562225, 8.2668982, 11.300434,
+                10.00604,  2.8654366, 15.472504,
+                -4.6863389, 5.9355154, 13.146358
+        }).convertTo(keypoints13D, CV_32F);
         vector<Point2f> imagesPoints;
         projectPoints(keypoints13D, true_rvec, true_tvec, matK, distCoeff, imagesPoints);
 
@@ -2307,6 +2316,65 @@ TEST(AP3P, ctheta1p_nan_23607)
         }
         EXPECT_LE(cvtest::norm(res.colRange(0, 2), expected, NORM_INF), 3.34e-16);
     }
+}
+
+TEST(Calib3d_SolvePnP, regression_30402)
+{
+    // A tag seen exactly head-on: the pose has a 180 degree rotation about X.
+    const double L = 0.05;
+    std::vector<Point3d> objectPoints = {
+        Point3d(-L,  L, 0), Point3d( L,  L, 0), Point3d( L, -L, 0), Point3d(-L, -L, 0)
+    };
+    Matx33d intrinsics(800, 0, 320,
+                       0, 800, 240,
+                       0, 0, 1);
+    Vec3d rvecGT(CV_PI, 0, 0), tvecGT(0, 0, 0.5);
+
+    std::vector<Point2d> imagePoints;
+    projectPoints(objectPoints, rvecGT, tvecGT, intrinsics, noArray(), imagePoints);
+
+    Mat rvec, tvec;
+    ASSERT_TRUE(solvePnP(objectPoints, imagePoints, intrinsics, noArray(), rvec, tvec,
+                         false, SOLVEPNP_IPPE_SQUARE));
+
+    Mat R, RGT;
+    cv::Rodrigues(rvec, R);
+    cv::Rodrigues(rvecGT, RGT);
+    EXPECT_LE(cvtest::norm(R, RGT, NORM_INF), 1e-6);
+    EXPECT_LE(cvtest::norm(tvec, Mat(tvecGT), NORM_INF), 1e-6);
+}
+
+TEST(Calib3d_SolvePnPRansac, regression_27098)
+{
+    // Planar target seen at an angle: refining only from the minimal sample model
+    // converged to the mirrored pose, which misses several points by about 10 px.
+    std::vector<Point3f> objectPoints = {
+        Point3f(20, 17.5f, 0), Point3f(208, 17.5f, 0), Point3f(208, 40.5f, 0),
+        Point3f(20, 40.5f, 0), Point3f(440, 97.5f, 0), Point3f(440, 120.5f, 0),
+        Point3f(20, 137.5f, 0), Point3f(208, 137.5f, 0), Point3f(208, 160.5f, 0),
+        Point3f(20, 160.5f, 0)
+    };
+    std::vector<Point2f> imagePoints = {
+        Point2f(545.44006f, 387.48523f), Point2f(613.87695f, 387.2843f),
+        Point2f(613.37036f, 391.72394f), Point2f(544.3327f, 391.97958f),
+        Point2f(700.9006f, 403.2526f), Point2f(701.5016f, 408.12985f),
+        Point2f(538.9222f, 411.964f), Point2f(611.1791f, 411.69757f),
+        Point2f(610.6426f, 416.74878f), Point2f(537.5011f, 416.98953f)
+    };
+    Matx33d intrinsics(609.472778, 0, 642.603699,
+                       0, 609.341736, 393.885529,
+                       0, 0, 1);
+    std::vector<double> distCoeffs = {
+        -1.117186, 0.620454, 0.000008, 0.000002, -0.116633, -1.098497, 0.594703, -0.106835
+    };
+
+    Mat rvec, tvec;
+    ASSERT_TRUE(solvePnPRansac(objectPoints, imagePoints, intrinsics, distCoeffs, rvec, tvec,
+                               false, 1000, 3.0f, 0.99, noArray(), SOLVEPNP_ITERATIVE));
+
+    std::vector<Point2f> projected;
+    projectPoints(objectPoints, rvec, tvec, intrinsics, distCoeffs, projected);
+    EXPECT_LE(cvtest::norm(projected, imagePoints, NORM_INF), 1.0);
 }
 
 }} // namespace

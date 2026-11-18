@@ -6,6 +6,7 @@
 
 #include "../precomp.hpp"
 #include "ptcloud_utils.hpp"
+#include "opencv2/flann.hpp"   // internal kNN when nn_idx is not supplied
 
 namespace cv {
 
@@ -20,11 +21,45 @@ normalEstimate(OutputArray normals, OutputArray curvatures, InputArray input_pts
     getPointsMatFromInputArray(input_pts_, ori_pts, 0);
     int pts_size = ori_pts.rows;
 
-    std::vector<Mat> nn_idx;
-    nn_idx_.getMatVector(nn_idx);
+    // Empty input yields empty outputs (no error), matching the pre-internal-kNN behavior.
+    if (pts_size == 0)
+    {
+        normals.release();
+        curvatures.release();
+        return;
+    }
 
-    CV_CheckEQ((int) nn_idx.size(), pts_size,
-            "The point number of NN search result should be equal to the size of the point cloud.");
+    // When the caller does not provide neighbor indices, build them here with a kd-tree
+    // (max_neighbor_num is then the number of neighbors k, and must be >= 2). The first
+    // neighbor of each point is itself, exactly as the pre-computed nn_idx contract expects.
+    std::vector<Mat> nn_idx;
+    Mat builtIdx;
+    const bool buildNN = nn_idx_.empty();
+    if (buildNN)
+    {
+        CV_Check(max_neighbor_num_, max_neighbor_num_ >= 2,
+                "When nn_idx is empty, max_neighbor_num (the number of neighbors k) must be >= 2.");
+        const int kk = std::min(max_neighbor_num_, pts_size);
+        flann::Index index(ori_pts, flann::KDTreeIndexParams(1));   // single tree for exact search
+        flann::SearchParams exact(cvflann::FLANN_CHECKS_UNLIMITED);
+        builtIdx.create(pts_size, kk, CV_32S);
+        parallel_for_(Range(0, pts_size), [&](const Range &range) {
+            Mat rowDist;   // discarded; only the neighbor indices are used
+            for (int i = range.start; i < range.end; ++i)
+                index.knnSearch(ori_pts.row(i), builtIdx.row(i), rowDist, kk, exact);
+        });
+    }
+    else
+    {
+        nn_idx_.getMatVector(nn_idx);
+        CV_CheckEQ((int) nn_idx.size(), pts_size,
+                "The point number of NN search result should be equal to the size of the point cloud.");
+        for (int i = 0; i < pts_size; ++i)
+        {
+            CV_CheckTypeEQ(nn_idx[i].type(), CV_32SC1, "Each matrix in nn_idx must be CV_32SC1");
+            CV_Assert(!nn_idx[i].empty() && (nn_idx[i].rows == 1 || nn_idx[i].cols == 1));
+        }
+    }
 
     if (normals.channels() == 3 && normals.isVector())
     {
@@ -49,19 +84,31 @@ normalEstimate(OutputArray normals, OutputArray curvatures, InputArray input_pts
         int cur_nei_idx;
         for (int i = range.start; i < range.end; ++i)
         {
+            // Neighbor indices for this point come from either the built kd-tree or the caller.
+            const int *nn_idx_ptr_base = buildNN ? builtIdx.ptr<int>(i) : nullptr;
+            int row_cols = buildNN ? builtIdx.cols : (int)nn_idx[i].total();
             // The maximum size that may be used for this row
-            int bound = max_neighbor_num > nn_idx[i].cols ? nn_idx[i].cols : max_neighbor_num;
-            const int *nn_idx_ptr_base = (int *) nn_idx[i].data;
+            int bound = max_neighbor_num > row_cols ? row_cols : max_neighbor_num;
             // The first point should be itself
             Mat pt_set(ori_pts.row(i));
             // Push the nearest neighbor points to pt_set
             for (int j = 1; j < bound; ++j)
             {
-                cur_nei_idx = nn_idx_ptr_base[j];
-                // If the index is less than 0,
+                cur_nei_idx = buildNN ? nn_idx_ptr_base[j] : nn_idx[i].at<int>(j);
+                // If the index is less than 0 or out of range,
                 // the nn_idx of this row will no longer have any information.
-                if (cur_nei_idx < 0) break;
+                if (cur_nei_idx < 0 || cur_nei_idx >= pts_size) break;
                 pt_set.push_back(ori_pts.row(cur_nei_idx));
+            }
+
+            float *normals_ptr_base = normals_ptr + 3 * i;
+            if (pt_set.rows < 3)
+            {
+                normals_ptr_base[0] = 0.f;
+                normals_ptr_base[1] = 0.f;
+                normals_ptr_base[2] = 0.f;
+                curvatures_ptr[i] = 0.f;
+                continue;
             }
 
             Mat mean;
@@ -71,14 +118,29 @@ normalEstimate(OutputArray normals, OutputArray curvatures, InputArray input_pts
             PCA pca(pt_set, mean, PCA::DATA_AS_ROW);
 
             const float *eigenvectors_ptr = (float *) pca.eigenvectors.data;
-            float *normals_ptr_base = normals_ptr + 3 * i;
-            normals_ptr_base[0] = eigenvectors_ptr[6];
-            normals_ptr_base[1] = eigenvectors_ptr[7];
-            normals_ptr_base[2] = eigenvectors_ptr[8];
+            if (pca.eigenvectors.rows >= 3)
+            {
+                normals_ptr_base[0] = eigenvectors_ptr[6];
+                normals_ptr_base[1] = eigenvectors_ptr[7];
+                normals_ptr_base[2] = eigenvectors_ptr[8];
+            }
+            else
+            {
+                normals_ptr_base[0] = 0.f;
+                normals_ptr_base[1] = 0.f;
+                normals_ptr_base[2] = 0.f;
+            }
 
             const float *eigenvalues_ptr = (float *) pca.eigenvalues.data;
-            curvatures_ptr[i] = eigenvalues_ptr[2] /
-                                (eigenvalues_ptr[0] + eigenvalues_ptr[1] + eigenvalues_ptr[2]);
+            if (pca.eigenvalues.rows >= 3)
+            {
+                curvatures_ptr[i] = eigenvalues_ptr[2] /
+                                    (eigenvalues_ptr[0] + eigenvalues_ptr[1] + eigenvalues_ptr[2]);
+            }
+            else
+            {
+                curvatures_ptr[i] = 0.f;
+            }
         }
     });
 }

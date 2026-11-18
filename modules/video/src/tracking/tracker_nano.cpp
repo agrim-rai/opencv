@@ -88,12 +88,8 @@ class TrackerNanoImpl : public TrackerNano
 public:
     TrackerNanoImpl(const TrackerNano::Params& parameters)
     {
-        dnn::EngineType engine = dnn::ENGINE_AUTO;
-        if (parameters.backend != 0 || parameters.target != 0){
-            engine = dnn::ENGINE_CLASSIC;
-        }
-        backbone = dnn::readNet(parameters.backbone, "", "", engine);
-        neckhead = dnn::readNet(parameters.neckhead, "", "", engine);
+        backbone = dnn::readNet(parameters.backbone);
+        neckhead = dnn::readNet(parameters.neckhead);
 
         CV_Assert(!backbone.empty());
         CV_Assert(!neckhead.empty());
@@ -143,9 +139,8 @@ protected:
     Mat grid2searchX, grid2searchY;
 
     dnn::Net backbone, neckhead;
-    Mat image;
 
-    void getSubwindow(Mat& dstCrop, Mat& srcImg, int originalSz, int resizeSz);
+    void getSubwindow(Mat& dstCrop, const Mat& srcImg, int originalSz, int resizeSz);
     void generateGrids();
 };
 
@@ -177,7 +172,7 @@ void TrackerNanoImpl::init(InputArray image_, const Rect &boundingBox_)
 {
     scoreSize = (instanceSize - exemplarSize) / trackState.totalStride + 8;
     trackState = trackerConfig();
-    image = image_.getMat().clone();
+    const Mat image = image_.getMat();
 
     // convert Rect2d from left-up to center.
     targetPos[0] = float(boundingBox_.x) + float(boundingBox_.width) * 0.5f;
@@ -206,9 +201,8 @@ void TrackerNanoImpl::init(InputArray image_, const Rect &boundingBox_)
     generateGrids();
 }
 
-void TrackerNanoImpl::getSubwindow(Mat& dstCrop, Mat& srcImg, int originalSz, int resizeSz)
+void TrackerNanoImpl::getSubwindow(Mat& dstCrop, const Mat& srcImg, int originalSz, int resizeSz)
 {
-    Scalar avgChans = mean(srcImg);
     Size imgSz = srcImg.size();
     int c = (originalSz + 1) / 2;
 
@@ -236,6 +230,8 @@ void TrackerNanoImpl::getSubwindow(Mat& dstCrop, Mat& srcImg, int originalSz, in
     }
     else // Crop image with padding, and the padding value is avgChans
     {
+        // The mean over the whole frame is only needed for the padding value.
+        Scalar avgChans = mean(srcImg);
         cv::Mat tmpMat;
         cv::copyMakeBorder(srcImg, tmpMat, top_pad, bottom_pad, left_pad, right_pad, cv::BORDER_CONSTANT, avgChans);
         cropImg = tmpMat(cv::Rect(context_xmin, context_ymin, context_xmax - context_xmin + 1, context_ymax - context_ymin + 1));
@@ -245,14 +241,14 @@ void TrackerNanoImpl::getSubwindow(Mat& dstCrop, Mat& srcImg, int originalSz, in
 
 bool TrackerNanoImpl::update(InputArray image_, Rect &boundingBoxRes)
 {
-    image = image_.getMat().clone();
-    int targetSzSum = (int)(targetSz[0] + targetSz[1]);
+    const Mat image = image_.getMat();
+    float targetSzSum = targetSz[0] + targetSz[1];
 
     float wc = targetSz[0] + trackState.contextAmount * targetSzSum;
     float hc = targetSz[1] + trackState.contextAmount * targetSzSum;
     float sz = cv::sqrt(wc * hc);
     float scale_z = exemplarSize / sz;
-    float sx = sz * (instanceSize / exemplarSize);
+    float sx = sz * (float(instanceSize) / exemplarSize);
     targetSz[0] *= scale_z;
     targetSz[1] *= scale_z;
 
@@ -288,7 +284,7 @@ bool TrackerNanoImpl::update(InputArray image_, Rect &boundingBoxRes)
 
     // size penalty
     // scale penalty
-    Mat sc = sizeCal(predX2 - predX1, predY2 - predY1)/sizeCal(targetPos[0], targetPos[1]);
+    Mat sc = sizeCal(predX2 - predX1, predY2 - predY1)/sizeCal(targetSz[0], targetSz[1]);
     elementReciprocalMax(sc);
 
     // ratio penalty
@@ -336,8 +332,11 @@ bool TrackerNanoImpl::update(InputArray image_, Rect &boundingBoxRes)
 
     resX = std::max(0.f, std::min((float)imgSize.width, resX));
     resY = std::max(0.f, std::min((float)imgSize.height, resY));
-    resW = std::max(10.f, std::min((float)imgSize.width, resW));
-    resH = std::max(10.f, std::min((float)imgSize.height, resH));
+    // Keep the size positive, but do not inflate small targets: a 10 px floor (inherited from pysot)
+    // makes the reported box larger than the object and, through the scale penalty, penalizes
+    // correctly sized candidates on the next frame.
+    resW = std::max(1.f, std::min((float)imgSize.width, resW));
+    resH = std::max(1.f, std::min((float)imgSize.height, resH));
 
     targetPos[0] = resX;
     targetPos[1] = resY;

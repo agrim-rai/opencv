@@ -12,14 +12,13 @@ ocv_add_dispatched_file_force_all("layers/cpu_kernels/conv_winograd_f63" AVX AVX
 ocv_add_dispatched_file_force_all("layers/cpu_kernels/fast_gemm_kernels" AVX AVX2 NEON LASX RVV)
 ocv_add_dispatched_file("layers/cpu_kernels/conv2_depthwise" AVX AVX2 NEON NEON_FP16)
 ocv_add_dispatched_file("layers/cpu_kernels/conv2_kernels" AVX AVX2 NEON NEON_FP16)
-ocv_add_dispatched_file_force_all("int8layers/conv2_int8_kernels" AVX2 RVV)
+ocv_add_dispatched_file("layers/cpu_kernels/conv2_deconv" AVX AVX2 NEON)
+ocv_add_dispatched_file("int8layers/conv2_int8_kernels" AVX2 RVV AVX_VNNI AVX512_CLX)
+ocv_add_dispatched_file("int8layers/matmul_int8_kernels" AVX2 AVX_VNNI AVX512_CLX NEON_DOTPROD)
 ocv_add_dispatched_file("layers/cpu_kernels/activation_kernels" AVX AVX2 NEON NEON_FP16)
-ocv_add_dispatched_file_force_all("layers/cpu_kernels/reduce2_kernels" AVX AVX2 NEON RVV LASX)
-ocv_add_dispatched_file_force_all("layers/cpu_kernels/transpose_kernels" AVX AVX2 NEON RVV LASX)
 ocv_add_dispatched_file_force_all("layers/cpu_kernels/gridsample_kernels" AVX AVX2 NEON RVV LASX)
-ocv_add_dispatched_file_force_all("layers/cpu_kernels/nary_eltwise_kernels" AVX AVX2 NEON RVV LASX)
 
-ocv_add_module(dnn opencv_core opencv_imgproc opencv_geometry WRAP python java objc js)
+ocv_add_module(dnn opencv_core opencv_imgproc opencv_geometry OPTIONAL opencv_imgcodecs WRAP python java objc js)
 
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/plugin.cmake)
 
@@ -51,19 +50,19 @@ endif()
 ocv_option(OPENCV_DNN_CUDA "Build with CUDA support"
     HAVE_CUDA
     AND HAVE_CUBLAS
-    AND HAVE_CUDNN
+    AND (HAVE_CUDNN OR HAVE_CUDNNJIT)
 )
 
 if(OPENCV_DNN_CUDA)
-  if(HAVE_CUDA AND HAVE_CUBLAS AND HAVE_CUDNN)
+  if(HAVE_CUDA AND HAVE_CUBLAS AND (HAVE_CUDNN OR HAVE_CUDNNJIT))
     ocv_target_compile_definitions(${the_module} PRIVATE "CV_CUDA4DNN=1")
   else()
     if(NOT HAVE_CUDA)
       message(SEND_ERROR "DNN: CUDA backend requires CUDA Toolkit. Please resolve dependency or disable OPENCV_DNN_CUDA=OFF")
     elseif(NOT HAVE_CUBLAS)
       message(SEND_ERROR "DNN: CUDA backend requires cuBLAS. Please resolve dependency or disable OPENCV_DNN_CUDA=OFF")
-    elseif(NOT HAVE_CUDNN)
-      message(SEND_ERROR "DNN: CUDA backend requires cuDNN. Please resolve dependency or disable OPENCV_DNN_CUDA=OFF")
+    elseif(NOT HAVE_CUDNN AND NOT HAVE_CUDNNJIT)
+      message(SEND_ERROR "DNN: CUDA backend requires cuDNN (WITH_CUDNN) or the cuDNN graph API (WITH_CUDNNJIT). Please resolve dependency or disable OPENCV_DNN_CUDA=OFF")
     endif()
   endif()
 endif()
@@ -93,10 +92,6 @@ endif()
 if(HAVE_CUDA)
   ocv_warnings_disable(CMAKE_CXX_FLAGS -Wundef)
 endif()
-if(NOT HAVE_CXX11)
-  ocv_warnings_disable(CMAKE_CXX_FLAGS -Wno-undef)  # LANG_CXX11 from protobuf files
-endif()
-
 if(APPLE_FRAMEWORK)
   ocv_warnings_disable(CMAKE_CXX_FLAGS -Wshorten-64-to-32)
 endif()
@@ -407,13 +402,12 @@ if(HAVE_PROTOBUF)
   ocv_target_compile_definitions(${the_module} PRIVATE "HAVE_PROTOBUF=1")
 
   if(PROTOBUF_UPDATE_FILES)
-    file(GLOB proto_files "${CMAKE_CURRENT_LIST_DIR}/src/tensorflow/*.proto" "${CMAKE_CURRENT_LIST_DIR}/src/onnx/opencv-onnx.proto")
+    file(GLOB proto_files "${CMAKE_CURRENT_LIST_DIR}/src/onnx/opencv-onnx.proto")
     if(CMAKE_VERSION VERSION_LESS "3.13.0")
-      set(PROTOBUF_GENERATE_CPP_APPEND_PATH ON) # required for tensorflow
       protobuf_generate_cpp(fw_srcs fw_hdrs ${proto_files})
     else()
       protobuf_generate(
-        APPEND_PATH # required for tensorflow
+        APPEND_PATH
         LANGUAGE cpp
         IMPORT_DIRS ${Protobuf_IMPORT_DIRS}
         OUT_VAR fw_srcs
@@ -425,9 +419,9 @@ if(HAVE_PROTOBUF)
       list(FILTER fw_hdrs INCLUDE REGEX ".+\.h$")
     endif()
   else()
-    file(GLOB fw_srcs "${CMAKE_CURRENT_LIST_DIR}/misc/tensorflow/*.cc" "${CMAKE_CURRENT_LIST_DIR}/misc/onnx/opencv-onnx.pb.cc")
-    file(GLOB fw_hdrs "${CMAKE_CURRENT_LIST_DIR}/misc/tensorflow/*.h" "${CMAKE_CURRENT_LIST_DIR}/misc/onnx/opencv-onnx.pb.h")
-    set(fw_inc "${CMAKE_CURRENT_LIST_DIR}/misc/tensorflow" "${CMAKE_CURRENT_LIST_DIR}/misc/onnx")
+    file(GLOB fw_srcs "${CMAKE_CURRENT_LIST_DIR}/misc/onnx/opencv-onnx.pb.cc")
+    file(GLOB fw_hdrs "${CMAKE_CURRENT_LIST_DIR}/misc/onnx/opencv-onnx.pb.h")
+    set(fw_inc "${CMAKE_CURRENT_LIST_DIR}/misc/onnx")
   endif()
 endif()
 
@@ -461,8 +455,8 @@ else()
   set(sources_options EXCLUDE_OPENCL)
 endif()
 
-if(OPENCV_DNN_CUDA AND HAVE_CUDA AND HAVE_CUBLAS AND HAVE_CUDNN)
-  list(APPEND include_dirs ${CUDA_TOOLKIT_INCLUDE} ${CUDNN_INCLUDE_DIRS})
+if(OPENCV_DNN_CUDA AND HAVE_CUDA AND HAVE_CUBLAS AND (HAVE_CUDNN OR HAVE_CUDNNJIT))
+  list(APPEND include_dirs ${CUDA_TOOLKIT_INCLUDE} ${CUDNN_INCLUDE_DIRS} ${CUDNNJIT_INCLUDE_DIRS})
   set(CC_LIST ${CUDA_ARCH_BIN})
   separate_arguments(CC_LIST)
   foreach(cc ${CC_LIST})
@@ -472,7 +466,7 @@ if(OPENCV_DNN_CUDA AND HAVE_CUDA AND HAVE_CUBLAS AND HAVE_CUDNN)
   endforeach()
   unset(CC_LIST)
   if(ENABLE_CUDA_FIRST_CLASS_LANGUAGE)
-    list(APPEND libs CUDA::cudart${CUDA_LIB_EXT} ${CUDNN_LIBRARIES} CUDA::cublas${CUDA_LIB_EXT})
+    list(APPEND libs CUDA::cudart${CUDA_LIB_EXT} ${CUDNN_LIBRARIES} ${CUDNNJIT_LIBRARIES} CUDA::cublas${CUDA_LIB_EXT})
     if(NOT CUDA_VERSION VERSION_LESS 10.1)
       list(APPEND libs CUDA::cublasLt${CUDA_LIB_EXT})
     endif()
@@ -507,6 +501,7 @@ endif()
 # CPU SGEMM accelerator (asm/intrinsic kernels) and the wasm scalar fallback
 # offers no benefit for the JS bindings build that produces opencv.js.
 set(HAVE_MLAS 0)
+set(MLAS_EXTERNAL_OBJECTS "")
 # Reset status flags + arch booleans
 foreach(_v OPENCV_DNN_MLAS_ENABLED OPENCV_DNN_MLAS_SKIP_REASON
            MLAS_X86_64 MLAS_X86 MLAS_ARM MLAS_ARM64 MLAS_POWER
@@ -518,6 +513,10 @@ if(NOT EMSCRIPTEN)
   add_subdirectory("${OpenCV_SOURCE_DIR}/3rdparty/mlas" "${CMAKE_BINARY_DIR}/3rdparty/mlas")
 endif()
 if(HAVE_MLAS)
+  if(MLAS_EXTERNAL_OBJECTS)
+    # Older CMake versions do not propagate GENERATED from the MLAS directory.
+    set_source_files_properties(${MLAS_EXTERNAL_OBJECTS} PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  endif()
   add_definitions(-DHAVE_MLAS=1)
   list(APPEND include_dirs ${MLAS_INCLUDE_DIRS})
   message(STATUS "DNN: MLAS (vendored) enabled.")
@@ -546,7 +545,7 @@ set(dnn_plugin_srcs ${dnn_srcs} ${dnn_int_hdrs})
 ocv_list_filterout_ex(dnn_plugin_srcs
     "/src/dnn.cpp$|/src/dnn_utils.cpp$|/src/dnn_read.cpp$|/src/registry.cpp$|/src/backend.cpp$"
     # importers
-    "/src/(onnx|tensorflow)/|/src/protobuf_io.cpp$"
+    "/src/onnx/"
     # executors
     "/src/(cuda|cuda4dnn|ocl4dnn|vkcom|webnn)/"
 )

@@ -898,8 +898,8 @@ void QRCodeEncoderImpl::findAutoMaskType()
             }
         }
         Mat penalty_pattern[2];
-        penalty_pattern[0] = (Mat_<uint8_t >(1, 11) << 255, 255, 255, 255, 0, 255, 0, 0, 0, 255, 0);
-        penalty_pattern[1] = (Mat_<uint8_t >(1, 11) << 0, 255, 0, 0, 0, 255, 0, 255, 255, 255, 255);
+        penalty_pattern[0] = Mat_<uint8_t >({1, 11}, {255, 255, 255, 255, 0, 255, 0, 0, 0, 255, 0});
+        penalty_pattern[1] = Mat_<uint8_t >({1, 11}, {0, 255, 0, 0, 0, 255, 0, 255, 255, 255, 255});
         for (int direction = 0; direction < 2; direction++)
         {
             if (direction != 0)
@@ -1774,7 +1774,10 @@ bool QRCodeDecoderImpl::decodeSymbols(String& result) {
             parity = static_cast<uint8_t>(bitstream.next(8));
         }
         else
-            CV_Error(Error::StsNotImplemented, format("mode %d", currMode));
+        {
+            CV_LOG_ERROR(NULL, "QRcode mode " << (int)currMode << " is not supported!");
+            return false;
+        }
     }
     return true;
 }

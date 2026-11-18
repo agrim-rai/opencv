@@ -39,6 +39,7 @@ public:
     virtual void setPreferableBackend(Backend backendId) { net.setPreferableBackend(backendId); }
     virtual void setPreferableTarget(Target targetId) { net.setPreferableTarget(targetId); }
     virtual void enableWinograd(bool useWinograd) { net.enableWinograd(useWinograd); }
+    virtual void enableTF32(bool useTF32) { net.enableTF32(useTF32); }
 
     virtual
     void initNet(const Net& network)
@@ -139,6 +140,24 @@ public:
         }
 
         net.forward(outs, outNames);
+
+        // Every Model subclass post-processes in float, so widen a declared-half output back.
+        for (int i = 0; i < (int)outs.total(); i++)
+        {
+            const int depth = outs.depth(i);
+            if (depth != CV_16F && depth != CV_16BF)
+                continue;
+            if (outs.isUMatVector())
+            {
+                UMat& out = outs.getUMatRef(i);
+                out.convertTo(out, CV_32F);
+            }
+            else
+            {
+                Mat& out = outs.getMatRef(i);
+                out.convertTo(out, CV_32F);
+            }
+        }
     }
 };
 
@@ -184,6 +203,13 @@ Model& Model::enableWinograd(bool useWinograd)
 {
     CV_DbgAssert(impl);
     impl->enableWinograd(useWinograd);
+    return *this;
+}
+
+Model& Model::enableTF32(bool useTF32)
+{
+    CV_DbgAssert(impl);
+    impl->enableTF32(useTF32);
     return *this;
 }
 

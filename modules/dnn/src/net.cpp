@@ -142,6 +142,10 @@ void Net::finalizeNet()
         return;
     }
 #endif
+    // New graph engine: explicitly select per-op executors for the chosen backend/target now,
+    // so the first forward() isn't slowed by it.
+    if (impl->mainGraph)
+        impl->finalize();
 }
 
 void Net::setInputsNames(const std::vector<String>& inputBlobNames)
@@ -439,6 +443,13 @@ void Net::enableWinograd(bool useWinograd)
     return impl->enableWinograd(useWinograd);
 }
 
+void Net::enableTF32(bool useTF32)
+{
+    CV_TRACE_FUNCTION();
+    CV_Assert(impl);
+    return impl->enableTF32(useTF32);
+}
+
 int64 Net::getPerfProfile(std::vector<double>& timings)
 {
     CV_TRACE_FUNCTION();
@@ -509,6 +520,26 @@ void Net::resetKVCache()
 {
     CV_Assert(impl);
     setKVCacheManager(impl);
+}
+
+void Net::reserveKVCache(int maxSequenceLength)
+{
+    CV_Assert(impl);
+    CV_CheckTrue(impl->useKVCache && impl->kvCacheManager.isInitialized,
+                 "reserveKVCache() requires enableKVCache() to be called first");
+    CV_CheckGE(maxSequenceLength, 0, "maxSequenceLength must be non-negative");
+    CV_CheckLE(maxSequenceLength, KV_CACHE_MAX_RESERVED_TOKENS,
+               "maxSequenceLength is unreasonably large");
+    if (impl->kvCacheManager.empty())
+    {
+        CV_LOG_WARNING(NULL, "DNN: reserveKVCache() has no effect, the model has no paged attention "
+                             "layers (no Attention/MultiHeadAttention op was imported, and a "
+                             "GroupQueryAttention node that carries seqlens_k or a rotary cache "
+                             "keeps its KV history in the graph instead). "
+                             "Only the present.* -> past_key_values.* routing is active.");
+        return;
+    }
+    impl->kvCacheManager.reserve(maxSequenceLength);
 }
 
 

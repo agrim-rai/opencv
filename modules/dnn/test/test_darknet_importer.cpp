@@ -55,13 +55,6 @@ static std::string _tf(TString filename)
 
 TEST(Test_YOLO, read_yolov4_onnx)
 {
-    auto engine_forced = static_cast<cv::dnn::EngineType>(
-            cv::utils::getConfigurationParameterSizeT("OPENCV_FORCE_DNN_ENGINE", cv::dnn::ENGINE_AUTO));
-    if (engine_forced == cv::dnn::ENGINE_CLASSIC)
-    {
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_PARSER);
-        return;
-    }
     Net net = readNet(findDataFile("dnn/yolov4.onnx", false));
     ASSERT_FALSE(net.empty());
 }
@@ -78,20 +71,12 @@ public:
                        float nmsThreshold = 0.4, bool useWinograd = true,
                        int zeroPadW = 0, Size inputSize = Size())
     {
-        auto engine_forced = static_cast<cv::dnn::EngineType>(
-                cv::utils::getConfigurationParameterSizeT("OPENCV_FORCE_DNN_ENGINE", cv::dnn::ENGINE_AUTO));
-        if (engine_forced == cv::dnn::ENGINE_CLASSIC)
-        {
-            applyTestTag(CV_TEST_TAG_DNN_SKIP_PARSER);
-            return;
-        }
-
         checkBackend();
 
         Mat img1 = imread(_tf("dog416.png"));
         Mat img2 = imread(_tf("street.png"));
-        cv::resize(img1, img1, inputSize);
-        cv::resize(img2, img2, inputSize);
+        cv::resize(img1, img1, inputSize, 0, 0, cv::INTER_LINEAR_EXACT);
+        cv::resize(img2, img2, inputSize, 0, 0, cv::INTER_LINEAR_EXACT);
 
         // Pad images by black pixel at the right to test not equal width and height sizes
         if (zeroPadW) {
@@ -107,7 +92,7 @@ public:
         CV_Assert(batch_size == 1 || batch_size == 2);
         samples.resize(batch_size);
 
-        Mat inp = blobFromImages(samples, 1.0/255, Size(), Scalar(), true, false);
+        Mat inp = blobFromImages(samples, 1.0/255, Size(), Scalar(), true, false, CV_32F, /*interpolation*/ cv::INTER_LINEAR_EXACT);
 
         Net net = readNet(findDataFile("dnn/" + model, false));
         net.setPreferableBackend(backend);
@@ -288,6 +273,11 @@ TEST_P(Test_YOLO_nets, YOLOv4)
     {
         scoreDiff = 0.008;
         iouDiff = 0.03;
+    }
+    else if (target == DNN_TARGET_CUDA && cudaTF32Enabled())
+    {
+        // TF32 reorders two near-tied NMS candidates on one box: IoU diff 0.0429 in 100 of 100 runs
+        iouDiff = 0.05;
     }
 
     std::string model_file = "yolov4.onnx";

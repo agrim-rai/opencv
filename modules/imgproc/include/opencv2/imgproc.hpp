@@ -372,6 +372,32 @@ enum FloodFillFlags {
     FLOODFILL_MASK_ONLY   = 1 << 17
 };
 
+/** @brief Porter-Duff compositing operators used by cv::alphaComposite.
+
+The names and the semantics follow [W3C Compositing and Blending Level 1](https://www.w3.org/TR/compositing-1/),
+which is also what Cairo and Skia implement. Every operator is a pair of per-pixel weights
+\f$F_a\f$ (applied to the overlay, the *source*) and \f$F_b\f$ (applied to the background, the
+*destination*), combined in premultiplied alpha space:
+\f[C_o = C_s F_a + C_b F_b, \qquad \alpha_o = \alpha_s F_a + \alpha_b F_b\f]
+The weights are listed below for each operator in terms of the source alpha \f$\alpha_s\f$ and the
+destination alpha \f$\alpha_b\f$.
+*/
+enum AlphaCompositeOperations {
+    ALPHA_COMPOSITE_CLEAR     = 0,  //!< \f$F_a = 0\f$, \f$F_b = 0\f$. Erases both images.
+    ALPHA_COMPOSITE_SOURCE    = 1,  //!< \f$F_a = 1\f$, \f$F_b = 0\f$. Keeps the overlay only (W3C `copy`).
+    ALPHA_COMPOSITE_DEST      = 2,  //!< \f$F_a = 0\f$, \f$F_b = 1\f$. Keeps the background only.
+    ALPHA_COMPOSITE_OVER      = 3,  //!< \f$F_a = 1\f$, \f$F_b = 1 - \alpha_s\f$. Draws the overlay on top (W3C `source-over`).
+    ALPHA_COMPOSITE_DEST_OVER = 4,  //!< \f$F_a = 1 - \alpha_b\f$, \f$F_b = 1\f$. Draws the overlay underneath.
+    ALPHA_COMPOSITE_IN        = 5,  //!< \f$F_a = \alpha_b\f$, \f$F_b = 0\f$. Keeps the overlay where the background is opaque.
+    ALPHA_COMPOSITE_DEST_IN   = 6,  //!< \f$F_a = 0\f$, \f$F_b = \alpha_s\f$. Keeps the background where the overlay is opaque.
+    ALPHA_COMPOSITE_OUT       = 7,  //!< \f$F_a = 1 - \alpha_b\f$, \f$F_b = 0\f$. Keeps the overlay where the background is transparent.
+    ALPHA_COMPOSITE_DEST_OUT  = 8,  //!< \f$F_a = 0\f$, \f$F_b = 1 - \alpha_s\f$. Keeps the background where the overlay is transparent.
+    ALPHA_COMPOSITE_ATOP      = 9,  //!< \f$F_a = \alpha_b\f$, \f$F_b = 1 - \alpha_s\f$. Draws the overlay on top, clipped to the background's shape.
+    ALPHA_COMPOSITE_DEST_ATOP = 10, //!< \f$F_a = 1 - \alpha_b\f$, \f$F_b = \alpha_s\f$. Draws the background on top, clipped to the overlay's shape.
+    ALPHA_COMPOSITE_XOR       = 11, //!< \f$F_a = 1 - \alpha_b\f$, \f$F_b = 1 - \alpha_s\f$. Keeps the non-overlapping parts of both.
+    ALPHA_COMPOSITE_PLUS      = 12  //!< \f$F_a = 1\f$, \f$F_b = 1\f$. Adds the two, clamped (W3C `lighter`, Cairo `OPERATOR_ADD`).
+};
+
 //! @} imgproc_misc
 
 //! @addtogroup imgproc_shape
@@ -863,7 +889,12 @@ enum ColorConversionCodes {
     COLOR_RGBA2YUV_YUNV = COLOR_RGBA2YUV_YUY2, //!< synonym to YUY2
     COLOR_BGRA2YUV_YUNV = COLOR_BGRA2YUV_YUY2, //!< synonym to YUY2
 
-    COLOR_COLORCVT_MAX  = 155
+    COLOR_BGR2Oklab     = 155, //!< [8U/32F] convert RGB/BGR to perceptual Oklab, @ref color_convert_rgb_oklab "color conversions"
+    COLOR_RGB2Oklab     = 156, //!< [8U/32F]
+    COLOR_Oklab2BGR     = 157, //!< [8U/32F]
+    COLOR_Oklab2RGB     = 158, //!< [8U/32F]
+
+    COLOR_COLORCVT_MAX  = 159
 };
 
 //! @addtogroup imgproc_shape
@@ -1184,7 +1215,7 @@ kernels are generated (see #Sobel). The filters are normally passed to #sepFilte
 @param ky Output matrix of column filter coefficients. It has the type ktype .
 @param dx Derivative order in respect of x.
 @param dy Derivative order in respect of y.
-@param ksize Aperture size. It can be FILTER_SCHARR, 1, 3, 5, or 7.
+@param ksize Aperture size. It can be FILTER_SCHARR, or an odd number not larger than 31 (1, 3, 5, and 7 are the typical choices).
 @param normalize Flag indicating whether to normalize (scale down) the filter coefficients or not.
 Theoretically, the coefficients should have the denominator \f$=2^{ksize*2-dx-dy-2}\f$. If you are
 going to filter floating-point images, you are likely to use the normalized kernels. But if you
@@ -1247,7 +1278,7 @@ In-place operation is supported.
 @param src input 1-, 3-, or 4-channel image; when ksize is 3 or 5, the image depth should be
 CV_8U, CV_16U, or CV_32F, for larger aperture sizes, it can only be CV_8U.
 @param dst destination array of the same size and type as src.
-@param ksize aperture linear size; it must be odd and greater than 1, for example: 3, 5, 7 ...
+@param ksize aperture linear size; it must be odd and positive, for example: 1, 3, 5, 7 ... (ksize = 1 returns the image unchanged)
 @sa  bilateralFilter, blur, boxFilter, GaussianBlur
  */
 CV_EXPORTS_W void medianBlur( InputArray src, OutputArray dst, int ksize );
@@ -1513,7 +1544,7 @@ The second case corresponds to a kernel of:
     8-bit input images it will result in truncated derivatives.
 @param dx order of the derivative x.
 @param dy order of the derivative y.
-@param ksize size of the extended Sobel kernel; it must be 1, 3, 5, or 7.
+@param ksize size of the extended Sobel kernel; it must be odd and not larger than 31 (1, 3, 5, and 7 are the typical choices).
 @param scale optional scale factor for the computed derivative values; by default, no scaling is
 applied (see #getDerivKernels for details).
 @param delta optional delta value that is added to the results prior to storing them in dst.
@@ -1597,7 +1628,7 @@ with the following \f$3 \times 3\f$ aperture:
 @param dst Destination image of the same size and the same number of channels as src .
 @param ddepth Desired depth of the destination image, see @ref filter_depths "combinations".
 @param ksize Aperture size used to compute the second-derivative filters. See #getDerivKernels for
-details. The size must be positive and odd.
+details. The size must be positive, odd, and not larger than 31 (1, 3, 5, and 7 are the typical choices).
 @param scale Optional scale factor for the computed Laplacian values. By default, no scaling is
 applied. See #getDerivKernels for details.
 @param delta Optional delta value that is added to the results prior to storing them in dst .
@@ -1635,6 +1666,10 @@ largest value is used to find initial segments of strong edges. See
 \f$=\sqrt{(dI/dx)^2 + (dI/dy)^2}\f$ should be used to calculate the image gradient magnitude (
 L2gradient=true ), or whether the default \f$L_1\f$ norm \f$=|dI/dx|+|dI/dy|\f$ is enough (
 L2gradient=false ).
+For efficiency, when L2gradient=true the implementation compares the squared
+gradient magnitude \f$(dI/dx)^2 + (dI/dy)^2\f$ against the squared thresholds
+instead of computing the square root; the resulting edge map is the same as if
+the \f$L_2\f$ norm were computed directly.
  */
 CV_EXPORTS_W void Canny( InputArray image, OutputArray edges,
                          double threshold1, double threshold2,
@@ -1653,6 +1688,10 @@ Finds edges in an image using the Canny algorithm with custom image gradient.
 \f$=\sqrt{(dI/dx)^2 + (dI/dy)^2}\f$ should be used to calculate the image gradient magnitude (
 L2gradient=true ), or whether the default \f$L_1\f$ norm \f$=|dI/dx|+|dI/dy|\f$ is enough (
 L2gradient=false ).
+For efficiency, when L2gradient=true the implementation compares the squared
+gradient magnitude \f$(dI/dx)^2 + (dI/dy)^2\f$ against the squared thresholds
+instead of computing the square root; the resulting edge map is the same as if
+the \f$L_2\f$ norm were computed directly.
  */
 CV_EXPORTS_W void Canny( InputArray dx, InputArray dy,
                          OutputArray edges,
@@ -1669,7 +1708,7 @@ of the formulae in the cornerEigenValsAndVecs description.
 @param dst Image to store the minimal eigenvalues. It has the type CV_32FC1 and the same size as
 src .
 @param blockSize Neighborhood size (see the details on #cornerEigenValsAndVecs ).
-@param ksize Aperture parameter for the Sobel operator.
+@param ksize Aperture parameter for the Sobel operator. It can be #FILTER_SCHARR, or an odd number not larger than 31 (1, 3, 5, and 7 are the typical choices).
 @param borderType Pixel extrapolation method. See #BorderTypes. #BORDER_WRAP is not supported.
  */
 CV_EXPORTS_W void cornerMinEigenVal( InputArray src, OutputArray dst,
@@ -1691,7 +1730,7 @@ Corners in the image can be found as the local maxima of this response map.
 @param dst Image to store the Harris detector responses. It has the type CV_32FC1 and the same
 size as src .
 @param blockSize Neighborhood size (see the details on #cornerEigenValsAndVecs ).
-@param ksize Aperture parameter for the Sobel operator.
+@param ksize Aperture parameter for the Sobel operator. It can be #FILTER_SCHARR, or an odd number not larger than 31 (1, 3, 5, and 7 are the typical choices).
 @param k Harris detector free parameter. See the formula above.
 @param borderType Pixel extrapolation method. See #BorderTypes. #BORDER_WRAP is not supported.
  */
@@ -1724,7 +1763,7 @@ The output of the function can be used for robust edge or corner detection.
 @param src Input single-channel 8-bit or floating-point image.
 @param dst Image to store the results. It has the same size as src and the type CV_32FC(6) .
 @param blockSize Neighborhood size (see details below).
-@param ksize Aperture parameter for the Sobel operator.
+@param ksize Aperture parameter for the Sobel operator. It can be #FILTER_SCHARR, or an odd number not larger than 31 (1, 3, 5, and 7 are the typical choices).
 @param borderType Pixel extrapolation method. See #BorderTypes. #BORDER_WRAP is not supported.
 
 @sa  cornerMinEigenVal, cornerHarris, preCornerDetect
@@ -1751,9 +1790,9 @@ The corners can be found as local maximums of the functions, as shown below:
     Mat corner_mask = corners == dilated_corners;
 @endcode
 
-@param src Source single-channel 8-bit of floating-point image.
+@param src Source single-channel 8-bit or floating-point image.
 @param dst Output image that has the type CV_32F and the same size as src .
-@param ksize %Aperture size of the Sobel .
+@param ksize Aperture size of the Sobel operator; it must be odd and not larger than 31 (1, 3, 5, and 7 are the typical choices).
 @param borderType Pixel extrapolation method. See #BorderTypes. #BORDER_WRAP is not supported.
  */
 CV_EXPORTS_W void preCornerDetect( InputArray src, OutputArray dst, int ksize,
@@ -2151,7 +2190,9 @@ and then put in the formula above instead of M. The function cannot operate in-p
 @param flags combination of interpolation methods (#INTER_LINEAR or #INTER_NEAREST) and the
 optional flag #WARP_INVERSE_MAP, that sets M as the inverse transformation (
 \f$\texttt{dst}\rightarrow\texttt{src}\f$ ).
-@param borderMode pixel extrapolation method (#BORDER_CONSTANT or #BORDER_REPLICATE).
+@param borderMode pixel extrapolation method (see #BorderTypes); when
+borderMode=#BORDER_TRANSPARENT, it means that the pixels in the destination image corresponding to
+the "outliers" in the source image are not modified by the function.
 @param borderValue value used in case of a constant border; by default, it equals 0.
 @param hint Implementation modification flags. Set #ALGO_HINT_APPROX to use FP16 precision (if available)
 for linear calculation for faster speed. See #AlgorithmHint.
@@ -2378,19 +2419,16 @@ computes the corresponding coordinates in the source image (that is, in the orig
 \text{newCameraMatrix}\\
 x  \leftarrow (u - {c'}_x)/{f'}_x  \\
 y  \leftarrow (v - {c'}_y)/{f'}_y  \\
-
 \\\text{Undistortion}
 \\\scriptsize{\textit{though equation shown is for radial undistortion, function implements cv::undistortPoints()}}\\
 r^2  \leftarrow x^2 + y^2 \\
 \theta \leftarrow \frac{1 + k_1 r^2 + k_2 r^4 + k_3 r^6}{1 + k_4 r^2 + k_5 r^4 + k_6 r^6}\\
 x' \leftarrow \frac{x}{\theta} \\
 y'  \leftarrow \frac{y}{\theta} \\
-
 \\\text{Rectification}\\
 {[X\,Y\,W]} ^T  \leftarrow R*[x' \, y' \, 1]^T  \\
 x''  \leftarrow X/W  \\
 y''  \leftarrow Y/W  \\
-
 \\\text{cameraMatrix}\\
 map_x(u,v)  \leftarrow x'' f_x + c_x  \\
 map_y(u,v)  \leftarrow y'' f_y + c_y
@@ -3475,6 +3513,52 @@ CV_EXPORTS int floodFill( InputOutputArray image,
 //! @param dst It is created if it does not have the same size and type with src1.
 CV_EXPORTS_W void blendLinear(InputArray src1, InputArray src2, InputArray weights1, InputArray weights2, OutputArray dst);
 
+/** @brief Composites two images according to their alpha channels, using a Porter-Duff operator.
+
+The default operator, #ALPHA_COMPOSITE_OVER, draws overlay on top of background and blends the two
+according to overlay's alpha channel, so that partially-transparent pixels mix smoothly into the
+background with no fringing at the edges. This is what is usually wanted when pasting an RGBA
+sprite, an antialiased glyph or a segmentation mask onto a picture. The other operators of
+#AlphaCompositeOperations select the rest of the Porter-Duff set, for instance
+#ALPHA_COMPOSITE_ATOP to clip the overlay to the background's shape, or #ALPHA_COMPOSITE_DEST_OUT
+to punch a hole in the background.
+
+Only the compositing operator is configurable. The blend mode is always *normal*: the overlay's
+color is taken as-is and is never mixed with the background's color the way the separable blend
+modes of the same specification (multiply, screen, overlay, darken, and so on) do. Blend modes are
+a separate axis and are not implemented here.
+
+All operators are evaluated in premultiplied alpha space, where each one reduces to a pair of
+per-pixel weights \f$F_a\f$, \f$F_b\f$ listed in #AlphaCompositeOperations:
+\f[C_o = C_s F_a + C_b F_b, \qquad \alpha_o = \alpha_s F_a + \alpha_b F_b\f]
+with \f$C_s, \alpha_s\f$ taken from overlay and \f$C_b, \alpha_b\f$ from background. Inputs that
+carry straight (unassociated) alpha are premultiplied on entry and the result is un-premultiplied
+on exit. Both steps reuse #cvtColor with #COLOR_RGBA2mRGBA and #COLOR_mRGBA2RGBA, so alphaComposite
+follows exactly the same alpha conventions as those conversions.
+
+@param overlay 8-bit 4-channel image (RGBA or BGRA; channel order does not matter as long as it
+matches background) acting as the source of the operator; must be the same size as background.
+@param background 8-bit 3-channel or 4-channel image acting as the destination of the operator. A
+4-channel background contributes its own alpha to the blend, using the same straight/premultiplied
+convention as overlay, and dst has 4 channels holding the composited alpha \f$\alpha_o\f$. A
+3-channel background is taken to be fully opaque (\f$\alpha_b = 1\f$) and dst has 3 channels;
+since such a dst cannot store \f$\alpha_o\f$, the alpha is dropped and the premultiplied color is
+written, which is what Cairo does when the target surface has no alpha channel. Operators whose
+result is not opaque (#ALPHA_COMPOSITE_CLEAR, #ALPHA_COMPOSITE_OUT, #ALPHA_COMPOSITE_XOR and
+others) therefore darken toward black on a 3-channel background; pass a 4-channel background to
+keep the alpha.
+@param dst output image, created with the same size and type as background. It may be the same
+array as background.
+@param op compositing operator, one of #AlphaCompositeOperations.
+@param premultiplied false (the default) if overlay's alpha (and background's, when it has one) is
+straight/unassociated, as produced by e.g. `imread(..., IMREAD_UNCHANGED)`; true if it is already
+premultiplied, which skips the internal conversion.
+
+@sa cvtColor, COLOR_RGBA2mRGBA, COLOR_mRGBA2RGBA, blendLinear, addWeighted
+*/
+CV_EXPORTS_W void alphaComposite(InputArray overlay, InputArray background, OutputArray dst,
+                                 int op = ALPHA_COMPOSITE_OVER, bool premultiplied = false);
+
 //! @} imgproc_misc
 
 //! @addtogroup imgproc_color_conversions
@@ -4310,8 +4394,17 @@ public:
     /** @brief loads default font */
     CV_WRAP FontFace();
     /** @brief loads font at the specified path or with specified name.
-       @param fontPathOrName either path to the custom font or the name of embedded font: "sans", "italic" or "uni".
-          Empty fontPathOrName means the default embedded font.
+       @param fontPathOrName either path to a custom font file (.ttf/.otf, optionally gzip-compressed)
+          or the name of one of the built-in font slots:
+          - "sans": the default font (Rubik, always compiled in);
+          - "italic": Rubik Italic, compiled in only if OpenCV was built with WITH_ITALICFONT=ON;
+            otherwise it can be provided with setBuiltinFont(), and if it is not available,
+            "italic" silently resolves to "sans";
+          - "uni": WenQuanYi Micro Hei (CJK), compiled in only with WITH_UNIFONT=ON; otherwise
+            provide it with setBuiltinFont(), or loading fails.
+          The built-in slots also serve as the fallback chain: characters missing from the
+          user's font are taken from "sans", then "italic", then "uni".
+          Empty fontPathOrName means the default embedded font ("sans").
     */
     CV_WRAP FontFace(const String& fontPathOrName);
 
@@ -4329,6 +4422,23 @@ public:
     */
     CV_WRAP bool setInstance(const std::vector<int>& params);
     CV_WRAP bool getInstance(CV_OUT std::vector<int>& params) const;
+
+    /** @brief Provides or replaces one of the built-in font slots with an external font file.
+        @param fontName the slot: "sans", "italic" or "uni".
+        @param fontPath path to a .ttf/.otf font (optionally gzip-compressed, e.g. `.ttf.gz`).
+          An empty path restores the compiled-in font of that slot (if any), otherwise the slot
+          becomes empty.
+        @return false if the slot name is unknown or the font file cannot be loaded (the
+          registry is left unchanged).
+
+        This is the way to get CJK text or a true italic when OpenCV is built without
+        WITH_UNIFONT / WITH_ITALICFONT (the defaults), e.g.
+        `cv::FontFace::setBuiltinFont("uni", "/usr/share/fonts/NotoSansCJK-Regular.ttc")`.
+        The registered font participates in the automatic fallback chain like the compiled-in
+        one would. The change is global (all threads) and applies to FontFace objects created
+        afterwards; existing FontFace objects keep the font they were created with.
+    */
+    CV_WRAP static bool setBuiltinFont(const String& fontName, const String& fontPath);
 
     struct Impl;
 

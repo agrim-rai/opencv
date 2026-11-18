@@ -17,7 +17,7 @@ float focal_length = 525;
 float cx = W / 2.f + 0.5f;
 float cy = H / 2.f + 0.5f;
 
-static Mat K() { static Mat res = (Mat_<double>(3, 3) << focal_length, 0, cx, 0, focal_length, cy, 0, 0, 1); return res; }
+static Mat K() { static Mat res = Mat_<double>({3, 3}, {focal_length, 0, cx, 0, focal_length, cy, 0, 0, 1}); return res; }
 static Mat Kinv() { static Mat res = K().inv(); return res; }
 
 void points3dToDepth16U(const Mat_<Vec4f>& points3d, Mat& depthMap);
@@ -340,7 +340,9 @@ INSTANTIATE_TEST_CASE_P(RGBD_Normals, NormalsRandomPlanes,
 ::testing::Combine(::testing::Values(
     // 3 normal computer params + 5 thresholds:
     //depth, alg, scale, 1plane mean, 1plane max, 3planes mean, 1plane16u mean, 3planes16 mean
-    NormalsTestData {CV_32F, RgbdNormals::RGBD_NORMALS_METHOD_FALS,  true, 0.00362, 0.08881, 0.02175, 0, 0},
+    // maxErr is the maximum over all the pixels, it is very sensitive to the floating-point details of a platform
+    // (FMA contraction, summation order in filters): 0.071 on x86-64, 0.094 on RISC-V (RVV)
+    NormalsTestData {CV_32F, RgbdNormals::RGBD_NORMALS_METHOD_FALS,  true, 0.00362, 0.1, 0.02175, 0, 0},
     NormalsTestData {CV_32F, RgbdNormals::RGBD_NORMALS_METHOD_FALS, false, 0.00374, 0.10309, 0.02, 0, 0},
     NormalsTestData {CV_64F, RgbdNormals::RGBD_NORMALS_METHOD_FALS,  true, 0.00023, 0.00037, 0.01805, 0, 0},
     NormalsTestData {CV_64F, RgbdNormals::RGBD_NORMALS_METHOD_FALS, false, 0.00023, 0.00037, 0.01805, 0, 0},
@@ -375,7 +377,7 @@ struct RenderedNormals: public ::testing::TestWithParam<std::tuple<MatDepth, Nor
             fs["testImg"] >> img;
         }
         return img;
-    };
+    }
 
     static Mat nanMask(Mat img)
     {
@@ -720,6 +722,38 @@ TEST(RGBD_Plane, regression2309ValgrindCheck)
     std::vector<cv::Vec4f> planes;
     // Will corrupt memory; valgrind gets triggered
     findPlanes(points, noArray(), mask, planes, blockSize);
+}
+
+TEST(RGBD_Plane, regression_3channel_matches_4channel)
+{
+    const int rows = 240, cols = 320;
+
+    Mat points3(rows, cols, CV_32FC3);
+    Mat points4(rows, cols, CV_32FC4);
+    for (int v = 0; v < rows; v++)
+    {
+        for (int u = 0; u < cols; u++)
+        {
+            const float z = 2.f + 0.001f * u + 0.002f * v;
+            const Vec3f p((float)u * 0.01f, (float)v * 0.01f, z);
+            points3.at<Vec3f>(v, u) = p;
+            points4.at<Vec4f>(v, u) = Vec4f(p[0], p[1], p[2], 0.f);
+        }
+    }
+
+    Mat mask3, mask4;
+    std::vector<Vec4f> planes3, planes4;
+    findPlanes(points3, noArray(), mask3, planes3);
+    findPlanes(points4, noArray(), mask4, planes4);
+
+    EXPECT_EQ(points3.size(), mask3.size());
+    EXPECT_EQ(CV_8U, mask3.type());
+
+    ASSERT_EQ(mask4.size(), mask3.size());
+    EXPECT_EQ(0, cv::countNonZero(mask3 != mask4));
+    ASSERT_EQ(planes4.size(), planes3.size());
+    for (size_t i = 0; i < planes3.size(); i++)
+        EXPECT_LE(cv::norm(planes3[i], planes4[i], NORM_INF), 1e-6) << "plane " << i;
 }
 
 }} // namespace

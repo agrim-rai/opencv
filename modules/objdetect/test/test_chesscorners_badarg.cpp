@@ -77,10 +77,8 @@ protected:
 void CV_ChessboardDetectorBadArgTest::run( int /*start_from */)
 {
     Mat bg(800, 600, CV_8U, Scalar(0));
-    Mat_<float> camMat(3, 3);
-    camMat << 300.f, 0.f, bg.cols/2.f, 0, 300.f, bg.rows/2.f, 0.f, 0.f, 1.f;
-    Mat_<float> distCoeffs(1, 5);
-    distCoeffs << 1.2f, 0.2f, 0.f, 0.f, 0.f;
+    Mat_<float> camMat({3, 3}, {300.f, 0.f, bg.cols/2.f, 0, 300.f, bg.rows/2.f, 0.f, 0.f, 1.f});
+    Mat_<float> distCoeffs({1, 5}, {1.2f, 0.2f, 0.f, 0.f, 0.f});
 
     ChessBoardGenerator cbg(Size(8,6));
     vector<Point2f> exp_corn;
@@ -110,6 +108,14 @@ void CV_ChessboardDetectorBadArgTest::run( int /*start_from */)
 }
 
 TEST(Calib3d_ChessboardDetector, badarg) { CV_ChessboardDetectorBadArgTest test; test.safe_run(); }
+
+TEST(Calib3d_ChessboardDetector, drawChessboardCorners_badarg)
+{
+    Mat img(100, 100, CV_8UC3, Scalar::all(0));
+    std::vector<Point2f> corners(4);
+    EXPECT_THROW(cv::drawChessboardCorners(img, Size(5, 5), corners, true), cv::Exception);
+    EXPECT_THROW(cv::drawChessboardCorners(img, Size(-1, 5), corners, true), cv::Exception);
+}
 
 }} // namespace
 /* End of file. */

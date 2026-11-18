@@ -287,7 +287,8 @@ Most of these operations return only one value.
 
 Different type conversions and casts:
 
-- Rounding: @ref v_round, @ref v_floor, @ref v_ceil, @ref v_trunc,
+- Rounding: @ref v_round, @ref v_floor, @ref v_ceil, @ref v_trunc (all saturate to the int32 range,
+  see @ref cvRound and friends for the exact bounds; the result for NaN is unspecified),
 - To float: @ref v_cvt_f32, @ref v_cvt_f64
 - Reinterpret: @ref v_reinterpret_as_u8, @ref v_reinterpret_as_s8, ...
 
@@ -868,7 +869,7 @@ Scheme:
 For all types except 64-bit integer and 64-bit floating point types. */
 OPENCV_HAL_IMPL_REDUCE_MINMAX_FUNC(v_reduce_max, std::max)
 
-static const unsigned char popCountTable[] =
+static constexpr unsigned char popCountTable[] =
 {
     0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
     1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
@@ -2546,7 +2547,7 @@ template<int n> inline v_reg<int, n> v_trunc(const v_reg<float, n>& a)
 {
     v_reg<int, n> c;
     for( int i = 0; i < n; i++ )
-        c.s[i] = (int)(a.s[i]);
+        c.s[i] = cvTrunc(a.s[i]);
     return c;
 }
 
@@ -2592,7 +2593,7 @@ template<int n> inline v_reg<int, n*2> v_trunc(const v_reg<double, n>& a)
     v_reg<int, n*2> c;
     for( int i = 0; i < n; i++ )
     {
-        c.s[i] = (int)(a.s[i]);
+        c.s[i] = cvTrunc(a.s[i]);
         c.s[i+n] = 0;
     }
     return c;
@@ -3050,17 +3051,18 @@ template<int n> inline v_reg<_Tpn, 2*n> v_##pack_suffix(const v_reg<_Tp, n>& a, 
 //! converts to corresponding unsigned type.
 //!
 //! - pack: for 16-, 32- and 64-bit integer input types
-//! - pack_u: for 16- and 32-bit signed integer input types
+//! - pack_u: for 16-, 32- and 64-bit signed integer input types
 //!
-//! @note All variants except 64-bit use saturation.
+//! @note All variants use saturation.
 OPENCV_HAL_IMPL_C_PACK(ushort, uchar, pack, saturate_cast)
 OPENCV_HAL_IMPL_C_PACK(short, schar, pack, saturate_cast)
 OPENCV_HAL_IMPL_C_PACK(unsigned, ushort, pack, saturate_cast)
 OPENCV_HAL_IMPL_C_PACK(int, short, pack, saturate_cast)
-OPENCV_HAL_IMPL_C_PACK(uint64, unsigned, pack, static_cast)
-OPENCV_HAL_IMPL_C_PACK(int64, int, pack, static_cast)
+OPENCV_HAL_IMPL_C_PACK(uint64, unsigned, pack, saturate_cast)
+OPENCV_HAL_IMPL_C_PACK(int64, int, pack, saturate_cast)
 OPENCV_HAL_IMPL_C_PACK(short, uchar, pack_u, saturate_cast)
 OPENCV_HAL_IMPL_C_PACK(int, ushort, pack_u, saturate_cast)
+OPENCV_HAL_IMPL_C_PACK(int64, unsigned, pack_u, saturate_cast)
 //! @}
 
 //! @brief Helper macro
@@ -3085,17 +3087,18 @@ template<int shift, int n> inline v_reg<_Tpn, 2*n> v_rshr_##pack_suffix(const v_
 //! type and returned in the result vector. Variant with _u_ suffix converts to unsigned type.
 //!
 //! - pack: for 16-, 32- and 64-bit integer input types
-//! - pack_u: for 16- and 32-bit signed integer input types
+//! - pack_u: for 16-, 32- and 64-bit signed integer input types
 //!
-//! @note All variants except 64-bit use saturation.
+//! @note All variants use saturation.
 OPENCV_HAL_IMPL_C_RSHR_PACK(ushort, uchar, pack, saturate_cast)
 OPENCV_HAL_IMPL_C_RSHR_PACK(short, schar, pack, saturate_cast)
 OPENCV_HAL_IMPL_C_RSHR_PACK(unsigned, ushort, pack, saturate_cast)
 OPENCV_HAL_IMPL_C_RSHR_PACK(int, short, pack, saturate_cast)
-OPENCV_HAL_IMPL_C_RSHR_PACK(uint64, unsigned, pack, static_cast)
-OPENCV_HAL_IMPL_C_RSHR_PACK(int64, int, pack, static_cast)
+OPENCV_HAL_IMPL_C_RSHR_PACK(uint64, unsigned, pack, saturate_cast)
+OPENCV_HAL_IMPL_C_RSHR_PACK(int64, int, pack, saturate_cast)
 OPENCV_HAL_IMPL_C_RSHR_PACK(short, uchar, pack_u, saturate_cast)
 OPENCV_HAL_IMPL_C_RSHR_PACK(int, ushort, pack_u, saturate_cast)
+OPENCV_HAL_IMPL_C_RSHR_PACK(int64, unsigned, pack_u, saturate_cast)
 //! @}
 
 //! @brief Helper macro
@@ -3115,17 +3118,18 @@ template<int n> inline void v_##pack_suffix##_store(_Tpn* ptr, const v_reg<_Tp, 
 //! Variant with _u_ suffix converts to corresponding unsigned type.
 //!
 //! - pack: for 16-, 32- and 64-bit integer input types
-//! - pack_u: for 16- and 32-bit signed integer input types
+//! - pack_u: for 16-, 32- and 64-bit signed integer input types
 //!
-//! @note All variants except 64-bit use saturation.
+//! @note All variants use saturation.
 OPENCV_HAL_IMPL_C_PACK_STORE(ushort, uchar, pack, saturate_cast)
 OPENCV_HAL_IMPL_C_PACK_STORE(short, schar, pack, saturate_cast)
 OPENCV_HAL_IMPL_C_PACK_STORE(unsigned, ushort, pack, saturate_cast)
 OPENCV_HAL_IMPL_C_PACK_STORE(int, short, pack, saturate_cast)
-OPENCV_HAL_IMPL_C_PACK_STORE(uint64, unsigned, pack, static_cast)
-OPENCV_HAL_IMPL_C_PACK_STORE(int64, int, pack, static_cast)
+OPENCV_HAL_IMPL_C_PACK_STORE(uint64, unsigned, pack, saturate_cast)
+OPENCV_HAL_IMPL_C_PACK_STORE(int64, int, pack, saturate_cast)
 OPENCV_HAL_IMPL_C_PACK_STORE(short, uchar, pack_u, saturate_cast)
 OPENCV_HAL_IMPL_C_PACK_STORE(int, ushort, pack_u, saturate_cast)
+OPENCV_HAL_IMPL_C_PACK_STORE(int64, unsigned, pack_u, saturate_cast)
 //! @}
 
 //! @brief Helper macro
@@ -3145,9 +3149,9 @@ template<int shift, int n> inline void v_rshr_##pack_suffix##_store(_Tpn* ptr, c
 //! memory. Variant with _u_ suffix converts to unsigned type.
 //!
 //! - pack: for 16-, 32- and 64-bit integer input types
-//! - pack_u: for 16- and 32-bit signed integer input types
+//! - pack_u: for 16-, 32- and 64-bit signed integer input types
 //!
-//! @note All variants except 64-bit use saturation.
+//! @note All variants use saturation.
 OPENCV_HAL_IMPL_C_RSHR_PACK_STORE(ushort, uchar, pack, saturate_cast)
 OPENCV_HAL_IMPL_C_RSHR_PACK_STORE(short, schar, pack, saturate_cast)
 OPENCV_HAL_IMPL_C_RSHR_PACK_STORE(unsigned, ushort, pack, saturate_cast)

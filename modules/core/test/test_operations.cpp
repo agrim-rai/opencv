@@ -100,11 +100,6 @@ CV_OperationsTest::~CV_OperationsTest() {}
 #define CHECK_DIFF(a, b) checkDiff(a, b, "(" #a ")  !=  (" #b ")  at l." STR(__LINE__))
 #define CHECK_DIFF_FLT(a, b) checkDiffF(a, b, "(" #a ")  !=(eps)  (" #b ")  at l." STR(__LINE__))
 
-#if defined _MSC_VER && _MSC_VER < 1400
-#define MSVC_OLD 1
-#else
-#define MSVC_OLD 0
-#endif
 
 template<typename _Tp> void CV_OperationsTest::TestType(Size sz, _Tp value)
 {
@@ -295,9 +290,7 @@ bool CV_OperationsTest::TestMat()
         CHECK_DIFF(4.0 * (maskMat1 | maskMat1), maskMat4);
         CHECK_DIFF((maskMat4 | maskMat4)/4.0, maskMat1);
 
-#if !MSVC_OLD
         CHECK_DIFF(2.0 * (maskMat1 * 2.0) , maskMat4);
-#endif
         CHECK_DIFF((maskMat4 / 2.0) / 2.0 , maskMat1);
         CHECK_DIFF(-(maskMat4 - maskMat5) , maskMat1);
         CHECK_DIFF(-((maskMat4 - maskMat5) * 1.0), maskMat1);
@@ -363,7 +356,6 @@ bool CV_OperationsTest::TestMat()
 
         m = maskMat1.clone(); m+=(maskMat1 * 3.0 + 1.0); CHECK_DIFF(m, maskMat5);
         m = maskMat5.clone(); m-=(maskMat1 * 3.0 + 1.0); CHECK_DIFF(m, maskMat1);
-#if !MSVC_OLD
         m = mi.clone(); m+=(3.0 * mi * mt + d1); CHECK_DIFF_FLT(m, mi + d1 * 4);
         m = mi.clone(); m-=(3.0 * mi * mt + d1); CHECK_DIFF_FLT(m, mi - d1 * 4);
         m = mi.clone(); m*=(mt * 1.0); CHECK_DIFF_FLT(m, d1);
@@ -420,7 +412,6 @@ bool CV_OperationsTest::TestMat()
         CHECK_DIFF_FLT(mt.inv() * mt, d1);
 
         CHECK_DIFF_FLT(mt.inv() * (2*mt - mt), d1);
-#endif
     }
     catch (const test_excep& e)
     {
@@ -894,8 +885,8 @@ bool CV_OperationsTest::TestMatMatxCastSum()
 {
     try
     {
-        Mat ref1 = (Mat_<double>(3, 1) << 1, 2, 3);
-        Mat ref2 = (Mat_<double>(3, 1) << 3, 4, 5);
+        Mat ref1 = Mat_<double>({3, 1}, {1, 2, 3});
+        Mat ref2 = Mat_<double>({3, 1}, {3, 4, 5});
         Mat ref3 = Mat::ones(3, 1, CV_64FC1);
 
         Mat mat = Mat::zeros(3, 1, CV_64FC1);
@@ -1179,7 +1170,7 @@ bool CV_OperationsTest::TestSVD()
 {
     try
     {
-        Mat A = (Mat_<double>(3,4) << 1, 2, -1, 4, 2, 4, 3, 5, -1, -2, 6, 7);
+        Mat A = Mat_<double>({3, 4}, {1, 2, -1, 4, 2, 4, 3, 5, -1, -2, 6, 7});
         Mat x;
         SVD::solveZ(A,x);
         if( cvtest::norm(A*x, NORM_INF) > FLT_EPSILON )
@@ -1390,6 +1381,37 @@ TEST(MatTestRoi, adjustRoiUndefinedBehavior)
     EXPECT_EQ(m.data, roi.data);
 }
 
+TEST(MatTestRoi, locateROI_1D)
+{
+    int sz = 6;
+    Mat m(1, &sz, CV_32S);
+    for (int i = 0; i < sz; i++)
+        m.at<int>(i) = i * 10;
+    Mat roi = m.colRange(2, 4);
+    ASSERT_EQ(1, roi.dims);
+
+    Size wholeSize;
+    Point ofs;
+    roi.locateROI(wholeSize, ofs);
+    EXPECT_EQ(Size(6, 1), wholeSize);
+    EXPECT_EQ(Point(2, 0), ofs);
+
+    UMat u = roi.getUMat(ACCESS_READ);
+    EXPECT_EQ(1, u.dims);
+    EXPECT_EQ(2, u.cols);
+    u.locateROI(wholeSize, ofs);
+    EXPECT_EQ(Size(6, 1), wholeSize);
+    EXPECT_EQ(Point(2, 0), ofs);
+    Mat back = u.getMat(ACCESS_READ);
+    EXPECT_EQ(20, back.at<int>(0));
+    EXPECT_EQ(30, back.at<int>(1));
+
+    roi.adjustROI(0, 0, 1, 1);
+    ASSERT_EQ(4, roi.cols);
+    EXPECT_EQ(10, roi.at<int>(0));
+    EXPECT_EQ(40, roi.at<int>(3));
+}
+
 CV_ENUM(SortRowCol, SORT_EVERY_COLUMN, SORT_EVERY_ROW)
 CV_ENUM(SortOrder, SORT_ASCENDING, SORT_DESCENDING)
 
@@ -1474,10 +1496,19 @@ PARAM_TEST_CASE(sortIdx, MatDepth, SortRowCol, SortOrder, Size, bool)
             {
             case CV_8U: check_<uchar>(values_row, idx_row); break;
             case CV_8S: check_<char>(values_row, idx_row); break;
+            case CV_16U: check_<ushort>(values_row, idx_row); break;
             case CV_16S: check_<short>(values_row, idx_row); break;
             case CV_32S: check_<int>(values_row, idx_row); break;
             case CV_32F: check_<float>(values_row, idx_row); break;
             case CV_64F: check_<double>(values_row, idx_row); break;
+            case CV_16F: check_<hfloat>(values_row, idx_row); break;
+            case CV_16BF: check_<bfloat>(values_row, idx_row); break;
+            case CV_Bool: check_<uchar>(values_row, idx_row); break;
+            case CV_64U: check_<uint64_t>(values_row, idx_row); break;
+            case CV_64S: check_<int64_t>(values_row, idx_row); break;
+            case CV_32U: check_<uint32_t>(values_row, idx_row); break;
+            case CV_8F_E4M3FN: check_<fp8_t>(values_row, idx_row); break;
+            case CV_8F_E4M3FNUZ: check_<fp8a_t>(values_row, idx_row); break;
             default: ASSERT_FALSE(true) << "Unsupported type: " << type;
             }
         }
@@ -1492,30 +1523,63 @@ TEST_P(sortIdx, simple)
 
         cv::sortIdx(src_roi, dst_roi, flags);
         validate();
+
+        // cv::sort must give the same values as sorting a CV_64F copy
+        Mat sorted, sorted64f, ref64f, src64f;
+        cv::sort(src_roi, sorted, flags);
+        src_roi.convertTo(src64f, CV_64F);
+        cv::sort(src64f, ref64f, flags);
+        sorted.convertTo(sorted64f, CV_64F);
+        EXPECT_EQ(0, cvtest::norm(sorted64f, ref64f, NORM_INF));
     }
 }
 
 INSTANTIATE_TEST_CASE_P(Core, sortIdx, Combine(
-        Values(CV_8U, CV_8S, CV_16S, CV_32S, CV_32F, CV_64F), // depth
+        Values(CV_8U, CV_8S, CV_16U, CV_16S, CV_32S, CV_32F, CV_64F,
+               CV_16F, CV_16BF, CV_Bool, CV_64U, CV_64S, CV_32U,
+               CV_8F_E4M3FN, CV_8F_E4M3FNUZ), // depth
         Values(SORT_EVERY_COLUMN, SORT_EVERY_ROW),
         Values(SORT_ASCENDING, SORT_DESCENDING),
         Values(Size(3, 3), Size(16, 8)),
         ::testing::Bool()
 ));
 
+// Values that need the full integer type: the high bit of the unsigned types,
+// and 64-bit neighbours above 2^53 that a double cannot tell apart.
+template<typename T>
+static void checkSortExact(int depth, const std::vector<T>& values, const std::vector<int>& expectedIdx)
+{
+    Mat src(1, (int)values.size(), depth, const_cast<T*>(values.data()));
+    Mat idx, sorted;
+    cv::sortIdx(src, idx, SORT_EVERY_ROW | SORT_ASCENDING);
+    cv::sort(src, sorted, SORT_EVERY_ROW | SORT_ASCENDING);
+    for (size_t i = 0; i < values.size(); i++)
+    {
+        EXPECT_EQ(expectedIdx[i], idx.at<int>((int)i)) << "i=" << i;
+        EXPECT_EQ(values[expectedIdx[i]], sorted.at<T>((int)i)) << "i=" << i;
+    }
+}
+
+TEST(Core_sort, large_integers)
+{
+    checkSortExact<int>(CV_32S, { INT_MAX, INT_MIN, -1, 0, 1 }, { 1, 2, 3, 4, 0 });
+    checkSortExact<uint32_t>(CV_32U, { UINT_MAX, 0, 0x80000000u, 1, 0x7fffffffu }, { 1, 3, 4, 2, 0 });
+    checkSortExact<int64_t>(CV_64S, { INT64_MAX, INT64_MIN, -1, (1LL << 53) + 1, 1LL << 53 }, { 1, 2, 4, 3, 0 });
+    checkSortExact<uint64_t>(CV_64U, { UINT64_MAX, 0, 1ULL << 63, (1ULL << 53) + 1, 1ULL << 53 }, { 1, 4, 3, 2, 0 });
+}
 
 TEST(Core_sortIdx, regression_8941)
 {
-    cv::Mat src = (cv::Mat_<int>(3, 3) <<
-        1, 2, 3,
-        0, 9, 5,
-        8, 1, 6
-    );
-    cv::Mat expected = (cv::Mat_<int>(3, 1) <<
-        1,
-        0,
-        2
-    );
+    cv::Mat src = cv::Mat_<int>({3, 3}, {
+            1, 2, 3,
+            0, 9, 5,
+            8, 1, 6
+    });
+    cv::Mat expected = cv::Mat_<int>({3, 1}, {
+            1,
+            0,
+            2
+    });
 
     cv::Mat result;
     cv::sortIdx(src.col(0), result, cv::SORT_EVERY_COLUMN | cv::SORT_ASCENDING);

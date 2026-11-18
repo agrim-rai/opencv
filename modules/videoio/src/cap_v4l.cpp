@@ -214,6 +214,7 @@ make & enjoy!
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <dirent.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -1455,7 +1456,11 @@ void CvCaptureCAM_V4L::convertToRgb(const Buffer &currentBuffer)
     case V4L2_PIX_FMT_MJPEG:
     case V4L2_PIX_FMT_JPEG:
         CV_LOG_DEBUG(NULL, "VIDEOIO(V4L2:" << deviceName << "): decoding JPEG frame: size=" << currentBuffer.bytesused);
-        cv::imdecode(Mat(1, currentBuffer.bytesused, CV_8U, start), IMREAD_COLOR, &frame);
+        if (cv::imdecode(Mat(1, currentBuffer.bytesused, CV_8U, start), IMREAD_COLOR, &frame).empty())
+        {
+            CV_LOG_WARNING(NULL, "VIDEOIO(V4L2:" << deviceName << "): can't decode JPEG frame: size=" << currentBuffer.bytesused);
+            frame.release();
+        }
         return;
 #endif
     case V4L2_PIX_FMT_YUYV:
@@ -1769,6 +1774,7 @@ bool CvCaptureCAM_V4L::controlInfo(int property_id, __u32 &_v4l2id, cv::Range &r
             break;
         case CAP_PROP_AUTO_EXPOSURE:
             range = Range(0, 4);
+            break;
         default:
             break;
         }
@@ -2146,7 +2152,7 @@ bool CvCaptureCAM_V4L::retrieveFrame(int, OutputArray ret)
 
     bufferIndex = -1;
     frame.copyTo(ret);
-    return true;
+    return !frame.empty();
 }
 
 Ptr<IVideoCapture> create_V4L_capture_cam(int index)
@@ -2262,6 +2268,68 @@ bool VideoCapture_V4L_waitAny(const std::vector<VideoCapture>& streams, CV_OUT s
     }
     return res;
 }
+
+std::vector<VideoDeviceInfo> enumerate_V4L_devices()
+{
+    std::vector<VideoDeviceInfo> result;
+    std::vector<int> indices;
+
+    DIR* dir = ::opendir("/dev");
+    if (!dir)
+        return result;
+
+    while (const dirent* ent = ::readdir(dir))
+    {
+        const char* name = ent->d_name;
+        if (strncmp(name, "video", 5) != 0 || name[5] == '\0')
+            continue;
+        const char* p = name + 5;
+        while (*p >= '0' && *p <= '9')
+            ++p;
+        if (*p != '\0')
+            continue;
+        indices.push_back(atoi(name + 5));
+    }
+    ::closedir(dir);
+    std::sort(indices.begin(), indices.end());
+
+    for (size_t i = 0; i < indices.size(); ++i)
+    {
+        const int index = indices[i];
+        const std::string path = cv::format("/dev/video%d", index);
+        int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK);
+        if (fd == -1)
+            continue;
+
+        v4l2_capability capability = v4l2_capability();
+        int res;
+        do {
+            res = ioctl(fd, VIDIOC_QUERYCAP, &capability);
+        } while (res == -1 && errno == EINTR);
+        ::close(fd);
+
+        if (res == -1)
+            continue;
+
+        #ifdef V4L2_CAP_DEVICE_CAPS
+            const __u32 caps = (capability.capabilities & V4L2_CAP_DEVICE_CAPS)
+                            ? capability.device_caps
+                            : capability.capabilities;
+        #else
+            const __u32 caps = capability.capabilities;
+        #endif
+
+        if ((caps & (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE)) == 0)
+            continue;
+
+        const char* card = reinterpret_cast<const char*>(capability.card);
+        const std::string name(card, strnlen(card, sizeof(capability.card)));
+
+        result.push_back(makeVideoDeviceInfo(index, CAP_V4L2, name));
+    }
+    return result;
+}
+
 
 } // cv::
 

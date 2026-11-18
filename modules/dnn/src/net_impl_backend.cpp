@@ -16,6 +16,9 @@
 
 #ifdef HAVE_ONNXRUNTIME
 #include <onnxruntime_cxx_api.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #endif
 
 namespace cv {
@@ -23,6 +26,31 @@ namespace dnn {
 CV__DNN_INLINE_NS_BEGIN
 
 #ifdef HAVE_ONNXRUNTIME
+
+OrtPathString toOrtPath(const std::string& utf8Path)
+{
+#ifdef _WIN32
+    if (utf8Path.empty())
+        return std::wstring();
+
+    const int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                        utf8Path.c_str(), (int)utf8Path.size(), NULL, 0);
+    if (len <= 0)
+    {
+        CV_LOG_WARNING(NULL, "DNN/ONNX/ORT: path is not valid UTF-8, cannot pass it to ONNX Runtime: "
+                             << utf8Path);
+        return std::wstring();
+    }
+
+    std::wstring wide((size_t)len, L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                        utf8Path.c_str(), (int)utf8Path.size(), &wide[0], len);
+    return wide;
+#else
+    return utf8Path;
+#endif
+}
+
 void Net::Impl::refreshOrtMainGraphOutputs()
 {
     CV_Assert(mainGraph && ort_session);
@@ -96,20 +124,12 @@ void Net::Impl::finalizeOrt()
     ort_profile_data.clear();
     if (profilingMode != DNN_PROFILE_NONE) {
         ort_profile_path_prefix = cv::tempfile("opencv_ort_profile_");
-#ifdef _WIN32
-        std::wstring w_profile_path(ort_profile_path_prefix.begin(), ort_profile_path_prefix.end());
-        opts.EnableProfiling(w_profile_path.c_str());
-#else
-        opts.EnableProfiling(ort_profile_path_prefix.c_str());
-#endif
+        const OrtPathString profilePath = toOrtPath(ort_profile_path_prefix);
+        opts.EnableProfiling(profilePath.c_str());
     }
 
-#ifdef _WIN32
-    std::wstring wpath(modelFileName.begin(), modelFileName.end());
-    ort_session = std::make_shared<Ort::Session>(*ort_env, wpath.c_str(), opts);
-#else
-    ort_session = std::make_shared<Ort::Session>(*ort_env, modelFileName.c_str(), opts);
-#endif
+    const OrtPathString modelPath = toOrtPath(modelFileName);
+    ort_session = std::make_shared<Ort::Session>(*ort_env, modelPath.c_str(), opts);
     preferableTarget = target;
     ortNeedsReinit = false;
 
@@ -123,10 +143,6 @@ Ptr<BackendWrapper> Net::Impl::wrap(Mat& host)
     if (preferableBackend == DNN_BACKEND_OPENCV &&
             (preferableTarget == DNN_TARGET_CPU || preferableTarget == DNN_TARGET_CPU_FP16))
         return Ptr<BackendWrapper>();
-
-    MatShape shape(host.dims);
-    for (int i = 0; i < host.dims; ++i)
-        shape[i] = host.size[i];
 
     void* data = host.data;
     if (backendWrappers.find(data) != backendWrappers.end())
@@ -171,19 +187,19 @@ Ptr<BackendWrapper> Net::Impl::wrap(Mat& host)
             {
             case CV_32F:
                 if (preferableTarget == DNN_TARGET_CUDA_FP16)
-                    return CUDABackendWrapperFP16::create(baseBuffer, shape);
+                    return CUDABackendWrapperFP16::create(baseBuffer, host);
                 else
-                    return CUDABackendWrapperFP32::create(baseBuffer, shape);
+                    return CUDABackendWrapperFP32::create(baseBuffer, host);
             case CV_8S:
-                return CUDABackendWrapperINT8::create(baseBuffer, shape);
+                return CUDABackendWrapperINT8::create(baseBuffer, host);
             case CV_8U:
-                return CUDABackendWrapperUINT8::create(baseBuffer, shape);
+                return CUDABackendWrapperUINT8::create(baseBuffer, host);
             case CV_32S:
-                return CUDABackendWrapperINT32::create(baseBuffer, shape);
+                return CUDABackendWrapperINT32::create(baseBuffer, host);
             case CV_64S:
-                return CUDABackendWrapperINT64::create(baseBuffer, shape);
+                return CUDABackendWrapperINT64::create(baseBuffer, host);
             case CV_Bool:
-                return CUDABackendWrapperBOOL::create(baseBuffer, shape);
+                return CUDABackendWrapperBOOL::create(baseBuffer, host);
             default:
                 CV_Error(Error::BadDepth, "Unsupported mat type for CUDA");
             }
@@ -239,7 +255,7 @@ void Net::Impl::initBackend(const std::vector<LayerPin>& blobsToKeep_)
     else if (preferableBackend == DNN_BACKEND_CUDA)
     {
 #ifdef HAVE_CUDA
-        initCUDABackend(blobsToKeep_);
+        initCUDABackend();
 #else
         CV_Error(Error::StsNotImplemented, "This OpenCV version is built without support of CUDA/CUDNN");
 #endif
@@ -299,6 +315,18 @@ void Net::Impl::setPreferableBackend(Net& net, int backendId)
 
     if (mainGraph)
     {
+        if (backendId == DNN_BACKEND_OPENCV
+#ifdef HAVE_CUDA
+            || backendId == DNN_BACKEND_CUDA
+#endif
+            )
+        {
+            if (preferableBackend != backendId) {
+                preferableBackend = backendId;
+                finalized = false;  // re-select per-op executors on next finalize()
+            }
+            return;
+        }
         CV_LOG_WARNING(NULL, "Back-ends are not supported by the new graph engine for now");
         preferableBackend = backendId;
         return;
@@ -347,10 +375,17 @@ void Net::Impl::setPreferableTarget(int targetId)
 
     if (mainGraph)
     {
-        if (targetId != DNN_TARGET_CPU)
+#ifdef HAVE_CUDA
+        if (targetId == DNN_TARGET_CPU || IS_DNN_CUDA_TARGET(targetId))
         {
-            CV_LOG_WARNING(NULL, "Targets are not supported by the new graph engine for now");
+            if (preferableTarget != targetId) {
+                preferableTarget = targetId;
+                finalized = false;  // re-select per-op executors on next finalize()
+            }
+            return;
         }
+#endif
+        CV_LOG_WARNING(NULL, "Targets are not supported by the new graph engine for now");
         return;
     }
     if (netWasQuantized && targetId != DNN_TARGET_CPU &&

@@ -55,9 +55,9 @@ CV__DNN_INLINE_NS_BEGIN
 
   Classes listed here, in fact, provides C++ API for creating instances of built-in layers.
   In addition to this way of layers instantiation, there is a more common factory API (see @ref dnnLayerFactory), it allows to create layers dynamically (by name) and register new ones.
-  You can use both API, but factory API is less convenient for native C++ programming and basically designed for use inside importers (see @ref readNetFromTensorflow()).
+  You can use both API, but factory API is less convenient for native C++ programming and basically designed for use inside importers (see @ref readNetFromONNX()).
 
-  Built-in layers reproduce the functionality of the corresponding ONNX and TensorFlow operators.
+  Built-in layers reproduce the functionality of the corresponding ONNX operators.
   The following layers are among the core building blocks used to assemble imported networks:
   - Convolution
   - Deconvolution
@@ -226,6 +226,19 @@ CV__DNN_INLINE_NS_BEGIN
         static Ptr<GRULayer> create(const LayerParams& params);
     };
 
+    /** @brief ONNX RNN layer, the single-gate recurrent unit.
+
+     * @f$h_t = f(W x_t + R h_{t-1} + W_b + R_b)@f$, where @f$f@f$ defaults to Tanh
+     * and can also be Relu or Sigmoid. Unlike @ref RNNLayer this follows the ONNX
+     * operator: weights arrive as inputs and there is no output projection.
+    */
+    class CV_EXPORTS RNN2Layer : public Layer
+    {
+    public:
+        /** Creates instance of ONNX RNN layer */
+        static Ptr<RNN2Layer> create(const LayerParams& params);
+    };
+
     /** @brief Classical recurrent layer
 
     Accepts two inputs @f$x_t@f$ and @f$h_{t-1}@f$ and compute two outputs @f$o_t@f$ and @f$h_t@f$.
@@ -372,9 +385,6 @@ CV__DNN_INLINE_NS_BEGIN
         virtual void setWeights(InputArray weights, InputArray bias,
                                 int C0, int accuracy) = 0;
         virtual bool fuseAddBias(InputArray bias) = 0;
-        virtual bool fuseBatchNorm(const Ptr<Layer>& bn) = 0;
-        virtual bool fuseActivation(const Ptr<Layer>& activ) = 0;
-        virtual bool fuseAddResidual(Arg residual) = 0;
 
         std::vector<int> strides, dilations, pads;
         int ngroups;
@@ -410,6 +420,7 @@ CV__DNN_INLINE_NS_BEGIN
         float input_sc, output_sc;
         bool per_channel;
         bool float_input = false;
+        bool int32_output = false; // ONNX ConvInteger: int32 sums, zero points are inputs
 
         std::vector<int> strides, dilations, pads;
         int ngroups;
@@ -797,6 +808,7 @@ CV__DNN_INLINE_NS_BEGIN
         int axis;
         int block_size;
         int output_dtype;
+        int output_onnx_dtype;  // raw ONNX dtype; disambiguates E5M2 vs E5M2FNUZ
         bool saturate;
 
         static Ptr<QuantizeLinearLayer> create(const LayerParams& params);
@@ -1123,6 +1135,8 @@ CV__DNN_INLINE_NS_BEGIN
     {
     public:
         static Ptr<Layer> create(const LayerParams& params);
+        // Set the per-channel slope when it arrives as a second input, not a blob.
+        virtual void setSlope(const Mat& /*slope*/) {}
     };
 
     class CV_EXPORTS ELULayer : public ActivationLayer
@@ -1484,7 +1498,9 @@ CV__DNN_INLINE_NS_BEGIN
             WHERE,
             BITWISE_AND,
             BITWISE_OR,
-            BITWISE_XOR
+            BITWISE_XOR,
+            NOT_EQUAL,
+            PRELU
         };
         OPERATION op;
 
@@ -1699,6 +1715,13 @@ CV__DNN_INLINE_NS_BEGIN
         static Ptr<DetLayer> create(const LayerParams &params);
     };
 
+    /** @brief ONNX Dropout in eval mode: passes input through, mask output is all-true. */
+    class CV_EXPORTS DropoutMaskLayer : public Layer
+    {
+    public:
+        static Ptr<DropoutMaskLayer> create(const LayerParams &params);
+    };
+
     class CV_EXPORTS EyeLikeLayer : public Layer
     {
     public:
@@ -1870,6 +1893,17 @@ CV__DNN_INLINE_NS_BEGIN
         static Ptr<MatMulLayer> create(const LayerParams &params);
     };
 
+    // com.microsoft MatMulNBits: weights stay n-bit packed, dequantized per block during the GEMM
+    class CV_EXPORTS MatMulNBitsLayer : public Layer {
+     public:
+        int K;
+        int N;
+        int bits;
+        int block_size;
+
+        static Ptr<MatMulNBitsLayer> create(const LayerParams &params);
+    };
+
     struct MatMulInt8Params
     {
         String name;
@@ -1891,6 +1925,15 @@ CV__DNN_INLINE_NS_BEGIN
         float input_sc, output_sc;
         int output_type;
         bool per_channel;
+        //! ONNX MatMulInteger (opset 10) mode: int32 output, B and both zero points are inputs
+        bool int32_output = false;
+
+        /** @brief Creates the ONNX MatMulInteger form of the layer.
+         * @param params layer parameters; "int32_output" must be true, because the requantizing
+         *        int8 form is built only from MatMulInt8Params, by the QDQ fusion
+         * @return the MatMulInteger layer: Y = (A - a_zero_point) * (B - b_zero_point) in int32
+         */
+        static Ptr<MatMulInt8Layer> create(const LayerParams& params);
         static Ptr<MatMulInt8Layer> create(const MatMulInt8Params& params);
     };
 
@@ -1910,6 +1953,18 @@ CV__DNN_INLINE_NS_BEGIN
     {
     public:
         static Ptr<NonZeroLayer> create(const LayerParams& params);
+    };
+
+    class CV_EXPORTS CompressLayer : public Layer
+    {
+    public:
+        static Ptr<CompressLayer> create(const LayerParams& params);
+    };
+
+    class CV_EXPORTS ImageDecoderLayer : public Layer
+    {
+    public:
+        static Ptr<ImageDecoderLayer> create(const LayerParams& params);
     };
 
     class CV_EXPORTS InstanceNormLayer : public Layer {
@@ -1938,6 +1993,8 @@ CV__DNN_INLINE_NS_BEGIN
     class CV_EXPORTS AttentionOnnxAiLayer : public Layer {
      public:
         int kv_num_heads;
+        // False when the node carries its own KV history in the graph (GroupQueryAttention).
+        bool paged_cache_supported = true;
 
         static Ptr<AttentionOnnxAiLayer> create(const LayerParams &params);
     };
@@ -1948,8 +2005,23 @@ CV__DNN_INLINE_NS_BEGIN
     };
 
     class CV_EXPORTS CumProdLayer : public Layer {
-     public:
+        public:
         static Ptr<CumProdLayer> create(const LayerParams &params);
+    };
+
+    class CV_EXPORTS BitCastLayer : public Layer {
+     public:
+        static Ptr<BitCastLayer> create(const LayerParams &params);
+    };
+
+    class CV_EXPORTS LinearAttentionLayer : public Layer {
+     public:
+        static Ptr<LinearAttentionLayer> create(const LayerParams &params);
+    };
+
+    class CV_EXPORTS FlexAttentionLayer : public Layer {
+     public:
+        static Ptr<FlexAttentionLayer> create(const LayerParams &params);
     };
 
     class CV_EXPORTS GroupNormLayer : public Layer {

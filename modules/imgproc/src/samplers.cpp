@@ -41,6 +41,7 @@
 //M*/
 
 #include "precomp.hpp"
+#include "opencv2/core/hal/intrin.hpp"
 
 namespace cv
 {
@@ -237,11 +238,11 @@ static void getRectSubPix_8u32f
         float a = center.x - ip.x;
         float b = center.y - ip.y;
         a = MAX(a,0.0001f);
-        float a12 = a*(1.f-b);
+
+        float a11 = (1.f - a)*(1.f - b);
+        float a12 = a*(1.f - b);
+        float a21 = (1.f - a)*b;
         float a22 = a*b;
-        float b1 = 1.f - b;
-        float b2 = b;
-        double s = (1. - a)/a;
 
         src_step /= sizeof(src[0]);
         dst_step /= sizeof(dst[0]);
@@ -251,13 +252,29 @@ static void getRectSubPix_8u32f
 
         for( ; win_size.height--; src += src_step, dst += dst_step )
         {
-            float prev = (1 - a)*(b1*src[0] + b2*src[src_step]);
-            for( int j = 0; j < win_size.width; j++ )
+            int j = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
             {
-                float t = a12*src[j+1] + a22*src[j+1+src_step];
-                dst[j] = prev + t;
-                prev = (float)(t*s);
+                const int V = VTraits<v_float32>::vlanes();
+                const v_float32 va11 = vx_setall_f32(a11), va12 = vx_setall_f32(a12);
+                const v_float32 va21 = vx_setall_f32(a21), va22 = vx_setall_f32(a22);
+                for( ; j <= win_size.width - V; j += V )
+                {
+                    v_float32 s0 = v_cvt_f32(v_reinterpret_as_s32(vx_load_expand_q(src + j)));
+                    v_float32 s1 = v_cvt_f32(v_reinterpret_as_s32(vx_load_expand_q(src + j + 1)));
+                    v_float32 s2 = v_cvt_f32(v_reinterpret_as_s32(vx_load_expand_q(src + j + src_step)));
+                    v_float32 s3 = v_cvt_f32(v_reinterpret_as_s32(vx_load_expand_q(src + j + src_step + 1)));
+
+                    v_float32 s = v_mul(s0, va11);
+                    s = v_add(s, v_mul(s1, va12));
+                    s = v_add(s, v_mul(s2, va21));
+                    s = v_add(s, v_mul(s3, va22));
+                    v_store(dst + j, s);
+                }
             }
+#endif
+            for( ; j < win_size.width; j++ )
+                dst[j] = a11*src[j] + a12*src[j+1] + a21*src[j+src_step] + a22*src[j+1+src_step];
         }
     }
     else
@@ -275,7 +292,16 @@ void cv::getRectSubPix( InputArray _image, Size patchSize, Point2f center,
 {
     CV_INSTRUMENT_REGION();
 
+    CV_CheckGT(patchSize.width, 0, "");
+    CV_CheckGT(patchSize.height, 0, "");
+
     Mat image = _image.getMat();
+    if( image.empty() )
+    {
+        _patch.release();
+        return;
+    }
+
     int depth = image.depth(), cn = image.channels();
     int ddepth = patchType < 0 ? depth : CV_MAT_DEPTH(patchType);
 
@@ -284,36 +310,10 @@ void cv::getRectSubPix( InputArray _image, Size patchSize, Point2f center,
     _patch.create(patchSize, CV_MAKETYPE(ddepth, cn));
     Mat patch = _patch.getMat();
 
-#if defined (HAVE_IPP) && (IPP_VERSION_X100 >= 700)
-    CV_IPP_CHECK()
-    {
-        typedef IppStatus (CV_STDCALL *ippiGetRectSubPixFunc)( const void* src, int src_step,
-                                                                IppiSize src_size, void* dst,
-                                                                int dst_step, IppiSize win_size,
-                                                                IppiPoint_32f center,
-                                                                IppiPoint* minpt, IppiPoint* maxpt );
-
-        IppiPoint minpt={0,0}, maxpt={0,0};
-        IppiPoint_32f icenter = {center.x, center.y};
-        IppiSize src_size={image.cols, image.rows}, win_size={patch.cols, patch.rows};
-        int srctype = image.type();
-        ippiGetRectSubPixFunc ippiCopySubpixIntersect =
-            srctype == CV_8UC1 && ddepth == CV_8U ? (ippiGetRectSubPixFunc)ippiCopySubpixIntersect_8u_C1R :
-            srctype == CV_8UC1 && ddepth == CV_32F ? (ippiGetRectSubPixFunc)ippiCopySubpixIntersect_8u32f_C1R :
-            srctype == CV_32FC1 && ddepth == CV_32F ? (ippiGetRectSubPixFunc)ippiCopySubpixIntersect_32f_C1R : 0;
-
-        if( ippiCopySubpixIntersect)
-        {
-            if (CV_INSTRUMENT_FUN_IPP(ippiCopySubpixIntersect, image.ptr(), (int)image.step, src_size, patch.ptr(),
-                        (int)patch.step, win_size, icenter, &minpt, &maxpt) >= 0)
-            {
-                CV_IMPL_ADD(CV_IMPL_IPP);
-                return;
-            }
-            setIppErrorStatus();
-        }
-    }
-#endif
+    CALL_HAL(getRectSubPix, cv_hal_getRectSubPix,
+             image.type(), image.data, image.step, image.cols, image.rows,
+             patch.type(), patch.data, patch.step, patch.cols, patch.rows,
+             center.x, center.y);
 
     if( depth == CV_8U && ddepth == CV_8U )
         getRectSubPix_Cn_<uchar, uchar, int, scale_fixpt, cast_8u>

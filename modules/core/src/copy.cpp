@@ -910,6 +910,12 @@ void repeat(InputArray _src, int ny, int nx, OutputArray _dst)
     CV_Assert( ny > 0 && nx > 0 );
 
     Size ssize = _src.size();
+    if( ssize.empty() )
+    {
+        _dst.create(0, 0, _src.type());
+        return;
+    }
+    CV_Assert( (int64_t)ssize.height * ny <= INT_MAX && (int64_t)ssize.width * nx <= INT_MAX );
     _dst.create(ssize.height*ny, ssize.width*nx, _src.type());
 
 #if !defined __APPLE__
@@ -990,10 +996,14 @@ int cv::borderInterpolate( int p, int len, int borderType )
     else if( borderType == BORDER_WRAP )
     {
         CV_Assert(len > 0);
-        if( p < 0 )
-            p -= ((p-len+1)/len)*len;
-        if( p >= len )
-            p %= len;
+        if( p < 0 || p >= len )
+        {
+            int64_t p64 = p;
+            p64 %= (int64_t)len;
+            if( p64 < 0 )
+                p64 += len;
+            p = (int)p64;
+        }
     }
     else if( borderType == BORDER_CONSTANT )
         p = -1;
@@ -1233,12 +1243,15 @@ void cv::copyMakeBorder( InputArray _src, OutputArray _dst, int top, int bottom,
 {
     CV_INSTRUMENT_REGION();
 
-    CV_Assert( top >= 0 && bottom >= 0 && left >= 0 && right >= 0 && _src.dims() <= 2);
+    CV_Assert( top >= 0 && bottom >= 0 && left >= 0 && right >= 0 && _src.dims() <= 2 );
+    CV_Assert( !_src.empty() );
+
+    Mat src = _src.getMat();
+    CV_Assert( (int64_t)src.rows + top + bottom <= INT_MAX );
+    CV_Assert( (int64_t)src.cols + left + right <= INT_MAX );
 
     CV_OCL_RUN(_dst.isUMat(),
                ocl_copyMakeBorder(_src, _dst, top, bottom, left, right, borderType, value))
-
-    Mat src = _src.getMat();
     int type = src.type();
 
     if( src.isSubmatrix() && (borderType & BORDER_ISOLATED) == 0 )

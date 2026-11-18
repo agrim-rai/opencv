@@ -265,7 +265,7 @@ static void cvt##suffix(const uchar* src_, size_t sstep, const uchar*, size_t, \
     \
     for( int i = 0; i < size.height; i++, src += sstep, dst += dstep ) { \
         for ( int j = 0; j < size.width; j++ ) \
-            dst[j] = (src[j]<<shift) != 0; \
+            dst[j] = (_Ts)(src[j] << shift) != 0; \
     } \
 }
 
@@ -387,10 +387,11 @@ DEF_CVT_FUNC(32u16u, cvt_, unsigned, ushort, v_uint32)
 DEF_CVT_FUNC(32u16s, cvt_, unsigned, short,  v_int32)
 DEF_CVT_SCALAR_FUNC(32u32s, unsigned, int)
 DEF_CVT_FUNC(32u32f, cvt_, unsigned, float,  v_float32)
-DEF_CVT_FUNC(32u64f, cvt_, unsigned, double, v_float32)
+DEF_CVT_FUNC(32u64f, cvt_64f, unsigned, double, v_float64)
 DEF_CVT_SCALAR_FUNC(32u64s, unsigned, int64_t)
+DEF_CVT_SCALAR_FUNC(64u64s, uint64_t, int64_t)
 DEF_CVT_FUNC(32u16f, cvt1_, unsigned, hfloat, v_float32)
-DEF_CVT_FUNC(32u16bf, cvt1_, int, bfloat, v_float32)
+DEF_CVT_FUNC(32u16bf, cvt1_, unsigned, bfloat, v_float32)
 
 ////////////////////// 32s -> ... ////////////////////////
 
@@ -450,7 +451,7 @@ DEF_CVT_FUNC(16f64f, cvt1_, hfloat, double, v_float32)
 DEF_CVT_FUNC(16f64u, cvt1_, hfloat, uint64_t, v_float32)
 DEF_CVT_FUNC(16f64s, cvt1_, hfloat, int64_t, v_float32)
 DEF_CVT_FUNC(16f16bf, cvt1_, hfloat, bfloat, v_float32)
-DEF_CVT2BOOL_FUNC(16f8b, short, 1)
+DEF_CVT2BOOL_FUNC(16f8b, ushort, 1)
 
 ////////////////////// 16bf -> ... ////////////////////////
 
@@ -517,7 +518,6 @@ static void cvt64s(const uchar* src, size_t sstep, const uchar*, size_t, uchar* 
     DEF_CVT_SCALAR_FUNC(S##16s,  T, short)     DEF_CVT_SCALAR_FUNC(16s##S,  short, T) \
     DEF_CVT_SCALAR_FUNC(S##32u,  T, unsigned)  DEF_CVT_SCALAR_FUNC(32u##S,  unsigned, T) \
     DEF_CVT_SCALAR_FUNC(S##32s,  T, int)       DEF_CVT_SCALAR_FUNC(32s##S,  int, T) \
-    DEF_CVT_SCALAR_FUNC(32f##S,  float, T) \
     DEF_CVT_SCALAR_FUNC(S##64f,  T, double)    DEF_CVT_SCALAR_FUNC(64f##S,  double, T) \
     DEF_CVT_SCALAR_FUNC(S##16f,  T, hfloat)    DEF_CVT_SCALAR_FUNC(16f##S,  hfloat, T) \
     DEF_CVT_SCALAR_FUNC(S##16bf, T, bfloat)    DEF_CVT_SCALAR_FUNC(16bf##S, bfloat, T) \
@@ -531,6 +531,40 @@ DEF_CVT_FP8(8fe4m3u, fp8a_t)
 // FP8 -> FP8, cross-format only (identity uses the 1-byte copy cvt8u, like 16f->16f uses cvt16u)
 DEF_CVT_SCALAR_FUNC(8fe4m38fe4m3u, fp8_t,   fp8a_t)
 DEF_CVT_SCALAR_FUNC(8fe4m3u8fe4m3, fp8a_t, fp8_t)
+
+// float32 -> FP8 encode via the shared building blocks in convert.hpp.
+template<int bias, bool fnuz> static void
+cvtF32ToFp8(const uchar* src_, size_t sstep, const uchar*, size_t,
+            uchar* dst, size_t dstep, Size size, void*)
+{
+    CV_INSTRUMENT_REGION();
+    const float* src = (const float*)src_;
+    sstep /= sizeof(src[0]);
+
+    for (int i = 0; i < size.height; i++, src += sstep, dst += dstep)
+    {
+        int j = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+        const int LANES32 = VTraits<v_int32>::vlanes();
+        const int VECSZ = LANES32 * 4;
+        for (; j <= size.width - VECSZ; j += VECSZ)
+        {
+            v_float32 vf0 = vx_load(src + j);
+            v_float32 vf1 = vx_load(src + j + LANES32);
+            v_float32 vf2 = vx_load(src + j + 2 * LANES32);
+            v_float32 vf3 = vx_load(src + j + 3 * LANES32);
+            encodeFp8Vec4<bias, fnuz>(vf0, vf1, vf2, vf3, src + j, VECSZ, dst + j);
+        }
+        vx_cleanup();
+#endif
+        for (; j < size.width; j++)
+            dst[j] = fp8_detail::encodeE4M3(src[j], bias, fnuz);
+    }
+}
+static void cvt32f8fe4m3(const uchar* s, size_t ss, const uchar* p, size_t ps, uchar* d, size_t ds, Size sz, void* x)
+{ cvtF32ToFp8<7, false>(s, ss, p, ps, d, ds, sz, x); }
+static void cvt32f8fe4m3u(const uchar* s, size_t ss, const uchar* p, size_t ps, uchar* d, size_t ds, Size sz, void* x)
+{ cvtF32ToFp8<8, true>(s, ss, p, ps, d, ds, sz, x); }
 
 // FP8 -> float32: 256-entry decode table gathered via universal intrinsics (same table as scalar)
 template<typename FP8>
@@ -778,7 +812,7 @@ BinaryFunc getConvertFunc(int sdepth_, int ddepth_)
             sdepth == CV_16F ? cvt16f64s :
             sdepth == CV_16BF ? cvt16bf64s :
             sdepth == CV_Bool ? cvt8b64s :
-            sdepth == CV_64U ? cvt64s :
+            sdepth == CV_64U ? cvt64u64s :
             sdepth == CV_64S ? cvt64s :
             sdepth == CV_8F_E4M3FN ? cvt8fe4m364s :
             sdepth == CV_8F_E4M3FNUZ ? cvt8fe4m3u64s :

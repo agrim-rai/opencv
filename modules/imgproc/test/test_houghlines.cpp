@@ -470,4 +470,57 @@ INSTANTIATE_TEST_CASE_P( Imgproc, HoughLinesPointSetTest, testing::Combine(testi
                                                                            testing::Values( (CV_PI / 2.0f), (CV_PI * 5.0f / 12.0f) )
                                                                            ));
 
+TEST(Imgproc_HoughLines, invalid_parameters)
+{
+    Mat img(10, 10, CV_8U, Scalar(0));
+    std::vector<Vec2f> lines;
+    EXPECT_THROW(cv::HoughLines(img, lines, 0, CV_PI/180, 1), cv::Exception);
+    EXPECT_THROW(cv::HoughLines(img, lines, -1, CV_PI/180, 1), cv::Exception);
+    EXPECT_THROW(cv::HoughLines(img, lines, DBL_MAX, CV_PI/180, 1), cv::Exception);
+    EXPECT_THROW(cv::HoughLines(img, lines, 1, 0, 1), cv::Exception);
+    EXPECT_THROW(cv::HoughLines(img, lines, 1, -CV_PI/180, 1), cv::Exception);
+    EXPECT_THROW(cv::HoughLines(img, lines, 1, DBL_MAX, 1), cv::Exception);
+    EXPECT_THROW(cv::HoughLines(img, lines, 1, CV_PI/180, -1), cv::Exception);
+
+    std::vector<Vec4i> linesP;
+    EXPECT_THROW(cv::HoughLinesP(img, linesP, 0, CV_PI/180, 1), cv::Exception);
+    EXPECT_THROW(cv::HoughLinesP(img, linesP, -1, CV_PI/180, 1), cv::Exception);
+    EXPECT_THROW(cv::HoughLinesP(img, linesP, DBL_MAX, CV_PI/180, 1), cv::Exception);
+    EXPECT_THROW(cv::HoughLinesP(img, linesP, 1, 0, 1), cv::Exception);
+    EXPECT_THROW(cv::HoughLinesP(img, linesP, 1, -CV_PI/180, 1), cv::Exception);
+    EXPECT_THROW(cv::HoughLinesP(img, linesP, 1, DBL_MAX, 1), cv::Exception);
+    EXPECT_THROW(cv::HoughLinesP(img, linesP, 1, CV_PI/180, -1), cv::Exception);
+}
+
+TEST(Imgproc_HoughLines, threshold_zero_single_vote)
+{
+    // Single non-zero pixel at (x=4, y=3) tested at angles {0, pi/2}:
+    // accum(theta=0, rho=4) == 1 and accum(theta=pi/2, rho=3) == 1.
+    cv::Mat1b img = cv::Mat1b::zeros(8, 8);
+    img(3, 4) = 255;
+
+    // With threshold = 1, strict `accum > threshold` (1 > 1) rejects 1-vote bins:
+    std::vector<cv::Vec2f> lines_gt1;
+    cv::HoughLines(img, lines_gt1, 1.0, CV_PI / 2, /*threshold=*/1);
+    EXPECT_TRUE(lines_gt1.empty());
+
+    // HoughLinesPointSet allows threshold = 0 (`accum > 0` => >= 1 vote) and finds both lines:
+    std::vector<cv::Point2f> pts = {{4.f, 3.f}};
+    std::vector<cv::Vec3d> lines_pts;
+    cv::HoughLinesPointSet(pts, lines_pts, /*lines_max=*/10, /*threshold=*/0,
+                           -16, 16, 1.0, 0.0, CV_PI, CV_PI / 2);
+    EXPECT_EQ(lines_pts.size(), 2u);
+
+    // HoughLines with threshold = 0 should likewise find both 1-vote lines
+    // (instead of throwing StsOutOfRange or dividing by zero in IPP):
+    std::vector<cv::Vec2f> lines_gt0;
+    cv::HoughLines(img, lines_gt0, 1.0, CV_PI / 2, /*threshold=*/0);
+    EXPECT_EQ(lines_gt0.size(), 2u);
+
+    // HoughLinesP with threshold = 0 should also accept non-negative threshold:
+    std::vector<cv::Vec4i> linesP_gt0;
+    cv::HoughLinesP(img, linesP_gt0, 1.0, CV_PI / 2, /*threshold=*/0);
+    EXPECT_EQ(linesP_gt0.size(), 1u);
+}
+
 }} // namespace

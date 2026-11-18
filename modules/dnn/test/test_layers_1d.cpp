@@ -78,9 +78,9 @@ TEST_P(Layer_Test_01D, Clip)
 
     lp.type = "Clip";
     lp.name = "ClipLayer";
-    lp.set("min_value", 0.0);
-    lp.set("max_value", 1.0);
-    Ptr<ReLU6Layer> layer = ReLU6Layer::create(lp);
+    lp.set("min", 0.0);
+    lp.set("max", 1.0);
+    Ptr<ClipLayer> layer = ClipLayer::create(lp);
 
     Mat output_ref(output_shape.size(), output_shape.data(), CV_32F, 1.0);
     std::vector<Mat> inputs{input};
@@ -725,7 +725,6 @@ int arg_op(const std::vector<T>& vec, const std::string& operation) {
         CV_Error(Error::StsAssert, "Provided operation: " + operation + " is not supported. Please check the test instantiation.");
     }
 }
-// Test for ArgLayer is disabled because there problem in runLayer function related to type assignment
 typedef testing::TestWithParam<tuple<std::vector<int>, std::string>> Layer_Arg_Test;
 TEST_P(Layer_Arg_Test, Accuracy_01D) {
     std::vector<int> input_shape = get<0>(GetParam());
@@ -774,7 +773,7 @@ TEST_P(Layer_Arg_Test, Accuracy_01D) {
     runLayer(layer, inputs, outputs);
     ASSERT_EQ(1, outputs.size());
     ASSERT_EQ(shape(output_ref), shape(outputs[0]));
-    // convert output_ref to float to match the output type
+    // ArgLayer::getTypes() reports CV_64S; match it before comparing
     output_ref.convertTo(output_ref, CV_64SC1);
     normAssert(output_ref, outputs[0]);
 }
@@ -838,6 +837,41 @@ INSTANTIATE_TEST_CASE_P(/*nothing*/, Layer_NaryElemwise_1d_Test, Combine(
                             std::vector<int>({4, 1})),
 /*operation*/           testing::Values("div", "mul", "sum", "sub")
 ));
+
+// ONNX Mod with fmod=0 on signed integers: the remainder takes the divisor's sign, and
+// min % -1 is 0 instead of an overflow.
+template<typename T>
+static void testSignedIntMod(int depth)
+{
+    LayerParams lp;
+    lp.type = "NaryEltwise";
+    lp.name = "mod_Layer";
+    lp.set("operation", "mod");
+    Ptr<NaryEltwiseLayer> layer = NaryEltwiseLayer::create(lp);
+
+    const T lo = std::numeric_limits<T>::min();
+    T a[] = {lo, lo, 7, -7, 7, -7};
+    T b[] = {-1, 1, 3, 3, -3, -3};
+    T ref[] = {0, 0, 1, 2, -2, -1};
+    const int n = (int)(sizeof(a) / sizeof(a[0]));
+
+    std::vector<Mat> inputs{Mat(1, n, depth, a), Mat(1, n, depth, b)};
+    std::vector<Mat> outputs;
+    runLayer(layer, inputs, outputs);
+
+    ASSERT_EQ(1u, outputs.size());
+    ASSERT_EQ(depth, outputs[0].depth());
+    ASSERT_EQ((size_t)n, outputs[0].total());
+    const T* out = outputs[0].ptr<T>();
+    for (int i = 0; i < n; i++)
+        EXPECT_EQ(ref[i], out[i]) << "i=" << i;
+}
+
+TEST(Layer_NaryElemwise_Mod_Test, signed_int_min_by_minus_one)
+{
+    testSignedIntMod<int32_t>(CV_32S);
+    testSignedIntMod<int64_t>(CV_64S);
+}
 
 typedef testing::TestWithParam<tuple<std::vector<int>, std::string>> Layer_Elemwise_1d_Test;
 TEST_P(Layer_Elemwise_1d_Test, Accuracy_01D) {
@@ -1659,6 +1693,73 @@ INSTANTIATE_TEST_CASE_P(/*nothing*/, Layer_Einsum_Test, testing::Values(
     std::make_tuple(std::vector<int>({4, 1}), std::vector<int>({4, 1}), "ij,ij->i"),
     std::make_tuple(std::vector<int>({4, 4}), std::vector<int>({4, 4}), "ij,ij->i")
     ));
+
+TEST(Layer_Einsum, DynamicLeadingDimensionReusesLayer)
+{
+    LayerParams lp;
+    lp.type = "Einsum";
+    lp.name = "dynamic_leading_dimension";
+    lp.set("equation", "mc,mchw->mhw");
+    Ptr<Layer> layer = EinsumLayer::create(lp);
+
+    const int channels = 3, height = 2, width = 2;
+    const int leadingDimensions[] = {2, 5, 2};
+    for (const int leadingDimension : leadingDimensions)
+    {
+        Mat coefficients(MatShape{leadingDimension, channels}, CV_32F, Scalar::all(1));
+        Mat features(MatShape{leadingDimension, channels, height, width}, CV_32F, Scalar::all(2));
+        std::vector<Mat> inputs{coefficients, features}, outputs;
+
+        runLayer(layer, inputs, outputs);
+
+        ASSERT_EQ(outputs.size(), (size_t)1);
+        EXPECT_EQ(shape(outputs[0]), MatShape({leadingDimension, height, width}));
+        Mat expected(MatShape{leadingDimension, height, width}, CV_32F, Scalar::all(6));
+        normAssert(outputs[0], expected);
+    }
+}
+
+TEST(Layer_TopK2, ZeroK)
+{
+    Mat input(MatShape{2, 5}, CV_32F);
+    randu(input, 0.f, 1.f);
+
+    // constant K = 0, given as the "k" attribute
+    {
+        LayerParams lp;
+        lp.type = "TopK2";
+        lp.name = "topk_static";
+        lp.set("axis", 1);
+        lp.set("k", 0);
+        Ptr<Layer> layer = TopK2Layer::create(lp);
+
+        std::vector<Mat> inputs{input}, outputs;
+        runLayer(layer, inputs, outputs);
+
+        ASSERT_EQ(outputs.size(), (size_t)2);
+        EXPECT_EQ(shape(outputs[0]), MatShape({2, 0}));
+        EXPECT_EQ(shape(outputs[1]), MatShape({2, 0}));
+    }
+
+    // K = 0 coming from a tensor at runtime, as in detectors when nothing passes the
+    // score threshold; the engine skips getMemoryShapes() here, so call forward() directly
+    {
+        LayerParams lp;
+        lp.type = "TopK2";
+        lp.name = "topk_dynamic";
+        lp.set("axis", 1);
+        Ptr<Layer> layer = TopK2Layer::create(lp);
+
+        Mat k(MatShape{1}, CV_64S, Scalar(0));
+        std::vector<Mat> inputs{input, k}, outputs(2), internals;
+        layer->forward(inputs, outputs, internals);
+
+        EXPECT_EQ(shape(outputs[0]), MatShape({2, 0}));
+        EXPECT_EQ(shape(outputs[1]), MatShape({2, 0}));
+        EXPECT_EQ(outputs[0].type(), CV_32F);
+        EXPECT_EQ(outputs[1].type(), CV_64S);
+    }
+}
 
 
 }}

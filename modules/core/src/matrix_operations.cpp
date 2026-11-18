@@ -327,6 +327,7 @@ namespace cv
 typedef void (*ReduceSumFunc)(const Mat& src, Mat& dst);
 ReduceSumFunc getReduceCSumFunc(int sdepth, int ddepth);
 ReduceSumFunc getReduceRSumFunc(int sdepth, int ddepth);
+ReduceSumFunc getReduceRSum2Func(int sdepth, int ddepth);
 
 template <typename T, typename WT, typename Op>
 struct ReduceR_SIMD
@@ -471,6 +472,11 @@ typedef void (*ReduceFunc)( const Mat& src, Mat& dst );
 #define reduceSumR32f32f reduceR_<float, float, OpAdd<float> >
 #define reduceSumR32f64f reduceR_<float, double,OpAdd<double> >
 #define reduceSumR64f64f reduceR_<double,double,OpAdd<double> >
+#define reduceSumR8s32s  reduceR_<schar, int,   OpAdd<int>, OpNop<int> >
+#define reduceSumR8s32f  reduceR_<schar, float, OpAdd<int>, OpNop<int> >
+#define reduceSumR8s64f  reduceR_<schar, double,OpAdd<int>, OpNop<int> >
+// CV_32S accumulates in double: int would overflow before OpAdd's saturate_cast could clamp it.
+#define reduceSumR32s64f reduceR_<int,   double,OpAdd<double> >
 
 #define reduceSum2R8u32s  reduceR_<uchar, int,   OpAddSqr<int>,   OpSqr<int> >
 #define reduceSum2R8u32f  reduceR_<uchar, float, OpAddSqr<int>,   OpSqr<int> >
@@ -482,6 +488,10 @@ typedef void (*ReduceFunc)( const Mat& src, Mat& dst );
 #define reduceSum2R32f32f reduceR_<float, float, OpAddSqr<float>, OpSqr<float> >
 #define reduceSum2R32f64f reduceR_<float, double,OpAddSqr<double>,OpSqr<double> >
 #define reduceSum2R64f64f reduceR_<double,double,OpAddSqr<double>,OpSqr<double> >
+#define reduceSum2R8s32s  reduceR_<schar, int,   OpAddSqr<int>,   OpSqr<int> >
+#define reduceSum2R8s32f  reduceR_<schar, float, OpAddSqr<int>,   OpSqr<int> >
+#define reduceSum2R8s64f  reduceR_<schar, double,OpAddSqr<int>,   OpSqr<int> >
+#define reduceSum2R32s64f reduceR_<int,   double,OpAddSqr<double>,OpSqr<double> >
 
 #define reduceMaxR8u  reduceR_<uchar, uchar, OpMax<uchar> >
 #define reduceMaxR16u reduceR_<ushort,ushort,OpMax<ushort> >
@@ -494,6 +504,10 @@ typedef void (*ReduceFunc)( const Mat& src, Mat& dst );
 #define reduceMinR16s reduceR_<short, short, OpMin<short> >
 #define reduceMinR32f reduceR_<float, float, OpMin<float> >
 #define reduceMinR64f reduceR_<double,double,OpMin<double> >
+#define reduceMaxR8s  reduceR_<schar, schar, OpMax<schar> >
+#define reduceMaxR32s reduceR_<int,   int,   OpMax<int> >
+#define reduceMinR8s  reduceR_<schar, schar, OpMin<schar> >
+#define reduceMinR32s reduceR_<int,   int,   OpMin<int> >
 
 #if defined(HAVE_IPP) && !IPP_DISABLE_REDUCE
 static inline bool ipp_reduceSumC_8u16u16s32f_64f(const cv::Mat& srcmat, cv::Mat& dstmat)
@@ -576,6 +590,10 @@ static inline void reduceSumC_8u16u16s32f_64f(const cv::Mat& srcmat, cv::Mat& ds
 #define reduceSumC16s32f reduceC_<short, float, OpAdd<float> >
 #define reduceSumC32f32f reduceC_<float, float, OpAdd<float> >
 #define reduceSumC64f64f reduceC_<double,double,OpAdd<double> >
+#define reduceSumC8s32s  reduceC_<schar, int,   OpAdd<int>, OpNop<int> >
+#define reduceSumC8s32f  reduceC_<schar, float, OpAdd<int>, OpNop<int> >
+#define reduceSumC8s64f  reduceC_<schar, double,OpAdd<int>, OpNop<int> >
+#define reduceSumC32s64f reduceC_<int,   double,OpAdd<double> >
 
 #define reduceSum2C8u32s  reduceC_<uchar, int,   OpAddSqr<int>,   OpSqr<int> >
 #define reduceSum2C8u32f  reduceC_<uchar, float, OpAddSqr<int>,   OpSqr<int> >
@@ -583,6 +601,10 @@ static inline void reduceSumC_8u16u16s32f_64f(const cv::Mat& srcmat, cv::Mat& ds
 #define reduceSum2C16s32f reduceC_<short, float, OpAddSqr<float>, OpSqr<float> >
 #define reduceSum2C32f32f reduceC_<float, float, OpAddSqr<float>, OpSqr<float> >
 #define reduceSum2C64f64f reduceC_<double,double,OpAddSqr<double>,OpSqr<double> >
+#define reduceSum2C8s32s  reduceC_<schar, int,   OpAddSqr<int>,   OpSqr<int> >
+#define reduceSum2C8s32f  reduceC_<schar, float, OpAddSqr<int>,   OpSqr<int> >
+#define reduceSum2C8s64f  reduceC_<schar, double,OpAddSqr<int>,   OpSqr<int> >
+#define reduceSum2C32s64f reduceC_<int,   double,OpAddSqr<double>,OpSqr<double> >
 
 #if defined(HAVE_IPP) && !IPP_DISABLE_REDUCE
 #define reduceSumC8u64f  reduceSumC_8u16u16s32f_64f
@@ -651,6 +673,10 @@ REDUCE_OP(32f, Min, float, float)
 #define reduceMinC32f reduceC_<float, float, OpMin<float> >
 #endif
 #define reduceMinC64f reduceC_<double,double,OpMin<double> >
+#define reduceMaxC8s  reduceC_<schar, schar, OpMax<schar> >
+#define reduceMaxC32s reduceC_<int,   int,   OpMax<int> >
+#define reduceMinC8s  reduceC_<schar, schar, OpMin<schar> >
+#define reduceMinC32s reduceC_<int,   int,   OpMin<int> >
 
 #ifdef HAVE_OPENCL
 
@@ -764,7 +790,13 @@ void cv::reduce(InputArray _src, OutputArray _dst, int dim, int op, int dtype)
 {
     CV_INSTRUMENT_REGION();
 
-    CV_Assert( _src.dims() <= 2 );
+    if (_src.dims() > 2 || op > REDUCE_SUM2)
+    {
+        CV_CheckGE(dim, -_src.dims(), "reduce: dim is out of range");
+        CV_CheckLT(dim, _src.dims(), "reduce: dim is out of range");
+        cv::reduce(_src, _dst, cv::ReduceParams(op, {dim}, true, dtype < 0 && _dst.fixedType() ? _dst.depth() : dtype));
+        return;
+    }
     int op0 = op;
     int stype = _src.type(), sdepth = CV_MAT_DEPTH(stype), cn = CV_MAT_CN(stype);
     if( dtype < 0 )
@@ -786,11 +818,11 @@ void cv::reduce(InputArray _src, OutputArray _dst, int dim, int op, int dtype)
         srcUMat = _src.getUMat();
 
     Mat src = _src.getMat();
+    if (src.empty()) {
+        src.convertTo(_dst, dtype);
+        return;
+    }
     if (src.dims <= 1) {
-        if (src.dims == 0) {
-            src.convertTo(_dst, dtype);
-            return;
-        }
         CV_Assert(dim == 0);
         dim = 1;
     }
@@ -836,6 +868,14 @@ void cv::reduce(InputArray _src, OutputArray _dst, int dim, int op, int dtype)
                 func = reduceSumR32f64f;
             else if(sdepth == CV_64F && ddepth == CV_64F)
                 func = reduceSumR64f64f;
+            else if(sdepth == CV_8S && ddepth == CV_32S)
+                func = reduceSumR8s32s;
+            else if(sdepth == CV_8S && ddepth == CV_32F)
+                func = reduceSumR8s32f;
+            else if(sdepth == CV_8S && ddepth == CV_64F)
+                func = reduceSumR8s64f;
+            else if(sdepth == CV_32S && ddepth == CV_64F)
+                func = reduceSumR32s64f;
         }
         else if(op == REDUCE_MAX)
         {
@@ -849,6 +889,10 @@ void cv::reduce(InputArray _src, OutputArray _dst, int dim, int op, int dtype)
                 func = reduceMaxR32f;
             else if(sdepth == CV_64F && ddepth == CV_64F)
                 func = reduceMaxR64f;
+            else if(sdepth == CV_8S && ddepth == CV_8S)
+                func = reduceMaxR8s;
+            else if(sdepth == CV_32S && ddepth == CV_32S)
+                func = reduceMaxR32s;
         }
         else if(op == REDUCE_MIN)
         {
@@ -862,10 +906,17 @@ void cv::reduce(InputArray _src, OutputArray _dst, int dim, int op, int dtype)
                 func = reduceMinR32f;
             else if(sdepth == CV_64F && ddepth == CV_64F)
                 func = reduceMinR64f;
+            else if(sdepth == CV_8S && ddepth == CV_8S)
+                func = reduceMinR8s;
+            else if(sdepth == CV_32S && ddepth == CV_32S)
+                func = reduceMinR32s;
         }
         else if( op == REDUCE_SUM2 )
         {
-            if(sdepth == CV_8U && ddepth == CV_32S)
+            ReduceSumFunc simd_func = getReduceRSum2Func(sdepth, ddepth);
+            if(simd_func)
+                func = simd_func;
+            else if(sdepth == CV_8U && ddepth == CV_32S)
                 func = reduceSum2R8u32s;
             else if(sdepth == CV_8U && ddepth == CV_32F)
                 func = reduceSum2R8u32f;
@@ -885,6 +936,14 @@ void cv::reduce(InputArray _src, OutputArray _dst, int dim, int op, int dtype)
                 func = reduceSum2R32f64f;
             else if(sdepth == CV_64F && ddepth == CV_64F)
                 func = reduceSum2R64f64f;
+            else if(sdepth == CV_8S && ddepth == CV_32S)
+                func = reduceSum2R8s32s;
+            else if(sdepth == CV_8S && ddepth == CV_32F)
+                func = reduceSum2R8s32f;
+            else if(sdepth == CV_8S && ddepth == CV_64F)
+                func = reduceSum2R8s64f;
+            else if(sdepth == CV_32S && ddepth == CV_64F)
+                func = reduceSum2R32s64f;
         }
     }
     else
@@ -914,6 +973,14 @@ void cv::reduce(InputArray _src, OutputArray _dst, int dim, int op, int dtype)
                 func = reduceSumC32f64f;
             else if(sdepth == CV_64F && ddepth == CV_64F)
                 func = reduceSumC64f64f;
+            else if(sdepth == CV_8S && ddepth == CV_32S)
+                func = reduceSumC8s32s;
+            else if(sdepth == CV_8S && ddepth == CV_32F)
+                func = reduceSumC8s32f;
+            else if(sdepth == CV_8S && ddepth == CV_64F)
+                func = reduceSumC8s64f;
+            else if(sdepth == CV_32S && ddepth == CV_64F)
+                func = reduceSumC32s64f;
         }
         else if(op == REDUCE_MAX)
         {
@@ -927,6 +994,10 @@ void cv::reduce(InputArray _src, OutputArray _dst, int dim, int op, int dtype)
                 func = reduceMaxC32f;
             else if(sdepth == CV_64F && ddepth == CV_64F)
                 func = reduceMaxC64f;
+            else if(sdepth == CV_8S && ddepth == CV_8S)
+                func = reduceMaxC8s;
+            else if(sdepth == CV_32S && ddepth == CV_32S)
+                func = reduceMaxC32s;
         }
         else if(op == REDUCE_MIN)
         {
@@ -940,6 +1011,10 @@ void cv::reduce(InputArray _src, OutputArray _dst, int dim, int op, int dtype)
                 func = reduceMinC32f;
             else if(sdepth == CV_64F && ddepth == CV_64F)
                 func = reduceMinC64f;
+            else if(sdepth == CV_8S && ddepth == CV_8S)
+                func = reduceMinC8s;
+            else if(sdepth == CV_32S && ddepth == CV_32S)
+                func = reduceMinC32s;
         }
         else if(op == REDUCE_SUM2)
         {
@@ -963,6 +1038,14 @@ void cv::reduce(InputArray _src, OutputArray _dst, int dim, int op, int dtype)
                 func = reduceSum2C32f64f;
             else if(sdepth == CV_64F && ddepth == CV_64F)
                 func = reduceSum2C64f64f;
+            else if(sdepth == CV_8S && ddepth == CV_32S)
+                func = reduceSum2C8s32s;
+            else if(sdepth == CV_8S && ddepth == CV_32F)
+                func = reduceSum2C8s32f;
+            else if(sdepth == CV_8S && ddepth == CV_64F)
+                func = reduceSum2C8s64f;
+            else if(sdepth == CV_32S && ddepth == CV_64F)
+                func = reduceSum2C32s64f;
         }
     }
 
@@ -1037,23 +1120,29 @@ template<typename T> static void sort_( const Mat& src, Mat& dst, int flags )
 #if defined(HAVE_IPP) && !IPP_DISABLE_SORT
 typedef IppStatus (CV_STDCALL *IppSortFunc)(void  *pSrcDst, int    len, Ipp8u *pBuffer);
 
+template<typename T, IppStatus (CV_STDCALL *fn)(T*, int, Ipp8u*)>
+static IppStatus CV_STDCALL ippSortWrap(void* pSrcDst, int len, Ipp8u* pBuffer)
+{
+    return fn((T*)pSrcDst, len, pBuffer);
+}
+
 static IppSortFunc getSortFunc(int depth, bool sortDescending)
 {
     if (!sortDescending)
-        return depth == CV_8U ? (IppSortFunc)ippsSortRadixAscend_8u_I :
-            depth == CV_16U ? (IppSortFunc)ippsSortRadixAscend_16u_I :
-            depth == CV_16S ? (IppSortFunc)ippsSortRadixAscend_16s_I :
-            depth == CV_32S ? (IppSortFunc)ippsSortRadixAscend_32s_I :
-            depth == CV_32F ? (IppSortFunc)ippsSortRadixAscend_32f_I :
-            depth == CV_64F ? (IppSortFunc)ippsSortRadixAscend_64f_I :
+        return depth == CV_8U ? ippSortWrap<Ipp8u, ippsSortRadixAscend_8u_I> :
+            depth == CV_16U ? ippSortWrap<Ipp16u, ippsSortRadixAscend_16u_I> :
+            depth == CV_16S ? ippSortWrap<Ipp16s, ippsSortRadixAscend_16s_I> :
+            depth == CV_32S ? ippSortWrap<Ipp32s, ippsSortRadixAscend_32s_I> :
+            depth == CV_32F ? ippSortWrap<Ipp32f, ippsSortRadixAscend_32f_I> :
+            depth == CV_64F ? ippSortWrap<Ipp64f, ippsSortRadixAscend_64f_I> :
             0;
     else
-        return depth == CV_8U ? (IppSortFunc)ippsSortRadixDescend_8u_I :
-            depth == CV_16U ? (IppSortFunc)ippsSortRadixDescend_16u_I :
-            depth == CV_16S ? (IppSortFunc)ippsSortRadixDescend_16s_I :
-            depth == CV_32S ? (IppSortFunc)ippsSortRadixDescend_32s_I :
-            depth == CV_32F ? (IppSortFunc)ippsSortRadixDescend_32f_I :
-            depth == CV_64F ? (IppSortFunc)ippsSortRadixDescend_64f_I :
+        return depth == CV_8U ? ippSortWrap<Ipp8u, ippsSortRadixDescend_8u_I> :
+            depth == CV_16U ? ippSortWrap<Ipp16u, ippsSortRadixDescend_16u_I> :
+            depth == CV_16S ? ippSortWrap<Ipp16s, ippsSortRadixDescend_16s_I> :
+            depth == CV_32S ? ippSortWrap<Ipp32s, ippsSortRadixDescend_32s_I> :
+            depth == CV_32F ? ippSortWrap<Ipp32f, ippsSortRadixDescend_32f_I> :
+            depth == CV_64F ? ippSortWrap<Ipp64f, ippsSortRadixDescend_64f_I> :
             0;
 }
 
@@ -1140,28 +1229,23 @@ public:
     const _Tp* arr;
 };
 
-template<typename T> static void sortIdx_( const Mat& src, Mat& dst, int flags )
+template<typename T> static void sortIdxRange_( const Mat& src, Mat& dst, int flags, const Range& range )
 {
-    AutoBuffer<T> buf;
-    AutoBuffer<int> ibuf;
     bool sortRows = (flags & 1) == SORT_EVERY_ROW;
     bool sortDescending = (flags & SORT_DESCENDING) != 0;
+    int len = sortRows ? src.cols : src.rows;
 
-    CV_Assert( src.data != dst.data );
-
-    int n, len;
-    if( sortRows )
-        n = src.rows, len = src.cols;
-    else
+    AutoBuffer<T> buf;
+    AutoBuffer<int> ibuf;
+    if( !sortRows )
     {
-        n = src.cols, len = src.rows;
         buf.allocate(len);
         ibuf.allocate(len);
     }
     T* bptr = buf.data();
     int* _iptr = ibuf.data();
 
-    for( int i = 0; i < n; i++ )
+    for( int i = range.start; i < range.end; i++ )
     {
         T* ptr = bptr;
         int* iptr = _iptr;
@@ -1192,24 +1276,52 @@ template<typename T> static void sortIdx_( const Mat& src, Mat& dst, int flags )
     }
 }
 
+template<typename T> static void sortIdx_( const Mat& src, Mat& dst, int flags )
+{
+    bool sortRows = (flags & 1) == SORT_EVERY_ROW;
+    CV_Assert( src.data != dst.data );
+    int n, len;
+    if( sortRows )
+        n = src.rows, len = src.cols;
+    else
+        n = src.cols, len = src.rows;
+
+    double nstripes = (double)n * len * std::log2((double)std::max(len, 2)) / (1 << 16);
+    if( nstripes <= 1 )
+    {
+        sortIdxRange_<T>(src, dst, flags, Range(0, n));
+        return;
+    }
+    parallel_for_(Range(0, n), [&](const Range& range)
+    {
+        sortIdxRange_<T>(src, dst, flags, range);
+    }, nstripes);
+}
+
 #if defined(HAVE_IPP) && !IPP_DISABLE_SORT
 typedef IppStatus (CV_STDCALL *IppSortIndexFunc)(const void*  pSrc, Ipp32s srcStrideBytes, Ipp32s *pDstIndx, int len, Ipp8u *pBuffer);
+
+template<typename T, IppStatus (CV_STDCALL *fn)(const T*, Ipp32s, Ipp32s*, int, Ipp8u*)>
+static IppStatus CV_STDCALL ippSortIndexWrap(const void* pSrc, Ipp32s srcStrideBytes, Ipp32s *pDstIndx, int len, Ipp8u *pBuffer)
+{
+    return fn((const T*)pSrc, srcStrideBytes, pDstIndx, len, pBuffer);
+}
 
 static IppSortIndexFunc getSortIndexFunc(int depth, bool sortDescending)
 {
     if (!sortDescending)
-        return depth == CV_8U ? (IppSortIndexFunc)ippsSortRadixIndexAscend_8u :
-            depth == CV_16U ? (IppSortIndexFunc)ippsSortRadixIndexAscend_16u :
-            depth == CV_16S ? (IppSortIndexFunc)ippsSortRadixIndexAscend_16s :
-            depth == CV_32S ? (IppSortIndexFunc)ippsSortRadixIndexAscend_32s :
-            depth == CV_32F ? (IppSortIndexFunc)ippsSortRadixIndexAscend_32f :
+        return depth == CV_8U ? ippSortIndexWrap<Ipp8u, ippsSortRadixIndexAscend_8u> :
+            depth == CV_16U ? ippSortIndexWrap<Ipp16u, ippsSortRadixIndexAscend_16u> :
+            depth == CV_16S ? ippSortIndexWrap<Ipp16s, ippsSortRadixIndexAscend_16s> :
+            depth == CV_32S ? ippSortIndexWrap<Ipp32s, ippsSortRadixIndexAscend_32s> :
+            depth == CV_32F ? ippSortIndexWrap<Ipp32f, ippsSortRadixIndexAscend_32f> :
             0;
     else
-        return depth == CV_8U ? (IppSortIndexFunc)ippsSortRadixIndexDescend_8u :
-            depth == CV_16U ? (IppSortIndexFunc)ippsSortRadixIndexDescend_16u :
-            depth == CV_16S ? (IppSortIndexFunc)ippsSortRadixIndexDescend_16s :
-            depth == CV_32S ? (IppSortIndexFunc)ippsSortRadixIndexDescend_32s :
-            depth == CV_32F ? (IppSortIndexFunc)ippsSortRadixIndexDescend_32f :
+        return depth == CV_8U ? ippSortIndexWrap<Ipp8u, ippsSortRadixIndexDescend_8u> :
+            depth == CV_16U ? ippSortIndexWrap<Ipp16u, ippsSortRadixIndexDescend_16u> :
+            depth == CV_16S ? ippSortIndexWrap<Ipp16s, ippsSortRadixIndexDescend_16s> :
+            depth == CV_32S ? ippSortIndexWrap<Ipp32s, ippsSortRadixIndexDescend_32s> :
+            depth == CV_32F ? ippSortIndexWrap<Ipp32f, ippsSortRadixIndexDescend_32f> :
             0;
 }
 
@@ -1290,7 +1402,9 @@ void cv::sort( InputArray _src, OutputArray _dst, int flags )
     static SortFunc tab[CV_DEPTH_MAX] =
     {
         sort_<uchar>, sort_<schar>, sort_<ushort>, sort_<short>,
-        sort_<int>, sort_<float>, sort_<double>, 0
+        sort_<int>, sort_<float>, sort_<double>, sort_<hfloat>,
+        sort_<bfloat>, sort_<uchar>, sort_<uint64_t>, sort_<int64_t>,
+        sort_<uint32_t>, sort_<fp8_t>, sort_<fp8a_t>
     };
     SortFunc func = tab[src.depth()];
     CV_Assert( func != 0 );
@@ -1317,7 +1431,9 @@ void cv::sortIdx( InputArray _src, OutputArray _dst, int flags )
     static SortFunc tab[CV_DEPTH_MAX] =
     {
         sortIdx_<uchar>, sortIdx_<schar>, sortIdx_<ushort>, sortIdx_<short>,
-        sortIdx_<int>, sortIdx_<float>, sortIdx_<double>, 0
+        sortIdx_<int>, sortIdx_<float>, sortIdx_<double>, sortIdx_<hfloat>,
+        sortIdx_<bfloat>, sortIdx_<uchar>, sortIdx_<uint64_t>, sortIdx_<int64_t>,
+        sortIdx_<uint32_t>, sortIdx_<fp8_t>, sortIdx_<fp8a_t>
     };
     SortFunc func = tab[src.depth()];
     CV_Assert( func != 0 );

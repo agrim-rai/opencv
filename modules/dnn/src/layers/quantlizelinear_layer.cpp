@@ -6,6 +6,7 @@
 #include "../precomp.hpp"
 #include "layers_common.hpp"
 #include "../net_impl.hpp"
+#include "../onnx/onnx_dtype_convert.hpp"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -16,39 +17,52 @@ namespace cv
 namespace dnn
 {
 
-// Fast path for per-tensor quantization: float → uint8 with AVX2
+// Fast path for per-tensor quantization: float -> uint8 or int8 with AVX2
 #if defined(__x86_64__) || defined(_M_X64)
+template <typename _OutTp>
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("avx2")))
 #endif
-static void quantizeLinearChunk_f32_u8_avx2(const float* src, uint8_t* dst,
-                                             float scale, float zp_f,
-                                             int64_t len)
+static void quantizeLinearChunk_f32_avx2(const float* src, _OutTp* dst,
+                                         float scale, int zp_i, int lo_i, int hi_i,
+                                         int64_t len)
 {
     __m256 vscale = _mm256_set1_ps(scale);
-    // The zero-point is integral. Round x/scale FIRST, then add the integer zp;
-    // adding an odd zp before rounding would flip round-half-to-even ties
-    int zp_i = cvRound(zp_f);
+    // Clamp in float: a value outside int32 range converts to INT_MIN, which then
+    // saturates to the wrong end. Bounds carry the zero point so it can be added after.
+    __m256 vlo = _mm256_set1_ps((float)(lo_i - zp_i));
+    __m256 vhi = _mm256_set1_ps((float)(hi_i - zp_i));
     __m256i vzp = _mm256_set1_epi32(zp_i);
 
     int64_t j = 0;
     for (; j <= len - 8; j += 8) {
-        __m256 v = _mm256_loadu_ps(src + j);
-        __m256i vi = _mm256_cvtps_epi32(_mm256_div_ps(v, vscale)); // round half-to-even
-        vi = _mm256_add_epi32(vi, vzp);                            // + integer zero-point
-        __m128i lo = _mm256_castsi256_si128(vi);
-        __m128i hi = _mm256_extracti128_si256(vi, 1);
-        __m128i packed16 = _mm_packs_epi32(lo, hi);
-        __m128i packed8 = _mm_packus_epi16(packed16, packed16);    // saturates to [0,255]
+        __m256 v = _mm256_div_ps(_mm256_loadu_ps(src + j), vscale);
+        // max then min, so a NaN takes the second operand and lands inside the range.
+        v = _mm256_min_ps(_mm256_max_ps(v, vlo), vhi);
+        // Round before adding the zero point; an odd one would flip half-to-even ties.
+        __m256i vi = _mm256_add_epi32(_mm256_cvtps_epi32(v), vzp);
+        __m128i packed16 = _mm_packs_epi32(_mm256_castsi256_si128(vi),
+                                           _mm256_extracti128_si256(vi, 1));
+        __m128i packed8 = std::is_signed<_OutTp>::value
+                        ? _mm_packs_epi16(packed16, packed16)
+                        : _mm_packus_epi16(packed16, packed16);
         _mm_storel_epi64((__m128i*)(dst + j), packed8);
     }
-    for (; j < len; j++)
-        dst[j] = saturate_cast<uint8_t>(cvRound(src[j] / scale) + zp_i);
+    // Same clamp as the vector loop: out of range cvRound gives INT_MIN and the zero point
+    // then overflows. A NaN fails both compares and lands on the low bound, as MAXPS does.
+    const float flo = (float)(lo_i - zp_i), fhi = (float)(hi_i - zp_i);
+    for (; j < len; j++) {
+        float v = src[j] / scale;
+        v = v > flo ? v : flo;
+        v = v < fhi ? v : fhi;
+        dst[j] = (_OutTp)(cvRound(v) + zp_i);
+    }
 }
 
-static void quantizeLinearFast_f32_u8_avx2(const float* inp, uint8_t* out,
-                                            float scale, float zp_f,
-                                            int64_t total)
+template <typename _OutTp>
+static void quantizeLinearFast_f32_avx2(const float* inp, _OutTp* out,
+                                        float scale, int zp_i, int lo_i, int hi_i,
+                                        int64_t total)
 {
     const int64_t block = 1024;
     int64_t nblocks = (total + block - 1) / block;
@@ -57,7 +71,7 @@ static void quantizeLinearFast_f32_u8_avx2(const float* inp, uint8_t* out,
         for (int i = r.start; i < r.end; i++) {
             int64_t ofs = i * block;
             int64_t len = std::min(block, total - ofs);
-            quantizeLinearChunk_f32_u8_avx2(inp + ofs, out + ofs, scale, zp_f, len);
+            quantizeLinearChunk_f32_avx2(inp + ofs, out + ofs, scale, zp_i, lo_i, hi_i, len);
         }
     });
 }
@@ -151,9 +165,53 @@ static void quantizeLinear(const _InpTp* inp_, const _ScaleTp* scale_,
     });
 }
 
+// Rounding is the fp8-grid snap itself, done by f32ToFp8 - no separate int round step.
+template <typename _InpTp, typename _ScaleTp>
+static void quantizeLinearToFp8Native(const _InpTp* inp, const _ScaleTp* scale, const uchar* zp,
+                                       uchar* out, const onnx_dtype::Fp8Fmt& fmt, bool saturate,
+                                       int64_t nslices, int sz_a, int64_t slice_size)
+{
+    parallel_for_(Range(0, (int)nslices), [&](const Range& r) {
+        for (int slice = r.start; slice < r.end; slice++) {
+            size_t base = (size_t)slice * sz_a * slice_size;
+            for (int a = 0; a < sz_a; a++) {
+                float sc = (float)scale[a];
+                float zpv = zp ? onnx_dtype::fp8ToF32(zp[a], fmt) : 0.f;
+                for (int64_t j = 0; j < slice_size; j++) {
+                    size_t idx = base + (size_t)a * slice_size + j;
+                    out[idx] = onnx_dtype::f32ToFp8((float)inp[idx] / sc + zpv, fmt, saturate);
+                }
+            }
+        }
+    });
+}
+
+// E5M2/E5M2FNUZ have no native depth; store the grid-snapped value in CV_16F, or
+// in CV_32F when setInput has widened the graph's zero_point and output.
+template <typename _InpTp, typename _ScaleTp, typename _OutTp>
+static void quantizeLinearToFp8Wide(const _InpTp* inp, const _ScaleTp* scale, const _OutTp* zp,
+                                     _OutTp* out, const onnx_dtype::Fp8Fmt& fmt, bool saturate,
+                                     int64_t nslices, int sz_a, int64_t slice_size)
+{
+    parallel_for_(Range(0, (int)nslices), [&](const Range& r) {
+        for (int slice = r.start; slice < r.end; slice++) {
+            size_t base = (size_t)slice * sz_a * slice_size;
+            for (int a = 0; a < sz_a; a++) {
+                float sc = (float)scale[a];
+                float zpv = zp ? (float)zp[a] : 0.f;
+                for (int64_t j = 0; j < slice_size; j++) {
+                    size_t idx = base + (size_t)a * slice_size + j;
+                    uint8_t code = onnx_dtype::f32ToFp8((float)inp[idx] / sc + zpv, fmt, saturate);
+                    out[idx] = _OutTp(onnx_dtype::fp8ToF32(code, fmt));
+                }
+            }
+        }
+    });
+}
+
 // Dequantize INT8/UINT8 to FP32/FP16; out must be preallocated
 static void quantizeLinear(const Mat& inp, const Mat& scale_, const Mat& zp,
-                           int axis, int block_size, Mat& out)
+                           int axis, int block_size, int outputOnnxDtype, bool saturate, Mat& out)
 {
     Mat scale = scale_;
     CV_Assert(inp.isContinuous());
@@ -172,12 +230,32 @@ static void quantizeLinear(const Mat& inp, const Mat& scale_, const Mat& zp,
 
     CV_Assert(inptype == CV_32F || inptype == CV_16F);
     CV_Assert(sctype == CV_32F || sctype == CV_16F);
-    CV_Assert(outtype == CV_8U || outtype == CV_8S);
+    // E5M2/E5M2FNUZ have no native depth, so they travel in CV_16F, or in CV_32F
+    // once setInput has widened a graph tensor. Both are ambiguous on their own -
+    // FLOAT4E2M1 and FLOAT8E8M0 map onto the same depths - so the raw ONNX dtype
+    // has to confirm this really is an FP8 request.
+    const bool wideFp8Out = (outtype == CV_16F || outtype == CV_32F) &&
+                            onnx_dtype::isFp8(outputOnnxDtype);
+    // CV_16F/CV_32F are let through here so an unsupported request (FLOAT4E2M1,
+    // FLOAT8E8M0, plain fp16) reaches the descriptive error below instead of
+    // tripping a bare assertion.
+    CV_Assert(outtype == CV_8U || outtype == CV_8S ||
+              outtype == CV_16U || outtype == CV_16S ||
+              outtype == CV_8F_E4M3FN || outtype == CV_8F_E4M3FNUZ ||
+              outtype == CV_16F || outtype == CV_32F);
+    if (outtype == CV_8F_E4M3FN || outtype == CV_8F_E4M3FNUZ || wideFp8Out)
+        CV_Assert(block_size == 0);  // block-wise FP8 quantization not yet supported
+    // INT4/UINT4 travel unpacked in CV_8S/CV_8U. QuantizeLinear saturates to the
+    // 4-bit range, which saturate_cast to the 8-bit storage type does not do.
+    const bool int4Out = onnx_dtype::isInt4(outputOnnxDtype) || onnx_dtype::isUint4(outputOnnxDtype);
+    if (int4Out)
+        CV_Assert(outtype == (onnx_dtype::isInt4(outputOnnxDtype) ? CV_8S : CV_8U));
 
     if (!zp.empty()) {
         CV_Assert(zp.isContinuous());
         CV_Assert(zptype == outtype);
-        CV_Assert(zpshape == scshape);
+        // ONNX's own test data pairs a rank-0 scale with a [1] zero_point.
+        CV_Assert(zpshape == scshape || (zpshape.total() == 1 && scshape.total() == 1));
     }
 
     if (ndims > 0)
@@ -227,16 +305,24 @@ static void quantizeLinear(const Mat& inp, const Mat& scale_, const Mat& zp,
         }
     }
 
-    // Fast path: per-tensor quantization float→uint8 with AVX2 + proper parallelism
+    // Fast path: per-tensor quantization float to uint8 or int8 with AVX2 + parallelism
 #if defined(__x86_64__) || defined(_M_X64)
-    if (block_size == 0 && sz_a == 1 && inptype == CV_32F && outtype == CV_8U && sctype == CV_32F
-        && checkHardwareSupport(CV_CPU_AVX2)) {
+    if (block_size == 0 && sz_a == 1 && inptype == CV_32F && sctype == CV_32F
+        && (outtype == CV_8U || outtype == CV_8S) && checkHardwareSupport(CV_CPU_AVX2)) {
         float scale_f32 = reinterpret_cast<const float*>(scale.data)[0];
-        float zp_f = zp.empty() ? 0.f : (float)reinterpret_cast<const uint8_t*>(zp.data)[0];
         int64_t total = nslices * slice_size;
-        quantizeLinearFast_f32_u8_avx2(reinterpret_cast<const float*>(inp.data),
+        // The kernel clamps in float before converting, so the 4-bit range goes in as bounds.
+        if (outtype == CV_8U) {
+            int zp_i = zp.empty() ? 0 : (int)reinterpret_cast<const uint8_t*>(zp.data)[0];
+            quantizeLinearFast_f32_avx2(reinterpret_cast<const float*>(inp.data),
                                         reinterpret_cast<uint8_t*>(out.data),
-                                        scale_f32, zp_f, total);
+                                        scale_f32, zp_i, 0, int4Out ? 15 : 255, total);
+        } else {
+            int zp_i = zp.empty() ? 0 : (int)reinterpret_cast<const int8_t*>(zp.data)[0];
+            quantizeLinearFast_f32_avx2(reinterpret_cast<const float*>(inp.data),
+                                        reinterpret_cast<int8_t*>(out.data),
+                                        scale_f32, zp_i, int4Out ? -8 : -128, int4Out ? 7 : 127, total);
+        }
         return;
     }
 #endif
@@ -289,13 +375,126 @@ static void quantizeLinear(const Mat& inp, const Mat& scale_, const Mat& zp,
                          reinterpret_cast<const int8_t*>(zp.data),
                          reinterpret_cast<int8_t*>(out.data),
                          nslices, sz_a, slice_size, block_size);
+    else if (outtype == CV_16U && sctype == CV_32F && inptype == CV_32F)
+        quantizeLinear(reinterpret_cast<const float*>(inp.data),
+                         reinterpret_cast<const float*>(scale.data),
+                         reinterpret_cast<const uint16_t*>(zp.data),
+                         reinterpret_cast<uint16_t*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (outtype == CV_16U && sctype == CV_32F && inptype == CV_16F)
+        quantizeLinear(reinterpret_cast<const hfloat*>(inp.data),
+                         reinterpret_cast<const float*>(scale.data),
+                         reinterpret_cast<const uint16_t*>(zp.data),
+                         reinterpret_cast<uint16_t*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (outtype == CV_16U && sctype == CV_16F && inptype == CV_32F)
+        quantizeLinear(reinterpret_cast<const float*>(inp.data),
+                         reinterpret_cast<const hfloat*>(scale.data),
+                         reinterpret_cast<const uint16_t*>(zp.data),
+                         reinterpret_cast<uint16_t*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (outtype == CV_16U && sctype == CV_16F && inptype == CV_16F)
+        quantizeLinear(reinterpret_cast<const hfloat*>(inp.data),
+                         reinterpret_cast<const hfloat*>(scale.data),
+                         reinterpret_cast<const uint16_t*>(zp.data),
+                         reinterpret_cast<uint16_t*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (outtype == CV_16S && sctype == CV_32F && inptype == CV_32F)
+        quantizeLinear(reinterpret_cast<const float*>(inp.data),
+                         reinterpret_cast<const float*>(scale.data),
+                         reinterpret_cast<const int16_t*>(zp.data),
+                         reinterpret_cast<int16_t*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (outtype == CV_16S && sctype == CV_32F && inptype == CV_16F)
+        quantizeLinear(reinterpret_cast<const hfloat*>(inp.data),
+                         reinterpret_cast<const float*>(scale.data),
+                         reinterpret_cast<const int16_t*>(zp.data),
+                         reinterpret_cast<int16_t*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (outtype == CV_16S && sctype == CV_16F && inptype == CV_32F)
+        quantizeLinear(reinterpret_cast<const float*>(inp.data),
+                         reinterpret_cast<const hfloat*>(scale.data),
+                         reinterpret_cast<const int16_t*>(zp.data),
+                         reinterpret_cast<int16_t*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (outtype == CV_16S && sctype == CV_16F && inptype == CV_16F)
+        quantizeLinear(reinterpret_cast<const hfloat*>(inp.data),
+                         reinterpret_cast<const hfloat*>(scale.data),
+                         reinterpret_cast<const int16_t*>(zp.data),
+                         reinterpret_cast<int16_t*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (outtype == CV_8F_E4M3FN || outtype == CV_8F_E4M3FNUZ) {
+        const onnx_dtype::Fp8Fmt fmt = onnx_dtype::fp8FmtFor(outtype == CV_8F_E4M3FN ? 17 : 18);
+        const uchar* zpdata = zp.empty() ? nullptr : reinterpret_cast<const uchar*>(zp.data);
+        uchar* d = reinterpret_cast<uchar*>(out.data);
+        if (inptype == CV_32F && sctype == CV_32F)
+            quantizeLinearToFp8Native(reinterpret_cast<const float*>(inp.data), reinterpret_cast<const float*>(scale.data),
+                                       zpdata, d, fmt, saturate, nslices, sz_a, slice_size);
+        else if (inptype == CV_32F && sctype == CV_16F)
+            quantizeLinearToFp8Native(reinterpret_cast<const float*>(inp.data), reinterpret_cast<const hfloat*>(scale.data),
+                                       zpdata, d, fmt, saturate, nslices, sz_a, slice_size);
+        else if (inptype == CV_16F && sctype == CV_32F)
+            quantizeLinearToFp8Native(reinterpret_cast<const hfloat*>(inp.data), reinterpret_cast<const float*>(scale.data),
+                                       zpdata, d, fmt, saturate, nslices, sz_a, slice_size);
+        else
+            quantizeLinearToFp8Native(reinterpret_cast<const hfloat*>(inp.data), reinterpret_cast<const hfloat*>(scale.data),
+                                       zpdata, d, fmt, saturate, nslices, sz_a, slice_size);
+    }
+    else if (wideFp8Out && outtype == CV_16F) {
+        const onnx_dtype::Fp8Fmt fmt = onnx_dtype::fp8FmtFor(outputOnnxDtype);
+        const hfloat* zpdata = zp.empty() ? nullptr : reinterpret_cast<const hfloat*>(zp.data);
+        hfloat* d = reinterpret_cast<hfloat*>(out.data);
+        if (inptype == CV_32F && sctype == CV_32F)
+            quantizeLinearToFp8Wide(reinterpret_cast<const float*>(inp.data), reinterpret_cast<const float*>(scale.data),
+                                     zpdata, d, fmt, saturate, nslices, sz_a, slice_size);
+        else if (inptype == CV_32F && sctype == CV_16F)
+            quantizeLinearToFp8Wide(reinterpret_cast<const float*>(inp.data), reinterpret_cast<const hfloat*>(scale.data),
+                                     zpdata, d, fmt, saturate, nslices, sz_a, slice_size);
+        else if (inptype == CV_16F && sctype == CV_32F)
+            quantizeLinearToFp8Wide(reinterpret_cast<const hfloat*>(inp.data), reinterpret_cast<const float*>(scale.data),
+                                     zpdata, d, fmt, saturate, nslices, sz_a, slice_size);
+        else
+            quantizeLinearToFp8Wide(reinterpret_cast<const hfloat*>(inp.data), reinterpret_cast<const hfloat*>(scale.data),
+                                     zpdata, d, fmt, saturate, nslices, sz_a, slice_size);
+    }
+    else if (wideFp8Out) {
+        const onnx_dtype::Fp8Fmt fmt = onnx_dtype::fp8FmtFor(outputOnnxDtype);
+        const float* zpdata = zp.empty() ? nullptr : reinterpret_cast<const float*>(zp.data);
+        float* d = reinterpret_cast<float*>(out.data);
+        if (inptype == CV_32F && sctype == CV_32F)
+            quantizeLinearToFp8Wide(reinterpret_cast<const float*>(inp.data), reinterpret_cast<const float*>(scale.data),
+                                     zpdata, d, fmt, saturate, nslices, sz_a, slice_size);
+        else if (inptype == CV_32F && sctype == CV_16F)
+            quantizeLinearToFp8Wide(reinterpret_cast<const float*>(inp.data), reinterpret_cast<const hfloat*>(scale.data),
+                                     zpdata, d, fmt, saturate, nslices, sz_a, slice_size);
+        else if (inptype == CV_16F && sctype == CV_32F)
+            quantizeLinearToFp8Wide(reinterpret_cast<const hfloat*>(inp.data), reinterpret_cast<const float*>(scale.data),
+                                     zpdata, d, fmt, saturate, nslices, sz_a, slice_size);
+        else
+            quantizeLinearToFp8Wide(reinterpret_cast<const hfloat*>(inp.data), reinterpret_cast<const hfloat*>(scale.data),
+                                     zpdata, d, fmt, saturate, nslices, sz_a, slice_size);
+    }
     else {
         CV_Error_(Error::StsNotImplemented,
                   ("the following combination of types is not supported in "
-                   "QuantizeLinear: inp=%s, scale=%s, out=%s",
+                   "QuantizeLinear: inp=%s, scale=%s, out=%s, onnx_output_dtype=%d",
                    typeToString(inptype).c_str(),
                    typeToString(sctype).c_str(),
-                   typeToString(outtype).c_str()));
+                   typeToString(outtype).c_str(),
+                   outputOnnxDtype));
+    }
+
+    if (int4Out) {
+        const int64_t total = (int64_t)out.total();
+        if (outtype == CV_8S) {
+            int8_t* d = out.ptr<int8_t>();
+            for (int64_t j = 0; j < total; j++)
+                d[j] = (int8_t)std::min(std::max((int)d[j], -8), 7);
+        } else {
+            uint8_t* d = out.ptr<uint8_t>();
+            for (int64_t j = 0; j < total; j++)
+                d[j] = (uint8_t)std::min((int)d[j], 15);
+        }
     }
 }
 
@@ -310,13 +509,38 @@ public:
         block_size = params.get<int>("block_size", 0);
         saturate = params.get<bool>("saturate", true);
         output_dtype = params.get<int>("output_dtype", -1);
+        output_onnx_dtype = params.get<int>("output_onnx_dtype", -1);
         CV_Assert(block_size >= 0);
-        CV_Assert(saturate);
     }
 
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH;
+    }
+
+    // Block layout reorders channels, so only a scalar scale survives it unchanged;
+    // a per-channel or blocked one would be indexed against the wrong axis.
+    bool isPerTensor() const
+    {
+        if (block_size != 0 || this->inputs.size() < 2)
+            return false;
+        Net::Impl* netimpl_ = getNetImpl(this);
+        return netimpl_ && netimpl_->isConstArg(this->inputs[1]) &&
+               netimpl_->argTensor(this->inputs[1]).total() == 1;
+    }
+
+    int getLayouts(const std::vector<DataLayout>& actualInputs,
+                   std::vector<DataLayout>& desiredInputs,
+                   const int requiredOutputs,
+                   std::vector<DataLayout>& outputs) const CV_OVERRIDE
+    {
+        size_t ninputs = actualInputs.size();
+        CV_Assert(ninputs >= 1u);
+        desiredInputs.assign(ninputs, DATA_LAYOUT_UNKNOWN);
+        const DataLayout keep = isPerTensor() ? actualInputs[0] : DATA_LAYOUT_UNKNOWN;
+        desiredInputs[0] = keep;
+        outputs.assign(requiredOutputs, keep);
+        return 0;
     }
 
     bool getMemoryShapes(const std::vector<MatShape> &inputs,
@@ -383,13 +607,13 @@ public:
             std::vector<Mat>& outs = outputs_arr.getMatVecRef();
             outs.resize(1);
             outs[0].fit(inpshape, outtype);
-            quantizeLinear(inp, scale, zeropoint, axis, block_size, outs[0]);
+            quantizeLinear(inp, scale, zeropoint, axis, block_size, output_onnx_dtype, saturate, outs[0]);
         } else if (kind == _InputArray::STD_VECTOR_UMAT) {
             std::vector<UMat>& outs = outputs_arr.getUMatVecRef();
             outs.resize(1);
             outs[0].fit(inpshape, outtype);
             Mat temp(inpshape, outtype);
-            quantizeLinear(inp, scale, zeropoint, axis, block_size, temp);
+            quantizeLinear(inp, scale, zeropoint, axis, block_size, output_onnx_dtype, saturate, temp);
             temp.copyTo(outs[0]);
         } else {
             CV_Error(Error::StsNotImplemented, "");

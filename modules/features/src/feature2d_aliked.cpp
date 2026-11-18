@@ -20,7 +20,7 @@ ALIKED::Params::Params()
     inputSize = Size(640, 640);
     normalizeDescriptors = true;
 #ifdef HAVE_OPENCV_DNN
-    engine = dnn::ENGINE_NEW;
+    engine = dnn::ENGINE_AUTO;
     backend = dnn::DNN_BACKEND_DEFAULT;
     target = dnn::DNN_TARGET_CPU;
 #else
@@ -82,7 +82,7 @@ void ALIKEDImpl::runNetwork(InputArray _image, std::vector<KeyPoint>& keypoints,
     Size origSize = image.size();
 
     // BGR->RGB conversion via swapRB=true
-    Mat blob = dnn::blobFromImage(image, 1.0/255.0, inputSz, Scalar(), /*swapRB=*/true, /*crop=*/false);
+    Mat blob = dnn::blobFromImage(image, 1.0/255.0, inputSz, Scalar(), /*swapRB=*/true, /*crop=*/false, CV_32F, /*interpolation=*/cv::INTER_LINEAR_EXACT);
 
     net.setInput(blob, "image");
 

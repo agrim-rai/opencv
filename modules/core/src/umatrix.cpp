@@ -370,9 +370,7 @@ void UMat::create(Size _sz, int _type, UMatUsageFlags _usageFlags)
 
 void UMat::createSameSize(InputArray arr, int _type, UMatUsageFlags _usageFlags)
 {
-    int arr_size[CV_MAX_DIM];
-    int ndims = arr.sizend(arr_size);
-    create(ndims, arr_size, _type, _usageFlags);
+    create(arr.shape(), _type, _usageFlags);
 }
 
 void UMat::addref()
@@ -534,7 +532,13 @@ UMat Mat::getUMat(AccessFlag accessFlags, UMatUsageFlags usageFlags) const
             int dleft = ofs.x;
             int dright = wholeSize.width - src.cols - ofs.x;
             src.adjustROI(dtop, dbottom, dleft, dright);
-            return src.getUMat(accessFlags, usageFlags)(cv::Rect(ofs.x, ofs.y, sz.width, sz.height));
+            UMat whole = src.getUMat(accessFlags, usageFlags);
+            if (dims == 1)
+            {
+                Range r(ofs.x, ofs.x + sz.width);
+                return whole(&r);
+            }
+            return whole(cv::Rect(ofs.x, ofs.y, sz.width, sz.height));
         }
     }
     CV_Assert(data == datastart);
@@ -735,9 +739,7 @@ void UMat::fit(Size _sz, int _type, UMatUsageFlags _usageFlags)
 
 void UMat::fitSameSize(InputArray m, int _type, UMatUsageFlags _usageFlags)
 {
-    int _sizes[CV_MAX_DIM];
-    int _dims = m.sizend(_sizes);
-    fit(_dims, _sizes, _type, _usageFlags);
+    fit(m.shape(), _type, _usageFlags);
 }
 
 void UMat::copySize(const UMat& m)
@@ -934,6 +936,16 @@ void UMat::locateROI( Size& wholeSize, Point& ofs ) const
     CV_Assert( dims <= 2 && step[0] > 0 );
     size_t esz = elemSize(), minstep;
     ptrdiff_t delta1 = (ptrdiff_t)offset, delta2 = (ptrdiff_t)u->size;
+
+    if( dims == 1 )
+    {
+        ofs.x = (int)(delta1/esz);
+        ofs.y = 0;
+
+        wholeSize.width = std::max((int)(delta2/esz), ofs.x + cols);
+        wholeSize.height = 1;
+        return;
+    }
 
     if( delta1 == 0 )
         ofs.x = ofs.y = 0;
@@ -1289,6 +1301,22 @@ void UMat::copyTo(OutputArray _dst) const
             dst.ndoffset(dstofs);
             dstofs[dims-1] *= esz;
             u->currAllocator->copy(u, dst.u, d, sz, srcofs, step.p, dstofs, dst.step.p, false);
+            return;
+        }
+
+        // different allocators: never map a device destination, upload into it instead
+        // (through a host Mat when both sides are device memory)
+        MatAllocator* hostAllocator = Mat::getDefaultAllocator();
+        if (dst.u->currAllocator != hostAllocator)
+        {
+            if (u->currAllocator == hostAllocator)
+                getMat(ACCESS_READ).copyTo(_dst);
+            else
+            {
+                Mat tmp;
+                copyTo(tmp);
+                tmp.copyTo(_dst);
+            }
             return;
         }
     }

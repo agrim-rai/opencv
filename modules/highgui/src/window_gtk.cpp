@@ -42,6 +42,14 @@
 #include "precomp.hpp"
 #include "backend.hpp"
 
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wunknown-warning-option"
+#pragma clang diagnostic ignored "-Wcast-function-type-strict"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic ignored "-Wcast-function-type-strict"
+#endif
+
 #if defined (HAVE_GTK)
 
 #include <gtk/gtk.h>
@@ -903,6 +911,11 @@ namespace
             CV_Error(cv::Error::OpenGlApiCallError, "OpenGL context is not initialized");
             return FALSE;
         }
+        const int scale = gtk_widget_get_scale_factor(GTK_WIDGET(area));
+        glViewport(0, 0,
+                   gtk_widget_get_allocated_width(GTK_WIDGET(area)) * scale,
+                   gtk_widget_get_allocated_height(GTK_WIDGET(area)) * scale);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         if(window->glDrawCallback) {
             window->glDrawCallback(window->glDrawData);
         }
@@ -1069,6 +1082,8 @@ static std::shared_ptr<CvWindow> namedWindow_(const std::string& name, int flags
 #if defined(HAVE_OPENGL) && defined(GTK_VERSION3)
     if (flags & cv::WINDOW_OPENGL) {
         window->glArea = gtk_gl_area_new();
+        // GtkGLArea has no depth buffer by default; request one so GL_DEPTH_TEST works.
+        gtk_gl_area_set_has_depth_buffer(GTK_GL_AREA(window->glArea), TRUE);
         gtk_container_add(GTK_CONTAINER(window->frame), window->glArea);
         gtk_widget_show(window->glArea);
     } else {
@@ -1993,11 +2008,11 @@ static gboolean icvOnMouse( GtkWidget *widget, GdkEvent *event, gpointer user_da
             break;
 #endif //GTK_VERSION3_4
         case GDK_SCROLL_LEFT:  cv_event = cv::EVENT_MOUSEHWHEEL;
-            /* FALLTHRU */
+            [[fallthrough]];
         case GDK_SCROLL_UP:    flags |= ~0xffff;
             break;
         case GDK_SCROLL_RIGHT: cv_event = cv::EVENT_MOUSEHWHEEL;
-            /* FALLTHRU */
+            [[fallthrough]];
         case GDK_SCROLL_DOWN:  flags |= (((int)1 << 16));
             break;
         default: ;

@@ -7,6 +7,7 @@
 #include "../precomp.hpp"
 #include "layers_common.hpp"
 #include "../net_impl.hpp"
+#include "../onnx/onnx_dtype_convert.hpp"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -25,30 +26,31 @@ namespace dnn
 */
 
 #if defined(__x86_64__) || defined(_M_X64)
+template <typename _InpTp>
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("avx2")))
 #endif
-static void dequantizeLinearChunk_u8_f32_avx2(const uint8_t* src, float* dst,
-                                               float scale, int zp, int64_t len)
+static void dequantizeLinearChunk_f32_avx2(const _InpTp* src, float* dst,
+                                           float scale, int zp, int64_t len)
 {
     __m256 vscale = _mm256_set1_ps(scale);
     __m256i vzp = _mm256_set1_epi32(zp);
     int64_t j = 0;
     for (; j <= len - 8; j += 8) {
-        __m128i raw = _mm_loadl_epi64((__m128i*)(src + j));
-        __m256i vi = _mm256_cvtepu8_epi32(raw);
-        vi = _mm256_sub_epi32(vi, vzp);
-        __m256 vf = _mm256_cvtepi32_ps(vi);
-        vf = _mm256_mul_ps(vf, vscale);
-        _mm256_storeu_ps(dst + j, vf);
+        __m128i raw = _mm_loadl_epi64((const __m128i*)(src + j));
+        // Signed input must sign-extend, not zero-extend.
+        __m256i vi = std::is_signed<_InpTp>::value ? _mm256_cvtepi8_epi32(raw)
+                                                   : _mm256_cvtepu8_epi32(raw);
+        __m256 vf = _mm256_cvtepi32_ps(_mm256_sub_epi32(vi, vzp));
+        _mm256_storeu_ps(dst + j, _mm256_mul_ps(vf, vscale));
     }
     for (; j < len; j++)
-        dst[j] = (float)(src[j] - zp) * scale;
+        dst[j] = (float)((int)src[j] - zp) * scale;
 }
 
-static void dequantizeLinearFast_u8_f32_avx2(const uint8_t* inp, float* out,
-                                              float scale, int zp,
-                                              int64_t total)
+template <typename _InpTp>
+static void dequantizeLinearFast_f32_avx2(const _InpTp* inp, float* out,
+                                          float scale, int zp, int64_t total)
 {
     const int64_t block = 1024;
     int64_t nblocks = (total + block - 1) / block;
@@ -57,7 +59,7 @@ static void dequantizeLinearFast_u8_f32_avx2(const uint8_t* inp, float* out,
         for (int i = r.start; i < r.end; i++) {
             int64_t ofs = i * block;
             int64_t len = std::min(block, total - ofs);
-            dequantizeLinearChunk_u8_f32_avx2(inp + ofs, out + ofs, scale, zp, len);
+            dequantizeLinearChunk_f32_avx2(inp + ofs, out + ofs, scale, zp, len);
         }
     });
 }
@@ -160,14 +162,64 @@ static void dequantizeLinear(const _InpTp* inp_, const _ScaleTp* scale_,
     });
 }
 
+// Native FP8 bytes through core's decode table, bit-identical to the ONNX reference.
+template <typename _ScaleTp, typename _OutTp>
+static void dequantizeLinearFp8Native(const uchar* inp, const _ScaleTp* scale, const uchar* zp,
+                                       _OutTp* out, const float* fp8lut,
+                                       int64_t nslices, int sz_a, int64_t slice_size)
+{
+    parallel_for_(Range(0, (int)nslices), [&](const Range& r) {
+        for (int slice = r.start; slice < r.end; slice++) {
+            size_t base = (size_t)slice * sz_a * slice_size;
+            for (int a = 0; a < sz_a; a++) {
+                float sc = (float)scale[a];
+                float zpv = zp ? fp8lut[zp[a]] : 0.f;
+                for (int64_t j = 0; j < slice_size; j++) {
+                    size_t idx = base + (size_t)a * slice_size + j;
+                    out[idx] = _OutTp((fp8lut[inp[idx]] - zpv) * sc);
+                }
+            }
+        }
+    });
+}
+
+// E5M2 has no native depth; already decoded to real values upstream, held in
+// CV_16F, or in CV_32F once setInput has widened a graph input.
+template <typename _InpTp, typename _ScaleTp, typename _OutTp>
+static void dequantizeLinearFp8Wide(const _InpTp* inp, const _ScaleTp* scale, const _InpTp* zp,
+                                     _OutTp* out, int64_t nslices, int sz_a, int64_t slice_size)
+{
+    parallel_for_(Range(0, (int)nslices), [&](const Range& r) {
+        for (int slice = r.start; slice < r.end; slice++) {
+            size_t base = (size_t)slice * sz_a * slice_size;
+            for (int a = 0; a < sz_a; a++) {
+                float sc = (float)scale[a];
+                float zpv = zp ? (float)zp[a] : 0.f;
+                for (int64_t j = 0; j < slice_size; j++) {
+                    size_t idx = base + (size_t)a * slice_size + j;
+                    out[idx] = _OutTp(((float)inp[idx] - zpv) * sc);
+                }
+            }
+        }
+    });
+}
+
 // Dequantize INT8/UINT8 to FP32/FP16; out must be preallocated
-static void dequantizeLinear(const Mat& inp, const Mat& scale_, const Mat& zp,
+static void dequantizeLinear(const Mat& inp, const Mat& scale_, const Mat& zp_,
                              int axis, int block_size, Mat& out)
 {
     Mat scale = scale_;
+    Mat zp = zp_;
     CV_Assert(inp.isContinuous());
     CV_Assert(scale.isContinuous());
     CV_Assert(out.isContinuous());
+
+    // E5M2 rides in CV_16F, but widenHalfConstants() may already have promoted a constant
+    // zero_point to CV_32F, so the two can reach here at different widths.
+    if (!zp.empty() && zp.type() != inp.type() &&
+        (inp.type() == CV_16F || inp.type() == CV_32F) &&
+        (zp.type() == CV_16F || zp.type() == CV_32F))
+        zp_.convertTo(zp, inp.type());
 
     int inptype = inp.type();
     int outtype = out.type();
@@ -179,14 +231,21 @@ static void dequantizeLinear(const Mat& inp, const Mat& scale_, const Mat& zp,
     int i, ndims = inpshape.dims;
     int64_t nslices = 1, slice_size = 1;
 
-    CV_Assert(inptype == CV_8U || inptype == CV_8S || inptype == CV_32S);
+    CV_Assert(inptype == CV_8U || inptype == CV_8S ||
+              inptype == CV_16U || inptype == CV_16S || inptype == CV_32S ||
+              inptype == CV_8F_E4M3FN || inptype == CV_8F_E4M3FNUZ ||
+              inptype == CV_16F || inptype == CV_32F);
     CV_Assert(sctype == CV_32F || sctype == CV_16F);
     CV_Assert(outtype == CV_32F || outtype == CV_16F);
+    if (inptype == CV_8F_E4M3FN || inptype == CV_8F_E4M3FNUZ ||
+        inptype == CV_16F || inptype == CV_32F)
+        CV_Assert(block_size == 0);  // block-wise FP8 dequantization not yet supported
 
     if (!zp.empty()) {
         CV_Assert(zp.isContinuous());
         CV_Assert(zptype == inptype);
-        CV_Assert(zpshape == scshape);
+        // ONNX's own test data pairs a rank-0 scale with a [1] zero_point.
+        CV_Assert(zpshape == scshape || (zpshape.total() == 1 && scshape.total() == 1));
     }
 
     if (ndims > 0)
@@ -233,14 +292,19 @@ static void dequantizeLinear(const Mat& inp, const Mat& scale_, const Mat& zp,
 
     // Fast path: per-tensor dequantization uint8→float with AVX2 + proper parallelism
 #if defined(__x86_64__) || defined(_M_X64)
-    if (block_size == 0 && sz_a == 1 && inptype == CV_8U && outtype == CV_32F && sctype == CV_32F
-        && checkHardwareSupport(CV_CPU_AVX2)) {
+    if (block_size == 0 && sz_a == 1 && outtype == CV_32F && sctype == CV_32F
+        && (inptype == CV_8U || inptype == CV_8S) && checkHardwareSupport(CV_CPU_AVX2)) {
         float sc = reinterpret_cast<const float*>(scale.data)[0];
-        int zpval = zp.empty() ? 0 : (int)reinterpret_cast<const uint8_t*>(zp.data)[0];
         int64_t total = nslices * slice_size;
-        dequantizeLinearFast_u8_f32_avx2(reinterpret_cast<const uint8_t*>(inp.data),
-                                          reinterpret_cast<float*>(out.data),
-                                          sc, zpval, total);
+        if (inptype == CV_8U) {
+            int zpval = zp.empty() ? 0 : (int)reinterpret_cast<const uint8_t*>(zp.data)[0];
+            dequantizeLinearFast_f32_avx2(reinterpret_cast<const uint8_t*>(inp.data),
+                                          reinterpret_cast<float*>(out.data), sc, zpval, total);
+        } else {
+            int zpval = zp.empty() ? 0 : (int)reinterpret_cast<const int8_t*>(zp.data)[0];
+            dequantizeLinearFast_f32_avx2(reinterpret_cast<const int8_t*>(inp.data),
+                                          reinterpret_cast<float*>(out.data), sc, zpval, total);
+        }
         return;
     }
 #endif
@@ -293,6 +357,54 @@ static void dequantizeLinear(const Mat& inp, const Mat& scale_, const Mat& zp,
                          reinterpret_cast<const int8_t*>(zp.data),
                          reinterpret_cast<hfloat*>(out.data),
                          nslices, sz_a, slice_size, block_size);
+    else if (inptype == CV_16U && sctype == CV_32F && outtype == CV_32F)
+        dequantizeLinear(reinterpret_cast<const uint16_t*>(inp.data),
+                         reinterpret_cast<const float*>(scale.data),
+                         reinterpret_cast<const uint16_t*>(zp.data),
+                         reinterpret_cast<float*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (inptype == CV_16U && sctype == CV_32F && outtype == CV_16F)
+        dequantizeLinear(reinterpret_cast<const uint16_t*>(inp.data),
+                         reinterpret_cast<const float*>(scale.data),
+                         reinterpret_cast<const uint16_t*>(zp.data),
+                         reinterpret_cast<hfloat*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (inptype == CV_16U && sctype == CV_16F && outtype == CV_32F)
+        dequantizeLinear(reinterpret_cast<const uint16_t*>(inp.data),
+                         reinterpret_cast<const hfloat*>(scale.data),
+                         reinterpret_cast<const uint16_t*>(zp.data),
+                         reinterpret_cast<float*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (inptype == CV_16U && sctype == CV_16F && outtype == CV_16F)
+        dequantizeLinear(reinterpret_cast<const uint16_t*>(inp.data),
+                         reinterpret_cast<const hfloat*>(scale.data),
+                         reinterpret_cast<const uint16_t*>(zp.data),
+                         reinterpret_cast<hfloat*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (inptype == CV_16S && sctype == CV_32F && outtype == CV_32F)
+        dequantizeLinear(reinterpret_cast<const int16_t*>(inp.data),
+                         reinterpret_cast<const float*>(scale.data),
+                         reinterpret_cast<const int16_t*>(zp.data),
+                         reinterpret_cast<float*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (inptype == CV_16S && sctype == CV_32F && outtype == CV_16F)
+        dequantizeLinear(reinterpret_cast<const int16_t*>(inp.data),
+                         reinterpret_cast<const float*>(scale.data),
+                         reinterpret_cast<const int16_t*>(zp.data),
+                         reinterpret_cast<hfloat*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (inptype == CV_16S && sctype == CV_16F && outtype == CV_32F)
+        dequantizeLinear(reinterpret_cast<const int16_t*>(inp.data),
+                         reinterpret_cast<const hfloat*>(scale.data),
+                         reinterpret_cast<const int16_t*>(zp.data),
+                         reinterpret_cast<float*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
+    else if (inptype == CV_16S && sctype == CV_16F && outtype == CV_16F)
+        dequantizeLinear(reinterpret_cast<const int16_t*>(inp.data),
+                         reinterpret_cast<const hfloat*>(scale.data),
+                         reinterpret_cast<const int16_t*>(zp.data),
+                         reinterpret_cast<hfloat*>(out.data),
+                         nslices, sz_a, slice_size, block_size);
     else if (inptype == CV_32S && sctype == CV_32F && outtype == CV_32F)
         dequantizeLinear(reinterpret_cast<const int32_t*>(inp.data),
                          reinterpret_cast<const float*>(scale.data),
@@ -317,6 +429,52 @@ static void dequantizeLinear(const Mat& inp, const Mat& scale_, const Mat& zp,
                          reinterpret_cast<const int32_t*>(zp.data),
                          reinterpret_cast<hfloat*>(out.data),
                          nslices, sz_a, slice_size, block_size);
+    else if (inptype == CV_8F_E4M3FN || inptype == CV_8F_E4M3FNUZ) {
+        const float* fp8lut = inptype == CV_8F_E4M3FN ? fp8_t::decodeLUT() : fp8a_t::decodeLUT();
+        const uchar* zpdata = zp.empty() ? nullptr : reinterpret_cast<const uchar*>(zp.data);
+        if (sctype == CV_32F && outtype == CV_32F)
+            dequantizeLinearFp8Native(reinterpret_cast<const uchar*>(inp.data), reinterpret_cast<const float*>(scale.data),
+                                       zpdata, reinterpret_cast<float*>(out.data), fp8lut, nslices, sz_a, slice_size);
+        else if (sctype == CV_16F && outtype == CV_32F)
+            dequantizeLinearFp8Native(reinterpret_cast<const uchar*>(inp.data), reinterpret_cast<const hfloat*>(scale.data),
+                                       zpdata, reinterpret_cast<float*>(out.data), fp8lut, nslices, sz_a, slice_size);
+        else if (sctype == CV_32F && outtype == CV_16F)
+            dequantizeLinearFp8Native(reinterpret_cast<const uchar*>(inp.data), reinterpret_cast<const float*>(scale.data),
+                                       zpdata, reinterpret_cast<hfloat*>(out.data), fp8lut, nslices, sz_a, slice_size);
+        else
+            dequantizeLinearFp8Native(reinterpret_cast<const uchar*>(inp.data), reinterpret_cast<const hfloat*>(scale.data),
+                                       zpdata, reinterpret_cast<hfloat*>(out.data), fp8lut, nslices, sz_a, slice_size);
+    }
+    else if (inptype == CV_16F) {
+        const hfloat* zpdata = zp.empty() ? nullptr : reinterpret_cast<const hfloat*>(zp.data);
+        if (sctype == CV_32F && outtype == CV_32F)
+            dequantizeLinearFp8Wide(reinterpret_cast<const hfloat*>(inp.data), reinterpret_cast<const float*>(scale.data),
+                                     zpdata, reinterpret_cast<float*>(out.data), nslices, sz_a, slice_size);
+        else if (sctype == CV_16F && outtype == CV_32F)
+            dequantizeLinearFp8Wide(reinterpret_cast<const hfloat*>(inp.data), reinterpret_cast<const hfloat*>(scale.data),
+                                     zpdata, reinterpret_cast<float*>(out.data), nslices, sz_a, slice_size);
+        else if (sctype == CV_32F && outtype == CV_16F)
+            dequantizeLinearFp8Wide(reinterpret_cast<const hfloat*>(inp.data), reinterpret_cast<const float*>(scale.data),
+                                     zpdata, reinterpret_cast<hfloat*>(out.data), nslices, sz_a, slice_size);
+        else
+            dequantizeLinearFp8Wide(reinterpret_cast<const hfloat*>(inp.data), reinterpret_cast<const hfloat*>(scale.data),
+                                     zpdata, reinterpret_cast<hfloat*>(out.data), nslices, sz_a, slice_size);
+    }
+    else if (inptype == CV_32F) {
+        const float* zpdata = zp.empty() ? nullptr : reinterpret_cast<const float*>(zp.data);
+        if (sctype == CV_32F && outtype == CV_32F)
+            dequantizeLinearFp8Wide(reinterpret_cast<const float*>(inp.data), reinterpret_cast<const float*>(scale.data),
+                                     zpdata, reinterpret_cast<float*>(out.data), nslices, sz_a, slice_size);
+        else if (sctype == CV_16F && outtype == CV_32F)
+            dequantizeLinearFp8Wide(reinterpret_cast<const float*>(inp.data), reinterpret_cast<const hfloat*>(scale.data),
+                                     zpdata, reinterpret_cast<float*>(out.data), nslices, sz_a, slice_size);
+        else if (sctype == CV_32F && outtype == CV_16F)
+            dequantizeLinearFp8Wide(reinterpret_cast<const float*>(inp.data), reinterpret_cast<const float*>(scale.data),
+                                     zpdata, reinterpret_cast<hfloat*>(out.data), nslices, sz_a, slice_size);
+        else
+            dequantizeLinearFp8Wide(reinterpret_cast<const float*>(inp.data), reinterpret_cast<const hfloat*>(scale.data),
+                                     zpdata, reinterpret_cast<hfloat*>(out.data), nslices, sz_a, slice_size);
+    }
     else {
         CV_Error_(Error::StsNotImplemented,
                   ("the following combination of types is not supported in "
@@ -342,6 +500,31 @@ public:
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH;
+    }
+
+    // Block layout reorders channels, so only a scalar scale survives it unchanged;
+    // a per-channel or blocked one would be indexed against the wrong axis.
+    bool isPerTensor() const
+    {
+        if (block_size != 0 || this->inputs.size() < 2)
+            return false;
+        Net::Impl* netimpl_ = getNetImpl(this);
+        return netimpl_ && netimpl_->isConstArg(this->inputs[1]) &&
+               netimpl_->argTensor(this->inputs[1]).total() == 1;
+    }
+
+    int getLayouts(const std::vector<DataLayout>& actualInputs,
+                   std::vector<DataLayout>& desiredInputs,
+                   const int requiredOutputs,
+                   std::vector<DataLayout>& outputs) const CV_OVERRIDE
+    {
+        size_t ninputs = actualInputs.size();
+        CV_Assert(ninputs >= 1u);
+        desiredInputs.assign(ninputs, DATA_LAYOUT_UNKNOWN);
+        const DataLayout keep = isPerTensor() ? actualInputs[0] : DATA_LAYOUT_UNKNOWN;
+        desiredInputs[0] = keep;
+        outputs.assign(requiredOutputs, keep);
+        return 0;
     }
 
     bool getMemoryShapes(const std::vector<MatShape> &inputs,
@@ -371,7 +554,10 @@ public:
         size_t ninputs = inputs.size();
         CV_Assert(2 <= ninputs && ninputs <= 3);
         if (ninputs == 3) {
-            CV_Assert(inputs[0] == inputs[2]);
+            // Both widths are accepted on the E5M2 pair; see dequantizeLinear() above.
+            const bool wideFp8Pair = (inputs[0] == CV_16F || inputs[0] == CV_32F) &&
+                                     (inputs[2] == CV_16F || inputs[2] == CV_32F);
+            CV_Assert(inputs[0] == inputs[2] || wideFp8Pair);
         }
         outputs.assign(1, getOutType());
     }

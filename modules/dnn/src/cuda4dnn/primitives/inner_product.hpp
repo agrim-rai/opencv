@@ -25,8 +25,6 @@ namespace cv { namespace dnn { namespace cuda4dnn {
     template <class T>
     class InnerProductOp final : public CUDABackendNode {
     public:
-        using wrapper_type = GetCUDABackendWrapperType<T>;
-
         InnerProductOp(csl::Stream stream_, csl::cublas::Handle handle, std::size_t axis, const Mat& weights, const Mat& bias)
             : stream(std::move(stream_)), cublasHandle(std::move(handle)), axis{ axis }
         {
@@ -43,17 +41,14 @@ namespace cv { namespace dnn { namespace cuda4dnn {
         }
 
         void forward(
-            const std::vector<cv::Ptr<BackendWrapper>>& inputs,
-            const std::vector<cv::Ptr<BackendWrapper>>& outputs,
+            const std::vector<UMat>& inputs,
+            const std::vector<UMat>& outputs,
             csl::Workspace& workspace) override
         {
             for (int i = 0; i < inputs.size(); i++)
             {
-                auto input_wrapper = inputs[i].dynamicCast<wrapper_type>();
-                auto input = input_wrapper->getView();
-
-                auto output_wrapper = outputs[i].dynamicCast<wrapper_type>();
-                auto output = output_wrapper->getSpan();
+                auto input = csl::viewOf<T>(inputs[i]);
+                auto output = csl::spanOf<T>(outputs[i]);
 
                 std::size_t batch_size = input.size_range(0, axis);
 

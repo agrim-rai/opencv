@@ -22,20 +22,15 @@ namespace cv { namespace dnn { namespace cuda4dnn {
     struct BaseOp : public CUDABackendNode
     {
     protected:
-        using wrapper_type = GetCUDABackendWrapperType<T>;
-
         void forward(
-            const std::vector<cv::Ptr<BackendWrapper>>& inputs,
-            const std::vector<cv::Ptr<BackendWrapper>>& outputs,
+            const std::vector<UMat>& inputs,
+            const std::vector<UMat>& outputs,
             csl::Workspace& workspace) override
         {
             for (int i = 0; i < inputs.size(); i++)
             {
-                auto input_wrapper = inputs[i].dynamicCast<wrapper_type>();
-                auto input = input_wrapper->getView();
-
-                auto output_wrapper = outputs[i].dynamicCast<wrapper_type>();
-                auto output = output_wrapper->getSpan();
+                auto input = csl::viewOf<T>(inputs[i]);
+                auto output = csl::spanOf<T>(outputs[i]);
 
                 static_cast<const Op<T>*>(this)->calculate(output, input);
             }
@@ -545,6 +540,20 @@ namespace cv { namespace dnn { namespace cuda4dnn {
         void calculate(csl::TensorSpan<T> output, csl::TensorView<T> input) const
         {
             kernels::gelu<T>(stream, output, input);
+        }
+
+    private:
+        csl::Stream stream;
+    };
+
+    template <class T>
+    class GeluApproximationOp final : public BaseOp<GeluApproximationOp, T> {
+    public:
+        GeluApproximationOp(csl::Stream stream_) : stream(std::move(stream_)) { }
+
+        void calculate(csl::TensorSpan<T> output, csl::TensorView<T> input) const
+        {
+            kernels::gelu_approximation<T>(stream, output, input);
         }
 
     private:

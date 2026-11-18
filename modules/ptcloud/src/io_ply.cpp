@@ -50,9 +50,14 @@ bool PlyDecoder::parseHeader(std::ifstream &file, int& nTexCoords)
     {
         e = trimSpaces(e);
     }
-    if (splitArr[0] != "format")
+    if (splitArr.empty() || splitArr[0] != "format")
     {
         CV_LOG_ERROR(NULL, "Provided file doesn't have format");
+        return false;
+    }
+    if (splitArr.size() < 2)
+    {
+        CV_LOG_ERROR(NULL, "Provided PLY file format is not supported");
         return false;
     }
     if (splitArr[1] == "ascii")
@@ -104,7 +109,13 @@ bool PlyDecoder::parseHeader(std::ifstream &file, int& nTexCoords)
             {
                 e = trimSpaces(e);
             }
-            std::string elemName = splitArrElem.at(1);
+            if (splitArrElem.size() < 2)
+            {
+                CV_LOG_ERROR(NULL, "Element description has " << splitArrElem.size()
+                             << " words instead of at least 2");
+                return false;
+            }
+            std::string elemName = splitArrElem[1];
             if (elemName == "vertex")
             {
                 elemRead = READ_VERTEX;
@@ -411,6 +422,93 @@ uchar readNext<uchar>(std::ifstream &file, DataFormat format)
     return val;
 }
 
+static float readPropertyValue(std::ifstream &file, int valType, DataFormat format)
+{
+    switch (valType)
+    {
+    case CV_8U:
+        return (float)readNext<uchar>(file, format);
+    case CV_8S:
+        return (float)(schar)readNext<uchar>(file, format);
+    case CV_16U:
+        return (float)readNext<ushort>(file, format);
+    case CV_16S:
+        return (float)(short)readNext<ushort>(file, format);
+    case CV_32U:
+        return (float)readNext<uint>(file, format);
+    case CV_32S:
+        return (float)(int)readNext<uint>(file, format);
+    case CV_32F:
+        return readNext<float>(file, format);
+    case CV_64F:
+        return (float)readNext<double>(file, format);
+    default:
+        return 0.f;
+    }
+}
+
+bool PlyDecoder::readNamedProperties(const std::vector<std::string>& names, Mat& values)
+{
+    values.release();
+
+    std::ifstream file(m_filename, std::ios::binary);
+    int nTexCoords = 0;
+    if (!parseHeader(file, nTexCoords))
+        return false;
+
+    const size_t nProps = m_vertexDescription.properties.size();
+    std::vector<int> colOf(nProps, -1);
+    std::vector<bool> got(names.size(), false);
+
+    for (size_t j = 0; j < nProps; j++)
+    {
+        for (size_t k = 0; k < names.size(); k++)
+        {
+            if (m_vertexDescription.properties[j].name == names[k] && !got[k])
+            {
+                colOf[j] = (int)k;
+                got[k] = true;
+                break;
+            }
+        }
+    }
+
+    for (size_t k = 0; k < names.size(); k++)
+    {
+        if (!got[k])
+        {
+            CV_LOG_ERROR(NULL, "Vertex property " << names[k] << " is not present in the file");
+            return false;
+        }
+    }
+
+    if (m_vertexCount > (size_t)INT_MAX)
+    {
+        CV_LOG_ERROR(NULL, "PLY vertex count " << m_vertexCount << " is too large");
+        return false;
+    }
+
+    values.create((int)m_vertexCount, (int)names.size(), CV_32F);
+    for (size_t i = 0; i < m_vertexCount; i++)
+    {
+        float* row = values.ptr<float>((int)i);
+        for (size_t j = 0; j < nProps; j++)
+        {
+            float v = readPropertyValue(file, m_vertexDescription.properties[j].valType, m_inputDataFormat);
+            if (colOf[j] >= 0)
+                row[colOf[j]] = v;
+        }
+        if (!file)
+        {
+            CV_LOG_ERROR(NULL, "PLY file ended after " << i << " of " << m_vertexCount << " vertices");
+            values.release();
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void PlyDecoder::parseBody(std::ifstream &file,
                            std::vector<Point3f>& points, std::vector<Point3f>& normals,
                            std::vector<Point3f>& rgb, std::vector<Point3f>& texCoords,
@@ -584,6 +682,13 @@ void PlyEncoder::writeData(const std::vector<Point3f>& points, const std::vector
                            const std::vector<Point3f>& texCoords, int nTexCoords,
                            const std::vector<std::vector<int32_t>>& indices)
 {
+    // PLY stores normals, colors and texture coordinates per vertex
+    if (!normals.empty())
+        CV_CheckEQ(normals.size(), points.size(), "Normals should have the same size as vertices");
+    if (!rgb.empty())
+        CV_CheckEQ(rgb.size(), points.size(), "Colors should have the same size as vertices");
+    if (nTexCoords > 0)
+        CV_CheckEQ(texCoords.size(), points.size(), "Texture coordinates should have the same size as vertices");
     std::ofstream file(m_filename, std::ios::binary);
     if (!file)
     {

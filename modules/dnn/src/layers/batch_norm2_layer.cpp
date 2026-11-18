@@ -7,6 +7,11 @@
 #include "../precomp.hpp"
 #include "layers_common.hpp"
 #include "../net_impl.hpp"
+#include "../adjacency_graph.hpp"
+#include "../op_cuda.hpp"
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/primitives/batch_norm.hpp"
+#endif
 
 namespace cv {
 namespace dnn {
@@ -142,7 +147,8 @@ static void batchnorm(const Mat& inp, Mat& out, const Mat& scale,
                 most part of the plane using vector code as if C0 == vlanes and
                 then process the tail using scalar code
             */
-            else if (C0 == vlanes*4 || C0 == vlanes*2 || C0 == vlanes) {
+            else if (C0 == vlanes*4 || C0 == vlanes*2 || C0 == vlanes ||
+                     (C0 < vlanes && vlanes % C0 == 0)) {
                 // accelerated block layout case
                 int c = 0;
                 for (; c < c_delta; c++) {
@@ -151,6 +157,17 @@ static void batchnorm(const Mat& inp, Mat& out, const Mat& scale,
                 }
                 for (; c < MAX_UNROLL*vlanes; c++) {
                     scalebuf[c] = biasbuf[c] = 0.f;
+                }
+                // A vector wider than the channel block spans vlanes/C0 pixels,
+                // so repeat the C0-periodic coefficients across the register and
+                // step by a whole vector instead of by C0.
+                int cstep = C0;
+                if (C0 < vlanes) {
+                    for (c = C0; c < vlanes; c++) {
+                        scalebuf[c] = scalebuf[c - C0];
+                        biasbuf[c] = biasbuf[c - C0];
+                    }
+                    cstep = vlanes;
                 }
                 v_float32 vsc0, vsc1, vsc2, vsc3;
                 v_float32 vb0, vb1, vb2, vb3;
@@ -190,47 +207,49 @@ static void batchnorm(const Mat& inp, Mat& out, const Mat& scale,
                             v_store(outptr + i + vlanes, x1);
                         }
                     } else {
-                        for (; i < planesize_C0; i += C0) {
+                        for (; i <= planesize_C0 - cstep; i += cstep) {
                             v_float32 x0 = vx_load(inptr + i);
                             x0 = v_fma(x0, vsc0, vb0);
                             v_store(outptr + i, x0);
                         }
+                        for (; i < planesize_C0; i++)
+                            outptr[i] = inptr[i]*scalebuf[i % C0] + biasbuf[i % C0];
                     }
                 } else if (type == CV_16F) {
                     const hfloat* inptr = (const hfloat*)inptr_;
                     hfloat* outptr = (hfloat*)outptr_;
-                    if (type == CV_32F) {
-                        if (C0 == vlanes*4) {
-                            for (; i < planesize_C0; i += C0) {
-                                v_float32 x0 = vx_load_expand(inptr + i);
-                                v_float32 x1 = vx_load_expand(inptr + i + vlanes);
-                                v_float32 x2 = vx_load_expand(inptr + i + vlanes*2);
-                                v_float32 x3 = vx_load_expand(inptr + i + vlanes*3);
-                                x0 = v_fma(x0, vsc0, vb0);
-                                x1 = v_fma(x1, vsc1, vb1);
-                                x2 = v_fma(x2, vsc2, vb2);
-                                x3 = v_fma(x3, vsc3, vb3);
-                                v_pack_store(outptr + i, x0);
-                                v_pack_store(outptr + i + vlanes, x1);
-                                v_pack_store(outptr + i + vlanes*2, x2);
-                                v_pack_store(outptr + i + vlanes*3, x3);
-                            }
-                        } else if (C0 == vlanes*2) {
-                            for (; i < planesize_C0; i += C0) {
-                                v_float32 x0 = vx_load_expand(inptr + i);
-                                v_float32 x1 = vx_load_expand(inptr + i + vlanes);
-                                x0 = v_fma(x0, vsc0, vb0);
-                                x1 = v_fma(x1, vsc1, vb1);
-                                v_pack_store(outptr + i, x0);
-                                v_pack_store(outptr + i + vlanes, x1);
-                            }
-                        } else {
-                            for (; i < planesize_C0; i += C0) {
-                                v_float32 x0 = vx_load_expand(inptr + i);
-                                x0 = v_fma(x0, vsc0, vb0);
-                                v_pack_store(outptr + i, x0);
-                            }
+                    if (C0 == vlanes*4) {
+                        for (; i < planesize_C0; i += C0) {
+                            v_float32 x0 = vx_load_expand(inptr + i);
+                            v_float32 x1 = vx_load_expand(inptr + i + vlanes);
+                            v_float32 x2 = vx_load_expand(inptr + i + vlanes*2);
+                            v_float32 x3 = vx_load_expand(inptr + i + vlanes*3);
+                            x0 = v_fma(x0, vsc0, vb0);
+                            x1 = v_fma(x1, vsc1, vb1);
+                            x2 = v_fma(x2, vsc2, vb2);
+                            x3 = v_fma(x3, vsc3, vb3);
+                            v_pack_store(outptr + i, x0);
+                            v_pack_store(outptr + i + vlanes, x1);
+                            v_pack_store(outptr + i + vlanes*2, x2);
+                            v_pack_store(outptr + i + vlanes*3, x3);
                         }
+                    } else if (C0 == vlanes*2) {
+                        for (; i < planesize_C0; i += C0) {
+                            v_float32 x0 = vx_load_expand(inptr + i);
+                            v_float32 x1 = vx_load_expand(inptr + i + vlanes);
+                            x0 = v_fma(x0, vsc0, vb0);
+                            x1 = v_fma(x1, vsc1, vb1);
+                            v_pack_store(outptr + i, x0);
+                            v_pack_store(outptr + i + vlanes, x1);
+                        }
+                    } else {
+                        for (; i <= planesize_C0 - cstep; i += cstep) {
+                            v_float32 x0 = vx_load_expand(inptr + i);
+                            x0 = v_fma(x0, vsc0, vb0);
+                            v_pack_store(outptr + i, x0);
+                        }
+                        for (; i < planesize_C0; i++)
+                            outptr[i] = hfloat(float(inptr[i])*scalebuf[i % C0] + biasbuf[i % C0]);
                     }
                 } else if (type == CV_16BF) {
                     const bfloat* inptr = (const bfloat*)inptr_;
@@ -260,11 +279,13 @@ static void batchnorm(const Mat& inp, Mat& out, const Mat& scale,
                             v_pack_store(outptr + i + vlanes, x1);
                         }
                     } else {
-                        for (; i < planesize_C0; i += C0) {
+                        for (; i <= planesize_C0 - cstep; i += cstep) {
                             v_float32 x0 = vx_load_expand(inptr + i);
                             x0 = v_fma(x0, vsc0, vb0);
                             v_pack_store(outptr + i, x0);
                         }
+                        for (; i < planesize_C0; i++)
+                            outptr[i] = bfloat(float(inptr[i])*scalebuf[i % C0] + biasbuf[i % C0]);
                     }
                 }
             }
@@ -349,14 +370,139 @@ class BatchNorm2LayerImpl CV_FINAL : public BatchNorm2Layer
 {
 public:
     BatchNorm2LayerImpl(const LayerParams& params) {
+        registerFusionOpsOnce<BatchNorm2LayerImpl>(
+            { &BatchNorm2LayerImpl::unfoldOp, &BatchNorm2LayerImpl::absorbOp, false, nullptr,
+              &BatchNorm2LayerImpl::ownedBuffersOp });
         setParamsFrom(params);
         epsilon = params.get<float>("epsilon", 1e-5);
     }
 
+    static bool absorbOp(Layer* self, const Ptr<AdjacencyGraph>& expr)
+    {
+        return static_cast<BatchNorm2LayerImpl*>(self)->absorbAffine(expr);
+    }
+
+    //! Folds a following Mul/Add by constants into scale and bias.
+    bool absorbAffine(const Ptr<AdjacencyGraph>& expr)
+    {
+        const int C = (int)scale.total();
+        if (!expr || expr->size() < 2 || !expr->tensorArgs.empty() || inputs.size() != 1 ||
+            C == 0 || (int)bias.total() != C)
+            return false;
+        const std::vector<FusionNode>& nd = expr->nodes();
+        if (nd[0].op != FusionEltwiseOp::INPUT)
+            return false;
+
+        // x*a+b then *c+d is x*(a*c) + (b*c+d)
+        std::vector<float> s(C, 1.f), t(C, 0.f), v(C);
+        for (int cur = expr->outputNode(); cur != 0;) {
+            bool isMul = nd[cur].op == FusionEltwiseOp::MUL;
+            if ((!isMul && nd[cur].op != FusionEltwiseOp::ADD) || !constTerm(*expr, cur, v))
+                return false;
+            for (int c = 0; c < C; c++) {
+                if (isMul)
+                    s[c] *= v[c];
+                else
+                    t[c] += v[c]*s[c];
+            }
+        }
+        float* sc = scale.ptr<float>();
+        float* b = bias.ptr<float>();
+        for (int c = 0; c < C; c++) {
+            sc[c] *= s[c];
+            b[c] = b[c]*s[c] + t[c];
+        }
+        return true;
+    }
+
+    //! Reads the constant side of @p node, then steps to the other side.
+    bool constTerm(const AdjacencyGraph& g, int& node, std::vector<float>& v) const
+    {
+        const std::vector<FusionNode>& nd = g.nodes();
+        if (nd[node].inputs.size() != 2)
+            return false;
+        for (int k = 0; k < 2; k++) {
+            const FusionNode& c = nd[nd[node].inputs[k]];
+            if (c.op == FusionEltwiseOp::CONST)
+                std::fill(v.begin(), v.end(), c.scalar);
+            else if (c.op != FusionEltwiseOp::PER_CHANNEL_CONST ||
+                     !perChannelValues(g, c.constBufferId, v))
+                continue;
+            node = nd[node].inputs[1 - k];
+            return true;
+        }
+        return false;
+    }
+
+    //! Only buffers flagged per channel: the layer's own, or graph constants the fuser proved.
+    bool perChannelValues(const AdjacencyGraph& g, int bufId, std::vector<float>& v) const
+    {
+        if (bufId < 0 || bufId >= (int)g.constBufs.size() ||
+            bufId >= (int)g.constBufPerChannel.size() || !g.constBufPerChannel[bufId])
+            return false;
+        const Mat& c = g.constBufs[bufId];
+        if (c.type() != CV_32F || !c.isContinuous() || c.total() != v.size())
+            return false;
+        std::copy(c.ptr<float>(), c.ptr<float>() + v.size(), v.begin());
+        return true;
+    }
+
+    //! Only once freezeScaleBias() has run; before it the members are empty.
+    static bool ownedBuffersOp(const Layer* self, std::vector<Mat>& out)
+    {
+        const BatchNorm2LayerImpl* l = static_cast<const BatchNorm2LayerImpl*>(self);
+        if (l->inputs.size() != 1)
+            return false;
+        if (l->scale.empty() || l->bias.empty() || l->scale.total() != l->bias.total())
+            return false;
+        if (l->scale.type() != CV_32F || l->bias.type() != CV_32F ||
+            !l->scale.isContinuous() || !l->bias.isContinuous())
+            return false;
+        out.push_back(l->scale);
+        out.push_back(l->bias);
+        return true;
+    }
+
+    static bool unfoldOp(const Layer* self, LayerMath& r, const ConstOperand& side)
+    {
+        return static_cast<const BatchNorm2LayerImpl*>(self)->unfoldMath(r, side);
+    }
+
+    bool unfoldMath(LayerMath& r, const ConstOperand& side) const
+    {
+        if (side.count != 2 || !side.at(0).isBuffer() || !side.at(1).isBuffer())
+            return false;
+
+        const int s      = r.perChannelConstant(side.at(0).bufferId);
+        const int scaled = r.binary(FusionEltwiseOp::MUL, LayerMath::INPUT_VALUE, s);
+        const int b      = r.perChannelConstant(side.at(1).bufferId);
+        r.binary(FusionEltwiseOp::ADD, scaled, b);
+        return true;
+    }
+
     bool supportBackend(int backendId) CV_OVERRIDE
     {
-        return backendId == DNN_BACKEND_OPENCV;
+        return backendId == DNN_BACKEND_OPENCV
+#ifdef HAVE_CUDA
+               // BatchNormOp needs scale/bias folded at load time (constant params)
+               || (backendId == DNN_BACKEND_CUDA && inputs.size() <= 1)
+#endif
+               ;
     }
+
+#ifdef HAVE_CUDA
+    // Channel-wise scale+shift on CUDA; reused by the new graph engine via CUDALegacyExec.
+    Ptr<BackendNode> initCUDA(void* context_,
+                              InputArrayOfArrays,
+                              InputArrayOfArrays) CV_OVERRIDE
+    {
+        auto context = reinterpret_cast<cuda4dnn::csl::CSLContext*>(context_);
+        Mat scale, bias;
+        getScaleBias(scale, bias);  // per-channel FP32 scale and shift
+        return make_cuda_node<cuda4dnn::BatchNormOp>(
+            preferableTarget, std::move(context->stream), scale, bias);
+    }
+#endif
 
     MatShape getOutShape(const MatShape& inpShape) const
     {

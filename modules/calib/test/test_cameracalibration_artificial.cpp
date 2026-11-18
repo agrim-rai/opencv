@@ -231,7 +231,7 @@ protected:
             projectPoints(_chessboard3D, _rvecs_exp[i], _tvecs_exp[i], eye33, zero15, uv_exp);
             projectPoints(_chessboard3D, rvecs_est[i], tvecs_est[i], eye33, zero15, uv_est);
             for(size_t j = 0; j < cb3d.size(); ++j)
-                res += cv::norm(uv_exp[i] - uv_est[i]); // TODO cvtest
+                res += cv::norm(uv_exp[j] - uv_est[j]); // TODO cvtest
         }
         return res;
     }
@@ -266,11 +266,17 @@ protected:
         vector<Point2f> corners_art, corners_fcb;
         for(size_t i = 0; i < brdsNum; ++i)
         {
-            for(;;)
+            for(int attempt = 0; ; ++attempt)
             {
                 boards[i] = cbg(bg, camMat, distCoeffs, sqSile, corners_art);
                 if(findChessboardCorners(boards[i], cornersSize, corners_fcb))
                     break;
+                if(attempt >= 100)
+                {
+                    ts->printf( cvtest::TS::LOG, "%d) Failed to generate a detectable board after %d attempts\n", r, attempt + 1);
+                    ts->set_failed_test_info(cvtest::TS::FAIL_INVALID_TEST_DATA);
+                    return;
+                }
             }
 
             //cv::namedWindow("CB"); imshow("CB", boards[i]); cv::waitKey();
@@ -323,10 +329,9 @@ protected:
         Mat camMat_est = Mat::eye(3, 3, CV_64F), distCoeffs_est = Mat::zeros(1, 5, CV_64F);
         vector<Mat> rvecs_est, tvecs_est;
 
-        int flags = /*CALIB_FIX_K3|*/CALIB_FIX_K4|CALIB_FIX_K5|CALIB_FIX_K6; //CALIB_FIX_K3; //CALIB_FIX_ASPECT_RATIO |  | CALIB_ZERO_TANGENT_DIST;
+        int flags = CALIB_FIX_K3|CALIB_FIX_K4|CALIB_FIX_K5|CALIB_FIX_K6; //CALIB_FIX_ASPECT_RATIO |  | CALIB_ZERO_TANGENT_DIST;
         TermCriteria criteria = TermCriteria(TermCriteria::COUNT+TermCriteria::EPS, 100, DBL_EPSILON);
         double rep_error = calibrateCamera(objectPoints, imagePoints, imgSize, camMat_est, distCoeffs_est, rvecs_est, tvecs_est, flags, criteria);
-        rep_error /= brdsNum * cornersSize.area();
 
         const double thres = 1;
         if (rep_error > thres)
@@ -382,8 +387,7 @@ protected:
             double cx = bg.cols/2 + (40 * (double)rng - 20);
             double cy = bg.rows/2 + (40 * (double)rng - 20);
 
-            Mat_<double> camMat(3, 3);
-            camMat << fx, 0., cx, 0, fy, cy, 0., 0., 1.;
+            Mat_<double> camMat({3, 3}, {fx, 0., cx, 0, fy, cy, 0., 0., 1.});
 
             double k1 = 0.5 + (double)rng/5;
             double k2 = (double)rng/5;
@@ -392,8 +396,7 @@ protected:
             double p1 = 0.001 + (double)rng/10;
             double p2 = 0.001 + (double)rng/10;
 
-            Mat_<double> distCoeffs(1, 5, 0.0);
-            distCoeffs << k1, k2, p1, p2, k3;
+            Mat_<double> distCoeffs({1, 5}, {k1, k2, p1, p2, k3});
 
             ChessBoardGenerator cbg(Size(9, 8));
             cbg.min_cos = 0.9;
@@ -422,6 +425,6 @@ protected:
     }
 };
 
-TEST(Calib3d_CalibrateCamera_CPP, DISABLED_accuracy_on_artificial_data) { CV_CalibrateCameraArtificialTest test; test.safe_run(); }
+TEST(Calib3d_CalibrateCamera_CPP, accuracy_on_artificial_data) { CV_CalibrateCameraArtificialTest test; test.safe_run(); }
 
 }} // namespace

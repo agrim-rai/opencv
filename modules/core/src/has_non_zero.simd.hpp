@@ -6,7 +6,7 @@
 
 namespace cv {
 
-typedef bool (*HasNonZeroFunc)(const uchar*, size_t);
+typedef bool (*HasNonZeroFunc)(const void*, size_t);
 
 CV_CPU_OPTIMIZATION_NAMESPACE_BEGIN
 
@@ -23,8 +23,9 @@ HasNonZeroFunc getHasNonZeroFunc(int depth);
 
 #undef DEFINE_HASNONZERO_FUNC
 #define DEFINE_HASNONZERO_FUNC(funcname, suffix, T, VT, cmp_op, scalar_nz_op) \
-static bool funcname( const T* src, size_t len ) \
+static bool funcname( const void* _src, size_t len ) \
 { \
+    const T* src = (const T*)_src; \
     size_t i = 0; \
     SIMD_ONLY( \
     const int vlanes = VTraits<VT>::vlanes(); \
@@ -78,6 +79,8 @@ static bool funcname( const T* src, size_t len ) \
 #define CHECK_NZ_FP(x) (((x)<<1) != 0)
 #undef CHECK_NZ_FP16
 #define CHECK_NZ_FP16(x) (((x)&0x7fff) != 0)
+#undef CHECK_NZ_FP8
+#define CHECK_NZ_FP8(x) (((x)&0x7f) != 0)
 #undef VEC_CMP_EQ_Z_FP16
 #define VEC_CMP_EQ_Z_FP16(x, z) v_ne(v_add_wrap(x, x), z)
 #undef VEC_CMP_EQ_Z_FP
@@ -91,25 +94,27 @@ DEFINE_HASNONZERO_FUNC(hasNonZero64s, s64, int64, v_int64, v_ne, CHECK_NZ_INT)
 DEFINE_HASNONZERO_FUNC(hasNonZero32f, s32, int, v_int32, VEC_CMP_EQ_Z_FP, CHECK_NZ_FP)
 DEFINE_HASNONZERO_FUNC(hasNonZero64f, s64, int64, v_int64, VEC_CMP_EQ_Z_FP, CHECK_NZ_FP)
 DEFINE_HASNONZERO_FUNC(hasNonZero16f, u16, ushort, v_uint16, VEC_CMP_EQ_Z_FP16, CHECK_NZ_FP16)
+DEFINE_HASNONZERO_FUNC(hasNonZero8f, u8, uchar, v_uint8, VEC_CMP_EQ_Z_FP16, CHECK_NZ_FP8)
 
 HasNonZeroFunc getHasNonZeroFunc(int depth)
 {
     static HasNonZeroFunc hasNonZeroTab[CV_DEPTH_MAX] =
     {
-        (HasNonZeroFunc)GET_OPTIMIZED(hasNonZero8u),
-        (HasNonZeroFunc)GET_OPTIMIZED(hasNonZero8u),
-        (HasNonZeroFunc)GET_OPTIMIZED(hasNonZero16u),
-        (HasNonZeroFunc)GET_OPTIMIZED(hasNonZero16u),
-        (HasNonZeroFunc)GET_OPTIMIZED(hasNonZero32s),
-        (HasNonZeroFunc)GET_OPTIMIZED(hasNonZero32f),
-        (HasNonZeroFunc)GET_OPTIMIZED(hasNonZero64f),
-        (HasNonZeroFunc)GET_OPTIMIZED(hasNonZero16f),
-        (HasNonZeroFunc)GET_OPTIMIZED(hasNonZero16f),
-        (HasNonZeroFunc)GET_OPTIMIZED(hasNonZero8u),
-        (HasNonZeroFunc)GET_OPTIMIZED(hasNonZero64s),
-        (HasNonZeroFunc)GET_OPTIMIZED(hasNonZero64s),
-        (HasNonZeroFunc)GET_OPTIMIZED(hasNonZero32s),
-        0
+        hasNonZero8u,
+        hasNonZero8u,
+        hasNonZero16u,
+        hasNonZero16u,
+        hasNonZero32s,
+        hasNonZero32f,
+        hasNonZero64f,
+        hasNonZero16f,
+        hasNonZero16f,
+        hasNonZero8u,
+        hasNonZero64s,
+        hasNonZero64s,
+        hasNonZero32s,
+        hasNonZero8f,
+        hasNonZero8u
     };
 
     return hasNonZeroTab[depth];

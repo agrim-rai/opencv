@@ -6,13 +6,60 @@
 #ifdef HAVE_EIGEN
 #include <Eigen/Core>
 #include <Eigen/Dense>
+#include "opencv2/core/quaternion.hpp"
+#include "opencv2/core/affine.hpp"
 #include "opencv2/core/eigen.hpp"
 #endif
 
 #include "opencv2/core/cuda.hpp"
 #include "opencv2/core/bindings_utils.hpp"
 
+#include <cstring>
+
 namespace opencv_test { namespace {
+
+typedef testing::TestWithParam<std::tuple<int, Size> > Core_Transpose_C3;
+
+TEST_P(Core_Transpose_C3, accuracy)
+{
+    const int type = std::get<0>(GetParam());
+    const Size size = std::get<1>(GetParam());
+    const size_t element_size = CV_ELEM_SIZE(type);
+
+    Mat src_storage(size.height + 2, size.width + 4, type);
+    Mat dst_storage(size.width + 2, size.height + 4, type);
+    for (size_t i = 0; i < src_storage.total() * element_size; ++i)
+        src_storage.data[i] = static_cast<uchar>((i * 37 + 11) & 255);
+    std::memset(dst_storage.data, 0xa5, dst_storage.total() * element_size);
+
+    Mat src = src_storage(Rect(1, 1, size.width, size.height));
+    Mat dst = dst_storage(Rect(1, 1, size.height, size.width));
+    cv::transpose(src, dst);
+
+    for (int y = 0; y < size.height; ++y)
+        for (int x = 0; x < size.width; ++x)
+            ASSERT_EQ(0, std::memcmp(src.ptr(y) + x * element_size,
+                                     dst.ptr(x) + y * element_size, element_size))
+                << "type=" << type << " size=" << size << " x=" << x << " y=" << y;
+    for (int y = 0; y < dst_storage.rows; ++y)
+    {
+        for (int x = 0; x < dst_storage.cols; ++x)
+        {
+            if (x == 0 || x > size.height || y == 0 || y > size.width)
+            {
+                for (size_t b = 0; b < element_size; ++b)
+                    ASSERT_EQ(0xa5, dst_storage.ptr(y)[x * element_size + b]);
+            }
+        }
+    }
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Core_Transpose_C3,
+    testing::Combine(
+        testing::Values(CV_8UC3, CV_8UC(6), CV_16SC3, CV_16FC3, CV_8UC(12), CV_32FC3),
+        testing::Values(Size(2, 3), Size(137, 5), Size(133, 4), Size(19, 11))
+    )
+);
 
 class Core_ReduceTest : public cvtest::BaseTest
 {
@@ -104,6 +151,10 @@ int Core_ReduceTest::checkOp( const Mat& src, int dstType, int opType, const Mat
     {
         if( srcType == CV_8U && (dstType == CV_32S || dstType == CV_32F || dstType == CV_64F) )
             support = true;
+        if( srcType == CV_8S && (dstType == CV_32S || dstType == CV_32F || dstType == CV_64F) )
+            support = true;
+        if( srcType == CV_32S && dstType == CV_64F )
+            support = true;
         if( srcType == CV_16U && (dstType == CV_32F || dstType == CV_64F) )
             support = true;
         if( srcType == CV_16S && (dstType == CV_32F || dstType == CV_64F) )
@@ -117,6 +168,14 @@ int Core_ReduceTest::checkOp( const Mat& src, int dstType, int opType, const Mat
     {
         if( srcType == CV_8U && dstType == CV_8U )
             support = true;
+        if( srcType == CV_8S && dstType == CV_8S )
+            support = true;
+        if( srcType == CV_16U && dstType == CV_16U )
+            support = true;
+        if( srcType == CV_16S && dstType == CV_16S )
+            support = true;
+        if( srcType == CV_32S && dstType == CV_32S )
+            support = true;
         if( srcType == CV_32F && dstType == CV_32F )
             support = true;
         if( srcType == CV_64F && dstType == CV_64F )
@@ -125,6 +184,14 @@ int Core_ReduceTest::checkOp( const Mat& src, int dstType, int opType, const Mat
     else if( opType == REDUCE_MIN )
     {
         if( srcType == CV_8U && dstType == CV_8U)
+            support = true;
+        if( srcType == CV_8S && dstType == CV_8S )
+            support = true;
+        if( srcType == CV_16U && dstType == CV_16U )
+            support = true;
+        if( srcType == CV_16S && dstType == CV_16S )
+            support = true;
+        if( srcType == CV_32S && dstType == CV_32S )
             support = true;
         if( srcType == CV_32F && dstType == CV_32F)
             support = true;
@@ -242,6 +309,26 @@ int Core_ReduceTest::checkDim( int dim, Size sz )
     code = tempCode != cvtest::TS::OK ? tempCode : code;
 
     tempCode = checkCase( CV_8UC1, CV_64FC1, dim, sz );
+    code = tempCode != cvtest::TS::OK ? tempCode : code;
+
+    // CV_8SC1
+    tempCode = checkCase( CV_8SC1, CV_8SC1, dim, sz );
+    code = tempCode != cvtest::TS::OK ? tempCode : code;
+
+    tempCode = checkCase( CV_8SC1, CV_32SC1, dim, sz );
+    code = tempCode != cvtest::TS::OK ? tempCode : code;
+
+    tempCode = checkCase( CV_8SC1, CV_32FC1, dim, sz );
+    code = tempCode != cvtest::TS::OK ? tempCode : code;
+
+    tempCode = checkCase( CV_8SC1, CV_64FC1, dim, sz );
+    code = tempCode != cvtest::TS::OK ? tempCode : code;
+
+    // CV_32SC1
+    tempCode = checkCase( CV_32SC1, CV_32SC1, dim, sz );
+    code = tempCode != cvtest::TS::OK ? tempCode : code;
+
+    tempCode = checkCase( CV_32SC1, CV_64FC1, dim, sz );
     code = tempCode != cvtest::TS::OK ? tempCode : code;
 
     // CV_16UC1
@@ -1095,10 +1182,83 @@ protected:
 };
 
 TEST(Core_Reduce, accuracy) { Core_ReduceTest test; test.safe_run(); }
+
+// Core_ReduceTest fills with randu(0, 100), so it never reaches the range where a 32-bit
+// accumulator would overflow. CV_32S reduces through a double accumulator for that reason.
+TEST(Core_Reduce, int32_accumulator_does_not_overflow)
+{
+    const int n = 64;
+    for (int dim = 0; dim <= 1; dim++)
+    {
+        for (int v : {INT_MAX, INT_MIN})
+        {
+            SCOPED_TRACE(cv::format("dim=%d v=%d", dim, v));
+            const cv::Mat src = dim == 0 ? cv::Mat(n, 1, CV_32SC1, cv::Scalar(v))
+                                         : cv::Mat(1, n, CV_32SC1, cv::Scalar(v));
+            cv::Mat res;
+
+            cv::reduce(src, res, dim, cv::REDUCE_SUM, CV_64F);
+            EXPECT_DOUBLE_EQ((double)v * n, res.at<double>(0, 0));
+
+            cv::reduce(src, res, dim, cv::REDUCE_AVG, CV_64F);
+            EXPECT_DOUBLE_EQ((double)v, res.at<double>(0, 0));
+
+            cv::reduce(src, res, dim, cv::REDUCE_SUM2, CV_64F);
+            EXPECT_DOUBLE_EQ((double)v * (double)v * n, res.at<double>(0, 0));
+
+            cv::reduce(src, res, dim, cv::REDUCE_MAX, -1);
+            EXPECT_EQ(v, res.at<int>(0, 0));
+        }
+    }
+}
+
+// CV_8S reduces through an int accumulator, like CV_8U; check the signed extremes survive it.
+TEST(Core_Reduce, int8_signed_extremes)
+{
+    for (int dim = 0; dim <= 1; dim++)
+    {
+        SCOPED_TRACE(cv::format("dim=%d", dim));
+        const schar vals[4] = { -128, 127, -1, 0 };
+        cv::Mat src = dim == 0 ? cv::Mat(4, 1, CV_8SC1) : cv::Mat(1, 4, CV_8SC1);
+        for (int i = 0; i < 4; i++)
+            src.ptr<schar>(dim == 0 ? i : 0)[dim == 0 ? 0 : i] = vals[i];
+        cv::Mat res;
+
+        cv::reduce(src, res, dim, cv::REDUCE_SUM, CV_32S);
+        EXPECT_EQ(-2, res.at<int>(0, 0));
+
+        cv::reduce(src, res, dim, cv::REDUCE_SUM2, CV_64F);
+        EXPECT_DOUBLE_EQ(128.0 * 128 + 127.0 * 127 + 1.0, res.at<double>(0, 0));
+
+        cv::reduce(src, res, dim, cv::REDUCE_MAX, -1);
+        EXPECT_EQ(127, res.at<schar>(0, 0));
+
+        cv::reduce(src, res, dim, cv::REDUCE_MIN, -1);
+        EXPECT_EQ(-128, res.at<schar>(0, 0));
+    }
+}
 TEST(Core_Array, basic_operations) { Core_ArrayOpTest test; test.safe_run(); }
 
 TEST(Core_Merge, shape_operations) { Core_MergeTest test; test.safe_run(); }
 TEST(Core_Split, shape_operations) { Core_SplitTest test; test.safe_run(); }
+
+TEST(Core_Split, empty_std_array_output)
+{
+    std::array<Mat, 3> outputs = {
+        Mat::ones(2, 2, CV_8U),
+        Mat::ones(3, 1, CV_32F),
+        Mat::eye(2, 3, CV_64F)
+    };
+
+    for( size_t i = 0; i < outputs.size(); i++ )
+        ASSERT_FALSE(outputs[i].empty());
+
+    EXPECT_NO_THROW(split(Mat(), outputs));
+
+    EXPECT_EQ((size_t)3, outputs.size());
+    for( size_t i = 0; i < outputs.size(); i++ )
+        EXPECT_TRUE(outputs[i].empty());
+}
 
 
 TEST(Core_IOArray, submat_assignment)
@@ -1132,7 +1292,7 @@ TEST(Core_Mat, issue4457_pass_null_ptr)
 
 TEST(Core_Mat, reshape_1942)
 {
-    cv::Mat A = (cv::Mat_<float>(2,3) << 3.4884074, 1.4159607, 0.78737736,  2.3456569, -0.88010466, 0.3009364);
+    cv::Mat A = cv::Mat_<float>({2, 3}, {3.4884074f, 1.4159607f, 0.78737736f,  2.3456569f, -0.88010466f, 0.3009364f});
     int cn = 0;
     ASSERT_NO_THROW(
         cv::Mat_<float> M = A.reshape(3);
@@ -1246,8 +1406,8 @@ TEST(Core_Mat, reinterpret_OutputArray_8UC4_32FC1) {
 
 TEST(Core_Mat, push_back)
 {
-    Mat a = (Mat_<float>(1,2) << 3.4884074f, 1.4159607f);
-    Mat b = (Mat_<float>(1,2) << 0.78737736f, 2.3456569f);
+    Mat a = Mat_<float>({1, 2}, {3.4884074f, 1.4159607f});
+    Mat b = Mat_<float>({1, 2}, {0.78737736f, 2.3456569f});
 
     a.push_back(b);
 
@@ -1259,7 +1419,7 @@ TEST(Core_Mat, push_back)
     ASSERT_FLOAT_EQ(0.78737736f, a.at<float>(1, 0));
     ASSERT_FLOAT_EQ(2.3456569f, a.at<float>(1, 1));
 
-    Mat c = (Mat_<float>(2,2) << -0.88010466f, 0.3009364f, 2.22399974f, -5.45933905f);
+    Mat c = Mat_<float>({2, 2}, {-0.88010466f, 0.3009364f, 2.22399974f, -5.45933905f});
 
     ASSERT_EQ(c.rows, a.cols);
 
@@ -1320,13 +1480,11 @@ INSTANTIATE_TYPED_TEST_CASE_P(CopyToTest, Core_Mat_copyTo, AllMatDepths);
 
 TEST(Core_Mat, copyNx1ToVector)
 {
-    cv::Mat_<uchar> src(5, 1);
+    cv::Mat_<uchar> src({5, 1}, {1, 2, 3, 4, 5});
     cv::Mat_<uchar> ref_dst8;
     cv::Mat_<ushort> ref_dst16;
     std::vector<uchar> dst8;
     std::vector<ushort> dst16;
-
-    src << 1, 2, 3, 4, 5;
 
     src.copyTo(ref_dst8);
     src.copyTo(dst8);
@@ -1360,14 +1518,14 @@ TEST(Core_Mat, zeros)
 
 TEST(Core_Matx, fromMat_)
 {
-    Mat_<double> a = (Mat_<double>(2,2) << 10, 11, 12, 13);
+    Mat_<double> a = Mat_<double>({2, 2}, {10, 11, 12, 13});
     Matx22d b(a);
     ASSERT_EQ( cvtest::norm(a, b, NORM_INF), 0.);
 }
 
 TEST(Core_Matx, from_initializer_list)
 {
-    Mat_<double> a = (Mat_<double>(2,2) << 10, 11, 12, 13);
+    Mat_<double> a = Mat_<double>({2, 2}, {10, 11, 12, 13});
     Matx22d b = {10, 11, 12, 13};
     ASSERT_EQ( cvtest::norm(a, b, NORM_INF), 0.);
     Mat_<double> c({2, 2}, {10, 11, 12, 13});
@@ -1380,6 +1538,50 @@ TEST(Core_Mat, regression_9507)
     cv::Mat m2{m};
     EXPECT_EQ(25u, m2.total());
 }
+
+TEST(Core_Mat, extractChannel_inplace_29568)
+{
+    // https://github.com/opencv/opencv/issues/29568
+    // extractChannel() must support in-place operation (dst aliasing src).
+    Mat mat(3, 3, CV_8UC3, Scalar(1, 2, 3));
+    ASSERT_NO_THROW(cv::extractChannel(mat, mat, 1));
+    EXPECT_EQ(1, mat.channels());
+    EXPECT_EQ(Size(3, 3), mat.size());
+    EXPECT_EQ(0, cv::norm(mat, Mat(3, 3, CV_8UC1, Scalar(2)), NORM_INF));
+}
+
+// insertChannel and extractChannel on every depth: only the chosen channel changes
+typedef testing::TestWithParam<std::tuple<perf::MatType, int> > Core_InsertExtractChannel;
+TEST_P(Core_InsertExtractChannel, accuracy)
+{
+    const int depth = std::get<0>(GetParam());
+    const int cn = std::get<1>(GetParam());
+
+    for (int coi = 0; coi < cn; coi++)
+    {
+        Mat dst(5, 7, CV_MAKETYPE(depth, cn), Scalar::all(1));
+        Mat channel(5, 7, depth, Scalar::all(0));
+
+        insertChannel(channel, dst, coi);
+
+        std::vector<Mat> planes;
+        split(dst, planes);
+        for (int c = 0; c < cn; c++)
+        {
+            Mat expected(5, 7, depth, Scalar::all(c == coi ? 0 : 1));
+            EXPECT_EQ(0, cv::norm(planes[c], expected, NORM_INF)) << "coi=" << coi << " c=" << c;
+        }
+
+        Mat extracted;
+        extractChannel(dst, extracted, coi);
+        EXPECT_EQ(depth, extracted.type());
+        EXPECT_EQ(0, cv::norm(extracted, channel, NORM_INF)) << "coi=" << coi;
+    }
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Core_InsertExtractChannel, testing::Combine(
+    testing::Range(perf::MatType(CV_8U), perf::MatType(CV_DEPTH_CURR_MAX)),
+    testing::Range(2, 5)));
 
 TEST(Core_Mat, empty)
 {
@@ -1404,6 +1606,23 @@ TEST(Core_InputArray, empty)
 {
     vector<vector<Point> > data;
     ASSERT_TRUE( _InputArray(data).empty() );
+}
+
+TEST(Core_InputArray, element_empty)
+{
+    Mat src = Mat::ones(2, 2, CV_8U);
+
+    std::vector<Mat> mats(2);
+    mats[1] = src;
+    InputArray matInput(mats);
+    EXPECT_TRUE(matInput.empty(0));
+    EXPECT_FALSE(matInput.empty(1));
+
+    std::vector<UMat> umats(2);
+    src.copyTo(umats[1]);
+    InputArray umatInput(umats);
+    EXPECT_NO_THROW({ EXPECT_TRUE(umatInput.empty(0)); });
+    EXPECT_NO_THROW({ EXPECT_FALSE(umatInput.empty(1)); });
 }
 
 TEST(Core_InputArray, convert_from_vector_over2GB)
@@ -1468,10 +1687,8 @@ TEST(Core_SparseMat, footprint)
 // Can't fix without dirty hacks or broken user code (PR #4159)
 TEST(Core_Mat_vector, DISABLED_OutputArray_create_getMat)
 {
-    cv::Mat_<uchar> src_base(5, 1);
+    cv::Mat_<uchar> src_base({5, 1}, {1, 2, 3, 4, 5});
     std::vector<uchar> dst8;
-
-    src_base << 1, 2, 3, 4, 5;
 
     Mat src(src_base);
     OutputArray _dst(dst8);
@@ -1486,10 +1703,8 @@ TEST(Core_Mat_vector, DISABLED_OutputArray_create_getMat)
 
 TEST(Core_Mat_vector, copyTo_roi_column)
 {
-    cv::Mat_<uchar> src_base(5, 2);
+    cv::Mat_<uchar> src_base({5, 2}, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
     std::vector<uchar> dst1;
-
-    src_base << 1, 2, 3, 4, 5, 6, 7, 8, 9, 10;
 
     Mat src_full(src_base);
     Mat src(src_full.col(0));
@@ -1518,10 +1733,8 @@ TEST(Core_Mat_vector, copyTo_roi_column)
 
 TEST(Core_Mat_vector, copyTo_roi_row)
 {
-    cv::Mat_<uchar> src_base(2, 5);
+    cv::Mat_<uchar> src_base({2, 5}, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
     std::vector<uchar> dst1;
-
-    src_base << 1, 2, 3, 4, 5, 6, 7, 8, 9, 10;
 
     Mat src_full(src_base);
     Mat src(src_full.row(0));
@@ -1688,10 +1901,8 @@ TEST(Mat, regression_10507_mat_setTo)
 
 TEST(Core_Mat_array, outputArray_create_getMat)
 {
-    cv::Mat_<uchar> src_base(5, 1);
+    cv::Mat_<uchar> src_base({5, 1}, {1, 2, 3, 4, 5});
     std::array<uchar, 5> dst8;
-
-    src_base << 1, 2, 3, 4, 5;
 
     Mat src(src_base);
     OutputArray _dst(dst8);
@@ -1707,9 +1918,7 @@ TEST(Core_Mat_array, outputArray_create_getMat)
 
 TEST(Core_Mat_array, copyTo_roi_column)
 {
-    cv::Mat_<uchar> src_base(5, 2);
-
-    src_base << 1, 2, 3, 4, 5, 6, 7, 8, 9, 10;
+    cv::Mat_<uchar> src_base({5, 2}, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
 
     Mat src_full(src_base);
     Mat src(src_full.col(0));
@@ -1728,10 +1937,8 @@ TEST(Core_Mat_array, copyTo_roi_column)
 
 TEST(Core_Mat_array, copyTo_roi_row)
 {
-    cv::Mat_<uchar> src_base(2, 5);
+    cv::Mat_<uchar> src_base({2, 5}, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
     std::array<uchar, 5> dst1;
-
-    src_base << 1, 2, 3, 4, 5, 6, 7, 8, 9, 10;
 
     Mat src_full(src_base);
     Mat src(src_full.row(0));
@@ -1785,10 +1992,30 @@ INSTANTIATE_TEST_CASE_P(/*nothing*/, Core_Mat_arrays, testing::Combine(
         perf::MatType(CV_8U),
         perf::MatType(CV_16U),
         perf::MatType(CV_32S),
-        perf::MatType(CV_64F)
+        perf::MatType(CV_64F),
+        perf::MatType(CV_8F_E4M3FN),
+        perf::MatType(CV_8F_E4M3FNUZ)
     )
 )
 );
+
+typedef testing::TestWithParam<perf::MatType> Core_MixChannels_FP8;
+
+TEST_P(Core_MixChannels_FP8, reverse_channels)
+{
+    Mat src, dst64f;
+    Mat(4, 4, CV_64FC3, Scalar(1, 2, 0.5)).convertTo(src, GetParam());
+    Mat dst(src.size(), src.type());
+
+    int fromTo[] = { 0, 2, 1, 1, 2, 0 };  // reverse the channel order
+    mixChannels(&src, 1, &dst, 1, fromTo, 3);
+
+    dst.convertTo(dst64f, CV_64F);
+    EXPECT_EQ(0, cvtest::norm(dst64f, Mat(4, 4, CV_64FC3, Scalar(0.5, 2, 1)), NORM_INF));
+}
+
+INSTANTIATE_TEST_CASE_P(/*nothing*/, Core_MixChannels_FP8,
+    testing::Values(perf::MatType(CV_8F_E4M3FN), perf::MatType(CV_8F_E4M3FNUZ)));
 
 TEST(Mat, regression_8680)
 {
@@ -1815,8 +2042,7 @@ TEST(Mat_, range_based_for)
 TEST(Mat, from_initializer_list)
 {
     Mat A({1.f, 2.f, 3.f});
-    int n = 3;
-    Mat_<float> B(1, &n); B << 1, 2, 3;
+    Mat_<float> B({3}, {1, 2, 3});
     Mat_<float> C({3}, {1,2,3});
 
     ASSERT_EQ(A.type(), CV_32F);
@@ -1837,8 +2063,7 @@ TEST(Mat, from_initializer_list)
 TEST(Mat_, from_initializer_list)
 {
     Mat_<float> A = {1, 2, 3};
-    int n = 3;
-    Mat_<float> B(1, &n); B << 1, 2, 3;
+    Mat_<float> B({3}, {1, 2, 3});
     Mat_<float> C({3}, {1,2,3});
 
     ASSERT_DOUBLE_EQ(cvtest::norm(A, B, NORM_INF), 0.);
@@ -1854,7 +2079,7 @@ TEST(Mat_, from_initializer_list)
 
 TEST(Mat, template_based_ptr)
 {
-    Mat mat = (Mat_<float>(2, 2) << 11.0f, 22.0f, 33.0f, 44.0f);
+    Mat mat = Mat_<float>({2, 2}, {11.0f, 22.0f, 33.0f, 44.0f});
     int idx[2] = {1, 0};
     ASSERT_FLOAT_EQ(33.0f, *(mat.ptr<float>(idx)));
     idx[0] = 1;
@@ -1864,9 +2089,8 @@ TEST(Mat, template_based_ptr)
 
 TEST(Mat_, template_based_ptr)
 {
-    int dim[4] = {2, 2, 1, 2};
-    Mat_<float> mat = (Mat_<float>(4, dim) << 11.0f, 22.0f, 33.0f, 44.0f,
-                                              55.0f, 66.0f, 77.0f, 88.0f);
+    Mat_<float> mat({2, 2, 1, 2}, {11.0f, 22.0f, 33.0f, 44.0f,
+                                   55.0f, 66.0f, 77.0f, 88.0f});
     int idx[4] = {1, 0, 0, 1};
     ASSERT_FLOAT_EQ(66.0f, *(mat.ptr<float>(idx)));
 }
@@ -2227,10 +2451,12 @@ TEST(Core_Vectors, issue_13078_workaround)
 
 TEST(Core_MatExpr, issue_13926)
 {
-    Mat M1 = (Mat_<double>(4,4,CV_64FC1) << 1, 2, 3, 4,
-                                           5, 6, 7, 8,
-                                           9, 10, 11, 12,
-                                           13, 14, 15, 16);
+    Mat M1 = Mat_<double>({4, 4}, {
+            1, 2, 3, 4,
+            5, 6, 7, 8,
+            9, 10, 11, 12,
+            13, 14, 15, 16
+    });
 
     Matx44d M2(1, 2, 3, 4,
                5, 6, 7, 8,
@@ -2311,6 +2537,106 @@ TEST(Core_Eigen, cv2eigen_check_RowMajor)
     ASSERT_EQ(4.0, eigen_A(1, 1));
     ASSERT_EQ(5.0, eigen_A(2, 0));
     ASSERT_EQ(6.0, eigen_A(2, 1));
+}
+
+TEST(Core_Eigen, quaternion_conversion)
+{
+    // Test float version
+    {
+        cv::Quatf cv_q(1.0f, 2.0f, 3.0f, 4.0f);
+        Eigen::Quaternionf eigen_q;
+        cv2eigen(cv_q, eigen_q);
+        EXPECT_FLOAT_EQ(cv_q.w, eigen_q.w());
+        EXPECT_FLOAT_EQ(cv_q.x, eigen_q.x());
+        EXPECT_FLOAT_EQ(cv_q.y, eigen_q.y());
+        EXPECT_FLOAT_EQ(cv_q.z, eigen_q.z());
+
+        cv::Quatf cv_q_back;
+        eigen2cv(eigen_q, cv_q_back);
+        EXPECT_FLOAT_EQ(cv_q.w, cv_q_back.w);
+        EXPECT_FLOAT_EQ(cv_q.x, cv_q_back.x);
+        EXPECT_FLOAT_EQ(cv_q.y, cv_q_back.y);
+        EXPECT_FLOAT_EQ(cv_q.z, cv_q_back.z);
+    }
+
+    // Test double version
+    {
+        cv::Quatd cv_q(1.0, 2.0, 3.0, 4.0);
+        Eigen::Quaterniond eigen_q;
+        cv2eigen(cv_q, eigen_q);
+        EXPECT_DOUBLE_EQ(cv_q.w, eigen_q.w());
+        EXPECT_DOUBLE_EQ(cv_q.x, eigen_q.x());
+        EXPECT_DOUBLE_EQ(cv_q.y, eigen_q.y());
+        EXPECT_DOUBLE_EQ(cv_q.z, eigen_q.z());
+
+        cv::Quatd cv_q_back;
+        eigen2cv(eigen_q, cv_q_back);
+        EXPECT_DOUBLE_EQ(cv_q.w, cv_q_back.w);
+        EXPECT_DOUBLE_EQ(cv_q.x, cv_q_back.x);
+        EXPECT_DOUBLE_EQ(cv_q.y, cv_q_back.y);
+        EXPECT_DOUBLE_EQ(cv_q.z, cv_q_back.z);
+    }
+}
+
+TEST(Core_Eigen, isometry_conversion)
+{
+    // Test float version
+    {
+        cv::Matx33f R = cv::Matx33f::eye();
+        cv::Vec3f t(1.0f, 2.0f, 3.0f);
+        cv::Affine3f cv_aff(R, t);
+
+        Eigen::Transform<float, 3, Eigen::Isometry> eigen_iso;
+        cv2eigen(cv_aff, eigen_iso);
+
+        // Verify elements
+        for (int i = 0; i < 4; ++i)
+        {
+            for (int j = 0; j < 4; ++j)
+            {
+                EXPECT_FLOAT_EQ(cv_aff.matrix(i, j), eigen_iso.matrix()(i, j));
+            }
+        }
+
+        cv::Affine3f cv_aff_back;
+        eigen2cv(eigen_iso, cv_aff_back);
+        for (int i = 0; i < 4; ++i)
+        {
+            for (int j = 0; j < 4; ++j)
+            {
+                EXPECT_FLOAT_EQ(cv_aff.matrix(i, j), cv_aff_back.matrix(i, j));
+            }
+        }
+    }
+
+    // Test double version
+    {
+        cv::Matx33d R = cv::Matx33d::eye();
+        cv::Vec3d t(1.0, 2.0, 3.0);
+        cv::Affine3d cv_aff(R, t);
+
+        Eigen::Transform<double, 3, Eigen::Isometry> eigen_iso;
+        cv2eigen(cv_aff, eigen_iso);
+
+        // Verify elements
+        for (int i = 0; i < 4; ++i)
+        {
+            for (int j = 0; j < 4; ++j)
+            {
+                EXPECT_DOUBLE_EQ(cv_aff.matrix(i, j), eigen_iso.matrix()(i, j));
+            }
+        }
+
+        cv::Affine3d cv_aff_back;
+        eigen2cv(eigen_iso, cv_aff_back);
+        for (int i = 0; i < 4; ++i)
+        {
+            for (int j = 0; j < 4; ++j)
+            {
+                EXPECT_DOUBLE_EQ(cv_aff.matrix(i, j), cv_aff_back.matrix(i, j));
+            }
+        }
+    }
 }
 #endif // HAVE_EIGEN
 
@@ -2533,9 +2859,20 @@ TEST(Mat1D, basic)
     }
 }
 
+TEST(Mat1D, forEach_position)
+{
+    std::vector<int> sizes { 10 };
+    Mat m(sizes, CV_32SC1, Scalar::all(-1));
+    m.forEach<int>([](int& v, const int* position) { v = position[0]; });
+
+    ASSERT_EQ(1, m.dims);
+    for (int i = 0; i < 10; i++)
+        EXPECT_EQ(i, m.at<int>(i));
+}
+
 TEST(Mat, ptrVecni_20044)
 {
-    Mat_<int> m(3,4); m << 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12;
+    Mat_<int> m({3, 4}, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
     Vec2i idx(1,1);
 
     uchar *u = m.ptr(idx);
@@ -3040,6 +3377,37 @@ TEST(Core_InputOutputArray, std_vector_vector)
     double err2 = cvtest::norm(m2, Mat(cn_d[2]), NORM_INF);
     EXPECT_EQ(m2.ptr<double>(), &cn_d[2][0]);
     EXPECT_EQ(0., err2);
+}
+
+// fitSameSize carries the layout; MatShape::operator== ignores it, so layout and C are checked directly
+TEST(Core_Mat, fitSameSize_keeps_layout)
+{
+    const MatShape blk({2, 2, 5, 5, 8}, DATA_LAYOUT_BLOCK, 12);
+    Mat src;
+    src.fit(blk, CV_32F);
+
+    Mat m, om;
+    UMat u, ou;
+    m.fitSameSize(src, CV_32F);
+    u.fitSameSize(src, CV_32F);
+    _OutputArray(om).fitSameSize(src, CV_32F);
+    _OutputArray(ou).fitSameSize(src, CV_32F);
+
+    for (const MatShape& s : {m.shape(), u.shape(), om.shape(), ou.shape()})
+    {
+        EXPECT_EQ(blk, s);
+        EXPECT_EQ(blk.layout, s.layout);
+        EXPECT_EQ(blk.C, s.C);
+    }
+}
+
+TEST(Mat, ScalarMul) {
+    cv::Mat cv_mat_1x1_c3(1, 1, CV_32FC3, cv::Scalar(1, 2, 3));
+    cv::Mat cv_mat_mul = cv_mat_1x1_c3.mul(cv::Scalar(2, 3, 4));
+    ASSERT_EQ(cv_mat_mul.rows, 1);
+    ASSERT_EQ(cv_mat_mul.cols, 1);
+    ASSERT_EQ(cv_mat_mul.type(), CV_32FC3);
+    ASSERT_EQ(cv_mat_mul.at<cv::Vec3f>(0, 0), cv::Vec3f(2, 6, 12));
 }
 
 }} // namespace

@@ -94,7 +94,6 @@
 #include "opencv2/core/vsx_utils.hpp"
 #include "hal_replacement.hpp"
 
-#define GET_OPTIMIZED(func) (func)
 
 namespace cv
 {
@@ -256,9 +255,9 @@ typedef void (*BinaryFunc)(const uchar* src1, size_t step1,
                        uchar* dst, size_t step, Size sz,
                        void*);
 
-typedef void (*BinaryFuncC)(const uchar* src1, size_t step1,
-                       const uchar* src2, size_t step2,
-                       uchar* dst, size_t step, int width, int height,
+typedef void (*BinaryFuncC)(const void* src1, size_t step1,
+                       const void* src2, size_t step2,
+                       void* dst, size_t step, int width, int height,
                        void*);
 
 // Exported so the new element-wise expression engine can reuse the already-optimized,
@@ -332,6 +331,13 @@ inline bool checkScalar(InputArray sc, int atype, _InputArray::KindFlag sckind, 
            (sz == Size(1, 4) && sc.type() == CV_64F && cn <= 4);
 }
 
+// Does the OTHER operand `arr` have exactly the same shape as the scalar candidate `sc`, with the
+// single channel.
+inline bool sameShapeAsArg(const _InputArray& sc, const _InputArray& arr)
+{
+    return arr.channels() == 1 && sc.sameSize(arr);
+}
+
 // New element-wise engine scalar handling. A genuine number / Scalar / Vec / Matx operand to an
 // arithmetic op arrives via _InputArray::MATX (its data is inline in the caller's object;
 // getObj() points straight at it). In addition, the EXACT Scalar materialization that the
@@ -340,9 +346,12 @@ inline bool checkScalar(InputArray sc, int atype, _InputArray::KindFlag sckind, 
 // (a 4-row array, a 1-D array make (4,1) legal numpy-wise), and the 4.x per-channel-scalar
 // semantics must win there for binding users. Any other real Mat/UMat rides normal broadcasting
 // (but see isScalarLikeMat below for the shape-incompatible compat fallback).
-inline bool isScalarArg(const _InputArray& sc, int cn)
+// `arr` is the OTHER operand: its channel count decides what a MATX scalar may broadcast over, its
+// shape whether the bindings-style column below is a scalar at all.
+inline bool isScalarArg(const _InputArray& sc, const _InputArray& arr)
 {
     const _InputArray::KindFlag kind = sc.kind();
+    const int cn = arr.channels();
     if (kind == _InputArray::MATX)
     {
         Size sz = sc.getSz();
@@ -359,17 +368,21 @@ inline bool isScalarArg(const _InputArray& sc, int cn)
     // the bindings-style Scalar column. dims must be exactly 2: a 1-D [4] CV_64F array is an honest
     // broadcast operand. Direct field reads (no _InputArray getter dispatch) - this runs on EVERY
     // engine call with Mat operands, and `rows == 4` alone rejects almost every real array.
+    // ... and never against an operand of the very same shape: a same-shape same-channel pair is
+    // element-wise, exactly as in 4.x (see sameShapeAsArg). That covers both the non-continuous
+    // partner that fails this very test (e.g. P.col(0)) and a genuine Scalar partner, which keeps
+    // its per-channel semantics because only the Mat/UMat side is demoted.
     if (kind == _InputArray::MAT)
     {
         const Mat& m = *(const Mat*)sc.getObj();
         return m.rows == 4 && m.cols == 1 && cn <= 4 && m.dims == 2 &&
-               m.type() == CV_64F && m.isContinuous();
+               m.type() == CV_64F && m.isContinuous() && !sameShapeAsArg(sc, arr);
     }
     if (kind == _InputArray::UMAT)
     {
         const UMat& m = *(const UMat*)sc.getObj();
         return m.rows == 4 && m.cols == 1 && cn <= 4 && m.dims == 2 &&
-               m.type() == CV_64F && m.isContinuous();
+               m.type() == CV_64F && m.isContinuous() && !sameShapeAsArg(sc, arr);
     }
     return false;
 }
@@ -400,7 +413,7 @@ inline bool isScalarLikeMat(const _InputArray& sc, int cn)
     }
     else
         return false;
-    if (!continuous || nval > 4)
+    if (!continuous || nval > 4 || (nval != 1 && nval != cn))
         return false;
     return (rows == 1 && cols == 1) || (rows == cn && cols == 1) || (rows == 1 && cols == cn);
 }
@@ -520,7 +533,7 @@ CoreTLSData& getCoreTlsData();
 #if defined(BUILD_SHARED_LIBS)
 #if defined _WIN32 || defined WINCE
 #define CL_RUNTIME_EXPORT __declspec(dllexport)
-#elif defined __GNUC__ && __GNUC__ >= 4
+#elif defined __GNUC__
 #define CL_RUNTIME_EXPORT __attribute__ ((visibility ("default")))
 #else
 #define CL_RUNTIME_EXPORT

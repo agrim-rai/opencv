@@ -3,6 +3,8 @@
 // of this distribution and at http://opencv.org/license.html.
 #include "test_precomp.hpp"
 #include <cmath>
+#include <climits>
+#include <limits>
 
 #include "opencv2/core/utils/logger.hpp"
 
@@ -37,6 +39,98 @@ TEST(Core_SaturateCast, NegativesAreClipped)
     ASSERT_EQ(0u, val);
 }
 
+TEST(Core_SaturateCast, FloatToIntSaturation)
+{
+    const double inf = std::numeric_limits<double>::infinity();
+    const float inff = std::numeric_limits<float>::infinity();
+
+    EXPECT_EQ(255, saturate_cast<uchar>(1e10f)); EXPECT_EQ(0, saturate_cast<uchar>(-1e10f));
+    EXPECT_EQ(255, saturate_cast<uchar>(1e10));  EXPECT_EQ(0, saturate_cast<uchar>(-1e10));
+    EXPECT_EQ(255, saturate_cast<uchar>(inff));  EXPECT_EQ(0, saturate_cast<uchar>(-inf));
+    EXPECT_EQ(127, saturate_cast<schar>(1e10f)); EXPECT_EQ(-128, saturate_cast<schar>(-1e10f));
+    EXPECT_EQ(127, saturate_cast<schar>(1e10));  EXPECT_EQ(-128, saturate_cast<schar>(-1e10));
+    EXPECT_EQ(127, saturate_cast<schar>(inf));   EXPECT_EQ(-128, saturate_cast<schar>(-inff));
+    EXPECT_EQ(65535, saturate_cast<ushort>(3.6e9f)); EXPECT_EQ(0, saturate_cast<ushort>(-3.6e9f));
+    EXPECT_EQ(65535, saturate_cast<ushort>(3.6e9));  EXPECT_EQ(0, saturate_cast<ushort>(-3.6e9));
+    EXPECT_EQ(65535, saturate_cast<ushort>(60000.f*60000.f));    // #28557
+    EXPECT_EQ(32767, saturate_cast<short>(3.6e9f));  EXPECT_EQ(-32768, saturate_cast<short>(-3.6e9f));
+    EXPECT_EQ(32767, saturate_cast<short>(3.6e9));   EXPECT_EQ(-32768, saturate_cast<short>(-3.6e9));
+    EXPECT_EQ(32767, saturate_cast<short>(inff));    EXPECT_EQ(-32768, saturate_cast<short>(-inf));
+
+    // int: INT_MAX is not representable as float, so for float inputs >= 2^31 the result is
+    // 2147483520 (the largest float below 2^31) or INT_MAX depending on the platform
+    EXPECT_EQ(INT_MAX, saturate_cast<int>(1e10)); EXPECT_EQ(INT_MIN, saturate_cast<int>(-1e10));
+    EXPECT_EQ(INT_MAX, saturate_cast<int>(inf));  EXPECT_EQ(INT_MIN, saturate_cast<int>(-inf));
+    EXPECT_GE(saturate_cast<int>(1e10f), 2147483520); EXPECT_EQ(INT_MIN, saturate_cast<int>(-1e10f));
+    EXPECT_GE(saturate_cast<int>(inff), 2147483520);  EXPECT_EQ(INT_MIN, saturate_cast<int>(-inff));
+    EXPECT_EQ(2147483520, saturate_cast<int>(2147483520.f));
+    EXPECT_EQ(INT_MIN, saturate_cast<int>(-2147483648.f));
+
+    EXPECT_EQ(UINT_MAX, saturate_cast<unsigned>(1e10)); EXPECT_EQ(0u, saturate_cast<unsigned>(-1e10));
+    EXPECT_EQ(UINT_MAX, saturate_cast<unsigned>(1e10f)); EXPECT_EQ(0u, saturate_cast<unsigned>(-1e10f));
+    EXPECT_EQ(UINT_MAX, saturate_cast<unsigned>(inf)); EXPECT_EQ(0u, saturate_cast<unsigned>(-inff));
+    EXPECT_EQ(UINT_MAX, saturate_cast<unsigned>(4294967295.)); EXPECT_EQ(UINT_MAX, saturate_cast<unsigned>(4294967295.5));
+    EXPECT_EQ(4294967294u, saturate_cast<unsigned>(4294967294.5)); EXPECT_EQ(UINT_MAX, saturate_cast<unsigned>(4294967294.6));
+    EXPECT_EQ(3000000000u, saturate_cast<unsigned>(3e9)); EXPECT_EQ(3000000000u, saturate_cast<unsigned>(3e9f));
+    EXPECT_EQ(0u, saturate_cast<unsigned>(-0.4)); EXPECT_EQ(0u, saturate_cast<unsigned>(-0.6f));
+
+    EXPECT_EQ(INT64_MAX, saturate_cast<int64>(1e30)); EXPECT_EQ(INT64_MIN, saturate_cast<int64>(-1e30));
+    EXPECT_EQ(INT64_MAX, saturate_cast<int64>(1e30f)); EXPECT_EQ(INT64_MIN, saturate_cast<int64>(-1e30f));
+    EXPECT_EQ(INT64_MAX, saturate_cast<int64>(inf)); EXPECT_EQ(INT64_MIN, saturate_cast<int64>(-inff));
+    EXPECT_EQ(9223372036854774784LL, saturate_cast<int64>(9223372036854774784.0));  // the largest double below 2^63
+    EXPECT_EQ(INT64_MAX, saturate_cast<int64>(9223372036854775808.0));
+    EXPECT_EQ(3000000000LL, saturate_cast<int64>(3e9f)); EXPECT_EQ(-3000000000LL, saturate_cast<int64>(-3e9));
+
+    EXPECT_EQ(UINT64_MAX, saturate_cast<uint64>(1e30)); EXPECT_EQ(0u, saturate_cast<uint64>(-1e30));
+    EXPECT_EQ(UINT64_MAX, saturate_cast<uint64>(1e30f)); EXPECT_EQ(0u, saturate_cast<uint64>(-1e30f));
+    EXPECT_EQ(UINT64_MAX, saturate_cast<uint64>(inff)); EXPECT_EQ(0u, saturate_cast<uint64>(-inf));
+    EXPECT_EQ(0u, saturate_cast<uint64>(-0.4)); EXPECT_EQ(0u, saturate_cast<uint64>(-1.f));
+    EXPECT_EQ(10000000000000000000ULL, saturate_cast<uint64>(1e19));
+    EXPECT_EQ((uint64)1e19f, saturate_cast<uint64>(1e19f));
+    EXPECT_EQ(9223372036854775808ULL, saturate_cast<uint64>(9223372036854775808.0));
+    EXPECT_EQ(18446744073709549568ULL, saturate_cast<uint64>(18446744073709549568.0));  // the largest double below 2^64
+    EXPECT_EQ(UINT64_MAX, saturate_cast<uint64>(18446744073709551616.0));
+    EXPECT_EQ(3000000000ULL, saturate_cast<uint64>(3e9f));
+
+    // 16-bit floats go through float
+    EXPECT_EQ(255, saturate_cast<uchar>(hfloat(65504.f))); EXPECT_EQ(-128, saturate_cast<schar>(hfloat(-65504.f)));
+    EXPECT_EQ(32767, saturate_cast<short>(hfloat(65504.f))); EXPECT_EQ(65504, saturate_cast<int>(hfloat(65504.f)));
+    EXPECT_EQ(255, saturate_cast<uchar>(bfloat(1e30f))); EXPECT_EQ(-32768, saturate_cast<short>(bfloat(-1e30f)));
+    EXPECT_GE(saturate_cast<int>(bfloat(1e30f)), 2147483520); EXPECT_EQ(INT_MIN, saturate_cast<int>(bfloat(-1e30f)));
+    EXPECT_EQ(UINT_MAX, saturate_cast<unsigned>(bfloat(1e30f))); EXPECT_EQ(INT64_MAX, saturate_cast<int64>(bfloat(1e30f)));
+    EXPECT_EQ(UINT64_MAX, saturate_cast<uint64>(bfloat(1e30f))); EXPECT_EQ(0u, saturate_cast<uint64>(bfloat(-1e30f)));
+}
+
+TEST(Core_SaturateCast, RoundHalfToEven)
+{
+    // all the integer targets use the same round-half-to-even rule (cvRound/cvRound64)
+    EXPECT_EQ(2, saturate_cast<uchar>(2.5f)); EXPECT_EQ(4, saturate_cast<uchar>(3.5)); EXPECT_EQ(0, saturate_cast<uchar>(0.5));
+    EXPECT_EQ(-2, saturate_cast<schar>(-2.5f)); EXPECT_EQ(-4, saturate_cast<schar>(-3.5)); EXPECT_EQ(0, saturate_cast<schar>(-0.5f));
+    EXPECT_EQ(2, saturate_cast<ushort>(2.5)); EXPECT_EQ(4, saturate_cast<ushort>(3.5f));
+    EXPECT_EQ(-4, saturate_cast<short>(-3.5)); EXPECT_EQ(-2, saturate_cast<short>(-2.5f));
+    EXPECT_EQ(2, saturate_cast<int>(2.5)); EXPECT_EQ(4, saturate_cast<int>(3.5f)); EXPECT_EQ(-2, saturate_cast<int>(-2.5));
+    EXPECT_EQ(2u, saturate_cast<unsigned>(2.5)); EXPECT_EQ(4u, saturate_cast<unsigned>(3.5f)); EXPECT_EQ(0u, saturate_cast<unsigned>(0.5)); EXPECT_EQ(2u, saturate_cast<unsigned>(1.5f));
+    EXPECT_EQ(2, saturate_cast<int64>(2.5)); EXPECT_EQ(-4, saturate_cast<int64>(-3.5f)); EXPECT_EQ(0, saturate_cast<int64>(-0.5));
+    EXPECT_EQ(2u, saturate_cast<uint64>(2.5)); EXPECT_EQ(4u, saturate_cast<uint64>(3.5f)); EXPECT_EQ(0u, saturate_cast<uint64>(0.5f)); EXPECT_EQ(2u, saturate_cast<uint64>(1.5));
+}
+
+TEST(Core_SaturateCast, IntToNarrowerIntBoundaries)
+{
+    // the range checks must not overflow (UB) for inputs near the source type limits
+    EXPECT_EQ(127, saturate_cast<schar>(INT_MAX)); EXPECT_EQ(-128, saturate_cast<schar>(INT_MIN));
+    EXPECT_EQ(127, saturate_cast<schar>(128)); EXPECT_EQ(127, saturate_cast<schar>(127)); EXPECT_EQ(-128, saturate_cast<schar>(-128)); EXPECT_EQ(-128, saturate_cast<schar>(-129));
+    EXPECT_EQ(32767, saturate_cast<short>(INT_MAX)); EXPECT_EQ(-32768, saturate_cast<short>(INT_MIN));
+    EXPECT_EQ(32767, saturate_cast<short>(32768)); EXPECT_EQ(32767, saturate_cast<short>(32767)); EXPECT_EQ(-32768, saturate_cast<short>(-32768)); EXPECT_EQ(-32768, saturate_cast<short>(-32769));
+    EXPECT_EQ(127, saturate_cast<schar>(INT64_MAX)); EXPECT_EQ(-128, saturate_cast<schar>(INT64_MIN));
+    EXPECT_EQ(127, saturate_cast<schar>((int64)128)); EXPECT_EQ(-128, saturate_cast<schar>((int64)-129)); EXPECT_EQ(-128, saturate_cast<schar>((int64)-128));
+    EXPECT_EQ(32767, saturate_cast<short>(INT64_MAX)); EXPECT_EQ(-32768, saturate_cast<short>(INT64_MIN));
+    EXPECT_EQ(32767, saturate_cast<short>((int64)32768)); EXPECT_EQ(-32768, saturate_cast<short>((int64)-32769)); EXPECT_EQ(32767, saturate_cast<short>((int64)32767));
+    EXPECT_EQ(INT_MAX, saturate_cast<int>(INT64_MAX)); EXPECT_EQ(INT_MIN, saturate_cast<int>(INT64_MIN));
+    EXPECT_EQ(INT_MAX, saturate_cast<int>((int64)INT_MAX + 1)); EXPECT_EQ(INT_MAX, saturate_cast<int>((int64)INT_MAX));
+    EXPECT_EQ(INT_MIN, saturate_cast<int>((int64)INT_MIN - 1)); EXPECT_EQ(INT_MIN, saturate_cast<int>((int64)INT_MIN));
+    EXPECT_EQ(-1, saturate_cast<int>((int64)-1)); EXPECT_EQ(-1, saturate_cast<short>((int64)-1)); EXPECT_EQ(-1, saturate_cast<schar>(-1));
+}
+
 template<typename T, typename U>
 static double maxAbsDiff(const T &t, const U &u)
 {
@@ -49,7 +143,7 @@ static double maxAbsDiff(const T &t, const U &u)
 
 TEST(Core_OutputArrayAssign, _Matxd_Matd)
 {
-    Mat expected = (Mat_<double>(2,3) << 1, 2, 3, .1, .2, .3);
+    Mat expected = Mat_<double>({2, 3}, {1, 2, 3, .1, .2, .3});
     Matx23d actualx;
 
     {
@@ -64,7 +158,7 @@ TEST(Core_OutputArrayAssign, _Matxd_Matd)
 
 TEST(Core_OutputArrayAssign, _Matxd_Matf)
 {
-    Mat expected = (Mat_<float>(2,3) << 1, 2, 3, .1, .2, .3);
+    Mat expected = Mat_<float>({2, 3}, {1.f, 2.f, 3.f, .1f, .2f, .3f});
     Matx23d actualx;
 
     {
@@ -79,7 +173,7 @@ TEST(Core_OutputArrayAssign, _Matxd_Matf)
 
 TEST(Core_OutputArrayAssign, _Matxf_Matd)
 {
-    Mat expected = (Mat_<double>(2,3) << 1, 2, 3, .1, .2, .3);
+    Mat expected = Mat_<double>({2, 3}, {1, 2, 3, .1, .2, .3});
     Matx23f actualx;
 
     {
@@ -94,7 +188,7 @@ TEST(Core_OutputArrayAssign, _Matxf_Matd)
 
 TEST(Core_OutputArrayAssign, _Matxd_UMatd)
 {
-    Mat expected = (Mat_<double>(2,3) << 1, 2, 3, .1, .2, .3);
+    Mat expected = Mat_<double>({2, 3}, {1, 2, 3, .1, .2, .3});
     UMat uexpected = expected.getUMat(ACCESS_READ);
     Matx23d actualx;
 
@@ -110,7 +204,7 @@ TEST(Core_OutputArrayAssign, _Matxd_UMatd)
 
 TEST(Core_OutputArrayAssign, _Matxd_UMatf)
 {
-    Mat expected = (Mat_<float>(2,3) << 1, 2, 3, .1, .2, .3);
+    Mat expected = Mat_<float>({2, 3}, {1.f, 2.f, 3.f, .1f, .2f, .3f});
     UMat uexpected = expected.getUMat(ACCESS_READ);
     Matx23d actualx;
 
@@ -126,7 +220,7 @@ TEST(Core_OutputArrayAssign, _Matxd_UMatf)
 
 TEST(Core_OutputArrayAssign, _Matxf_UMatd)
 {
-    Mat expected = (Mat_<double>(2,3) << 1, 2, 3, .1, .2, .3);
+    Mat expected = Mat_<double>({2, 3}, {1, 2, 3, .1, .2, .3});
     UMat uexpected = expected.getUMat(ACCESS_READ);
     Matx23f actualx;
 
@@ -211,13 +305,56 @@ TEST(Core_String, end_method_regression)
 
 TEST(Core_Copy, repeat_regression_8972)
 {
-    Mat src = (Mat_<int>(1, 4) << 1, 2, 3, 4);
+    Mat src = Mat_<int>({1, 4}, {1, 2, 3, 4});
 
     ASSERT_ANY_THROW({
                          repeat(src, 5, 1, src);
                      });
 }
 
+TEST(Core_BorderInterpolate, wrap_no_overflow_29232)
+{
+    EXPECT_EQ(cv::borderInterpolate(INT_MIN, 5, cv::BORDER_WRAP), 2);
+    EXPECT_EQ(cv::borderInterpolate(INT_MAX, 5, cv::BORDER_WRAP), 2);
+    int r = cv::borderInterpolate(INT_MIN, 5, cv::BORDER_WRAP);
+    EXPECT_GE(r, 0);
+    EXPECT_LT(r, 5);
+}
+
+TEST(Core_CopyMakeBorder, empty_src_and_overflow)
+{
+    Mat emptySrc, dst;
+    EXPECT_THROW(cv::copyMakeBorder(emptySrc, dst, 1, 1, 1, 1, cv::BORDER_CONSTANT, cv::Scalar(0)), cv::Exception);
+
+    Mat src(5, 5, CV_8UC1, Scalar(1));
+    EXPECT_THROW(cv::copyMakeBorder(src, dst, INT_MAX, 1, 0, 0, cv::BORDER_CONSTANT, cv::Scalar(0)), cv::Exception);
+    EXPECT_THROW(cv::copyMakeBorder(src, dst, 0, 0, INT_MAX, 1, cv::BORDER_CONSTANT, cv::Scalar(0)), cv::Exception);
+}
+
+TEST(Core_MixChannels, empty_and_mismatched_inputs)
+{
+    Mat emptySrc, emptyDst;
+    std::vector<int> fromTo = {0, 0};
+    EXPECT_THROW(cv::mixChannels(&emptySrc, 1, &emptyDst, 1, fromTo.data(), 1), cv::Exception);
+
+    Mat src(5, 5, CV_8UC1, Scalar(1));
+    EXPECT_THROW(cv::mixChannels(&src, 1, &emptyDst, 1, fromTo.data(), 1), cv::Exception);
+    EXPECT_THROW(cv::mixChannels(&emptySrc, 1, &src, 1, fromTo.data(), 1), cv::Exception);
+
+    Mat dstMismatched(6, 6, CV_8UC1);
+    EXPECT_THROW(cv::mixChannels(&src, 1, &dstMismatched, 1, fromTo.data(), 1), cv::Exception);
+}
+
+TEST(Core_Repeat, empty_and_overflow)
+{
+    Mat emptySrc, dst;
+    cv::repeat(emptySrc, 5, 5, dst);
+    EXPECT_TRUE(dst.empty());
+
+    Mat src(2, 2, CV_8U, Scalar(1));
+    EXPECT_THROW(cv::repeat(src, INT_MAX, 1, dst), cv::Exception);
+    EXPECT_THROW(cv::repeat(src, 1, INT_MAX, dst), cv::Exception);
+}
 
 class ThrowErrorParallelLoopBody : public cv::ParallelLoopBody
 {
@@ -303,6 +440,34 @@ TEST(Core_Parallel, propagate_fp_denormals_ignore_hint)
         EXPECT_TRUE(job.isOK);
     }
 }
+
+class CountingParallelLoopBody : public cv::ParallelLoopBody
+{
+public:
+    explicit CountingParallelLoopBody(std::vector<int>& hits) : hits_(hits) {}
+    void operator()(const cv::Range& r) const CV_OVERRIDE
+    {
+        for (int i = r.start; i < r.end; i++)
+            CV_XADD(&hits_[i], 1);
+    }
+    std::vector<int>& hits_;
+};
+
+typedef testing::TestWithParam<int> Core_Parallel_IndexCoverage;
+
+TEST_P(Core_Parallel_IndexCoverage, every_index_exactly_once)
+{
+    const int total = GetParam();
+    std::vector<int> hits(total, 0);
+    parallel_for_(cv::Range(0, total), CountingParallelLoopBody(hits));
+    for (int i = 0; i < total; i++)
+        ASSERT_EQ(1, hits[i]) << "index " << i << " of " << total;
+}
+
+// Brackets pplParallelFor's total<=workers fast path, and goes well past it to also
+// exercise the shrinking-chunk claim loop.
+INSTANTIATE_TEST_CASE_P(/**/, Core_Parallel_IndexCoverage,
+    testing::Values(1, 2, 4, 8, 16, 17, 32, 64, 100, 300, 100000));
 
 TEST(Core_Version, consistency)
 {
@@ -860,7 +1025,6 @@ TEST(Core_Allocation, alignedAllocation)
 }
 
 
-#if !(defined(__GNUC__) && __GNUC__ < 5)  // GCC 4.8 emits: 'is_trivially_copyable' is not a member of 'std'
 TEST(Core_Types, trivially_copyable)
 {
     EXPECT_TRUE(std::is_trivially_copyable<cv::Complexd>::value);
@@ -880,7 +1044,6 @@ TEST(Core_Types, trivially_copyable_extra)
     EXPECT_TRUE(std::is_trivially_copyable<cv::TermCriteria>::value);
     EXPECT_TRUE(std::is_trivially_copyable<cv::Moments>::value);
 }
-#endif
 
 template <typename T> class Rect_Test : public testing::Test {};
 
@@ -928,6 +1091,26 @@ REGISTER_TYPED_TEST_CASE_P(Rect_Test, Overflows, OnTheEdge);
 typedef ::testing::Types<int, float, double> RectTypes;
 INSTANTIATE_TYPED_TEST_CASE_P(Negative_Test, Rect_Test, RectTypes);
 
+// See https://github.com/opencv/opencv/issues/11988
+// Intersecting two disjoint unsigned rectangles must not underflow width/height.
+TEST(Core_Rect, unsigned_intersection_no_underflow)
+{
+    typedef Rect_<unsigned> R;
+    // Disjoint on both axes.
+    EXPECT_EQ(R(), R(0u, 0u, 1u, 1u) & R(2u, 2u, 1u, 1u));
+    // Disjoint on one axis only.
+    EXPECT_EQ(R(), R(0u, 0u, 4u, 4u) & R(5u, 1u, 4u, 4u));
+    EXPECT_EQ(R(), R(0u, 0u, 4u, 4u) & R(1u, 5u, 4u, 4u));
+    // Touching edges are still empty.
+    EXPECT_EQ(R(), R(0u, 0u, 4u, 4u) & R(4u, 4u, 4u, 4u));
+    // Overlapping intersection is unchanged.
+    EXPECT_EQ(R(3u, 2u, 2u, 3u), R(0u, 0u, 5u, 5u) & R(3u, 2u, 4u, 4u));
+
+    const R inter = R(0u, 0u, 1u, 1u) & R(2u, 2u, 1u, 1u);
+    EXPECT_TRUE(inter.empty());
+    EXPECT_EQ(0u, inter.area());
+}
+
 // Expected that SkipTestException thrown in the constructor should skip test but not fail
 struct TestFixtureSkip: public ::testing::Test {
     TestFixtureSkip(bool throwEx = true) {
@@ -950,6 +1133,94 @@ struct TestSetUpSkip: public ::testing::Test {
 
 TEST_F(TestSetUpSkip, NoBodyRun) {
     FAIL() << "Unreachable code called";
+}
+
+TEST(Core_HardwareSupport, OutOfBounds) {
+    EXPECT_FALSE(cv::checkHardwareSupport(-1));
+    EXPECT_FALSE(cv::checkHardwareSupport(-100));
+    EXPECT_FALSE(cv::checkHardwareSupport(CV_HARDWARE_MAX_FEATURE));
+    EXPECT_FALSE(cv::checkHardwareSupport(652214343));
+
+    EXPECT_TRUE(cv::getHardwareFeatureName(-1).empty());
+    EXPECT_TRUE(cv::getHardwareFeatureName(CV_HARDWARE_MAX_FEATURE).empty());
+    EXPECT_TRUE(cv::getHardwareFeatureName(652214343).empty());
+}
+
+TEST(Core_KeyPoint, ConvertOutOfBounds) {
+    std::vector<cv::KeyPoint> kpts = { cv::KeyPoint(1.0f, 2.0f, 5.0f) };
+    std::vector<cv::Point2f> pts;
+
+    // Negative index throws
+    EXPECT_THROW(cv::KeyPoint::convert(kpts, pts, { -1 }), cv::Exception);
+
+    // Out-of-bounds positive index throws
+    EXPECT_THROW(cv::KeyPoint::convert(kpts, pts, { 1 }), cv::Exception);
+    EXPECT_THROW(cv::KeyPoint::convert(kpts, pts, { 100 }), cv::Exception);
+    EXPECT_THROW(cv::KeyPoint::convert({}, pts, { 0 }), cv::Exception);
+
+    // Valid index works
+    EXPECT_NO_THROW(cv::KeyPoint::convert(kpts, pts, { 0 }));
+    ASSERT_EQ(pts.size(), 1u);
+    EXPECT_EQ(pts[0], cv::Point2f(1.0f, 2.0f));
+}
+
+TEST(Core_EmptyMat, FuzzRegressions) {
+    cv::Mat empty_mat;
+    cv::Mat mask_1x1 = cv::Mat::ones(1, 1, CV_8U);
+
+    // cv::mean
+    EXPECT_NO_THROW({
+        cv::Scalar m = cv::mean(empty_mat);
+        EXPECT_EQ(m, cv::Scalar::all(0.0));
+    });
+    EXPECT_NO_THROW({
+        cv::Scalar m = cv::mean(cv::Mat(0, 4, CV_32F));
+        EXPECT_EQ(m, cv::Scalar::all(0.0));
+    });
+    EXPECT_THROW(cv::mean(empty_mat, mask_1x1), cv::Exception);
+
+    // cv::norm
+    EXPECT_NO_THROW({
+        double n = cv::norm(empty_mat);
+        EXPECT_EQ(n, 0.0);
+    });
+    EXPECT_NO_THROW({
+        double n = cv::norm(cv::Mat(0, 4, CV_32F));
+        EXPECT_EQ(n, 0.0);
+    });
+    EXPECT_THROW(cv::norm(empty_mat, cv::NORM_L2, mask_1x1), cv::Exception);
+    EXPECT_NO_THROW({
+        double n = cv::norm(empty_mat, empty_mat);
+        EXPECT_EQ(n, 0.0);
+    });
+
+    // cv::reduce
+    cv::Mat dst;
+    EXPECT_NO_THROW(cv::reduce(empty_mat, dst, 0, cv::REDUCE_SUM));
+    EXPECT_TRUE(dst.empty());
+    EXPECT_NO_THROW(cv::reduce(cv::Mat(0, 4, CV_32F), dst, 0, cv::REDUCE_SUM));
+
+    // cv::dft, cv::dct
+    EXPECT_NO_THROW(cv::dft(empty_mat, dst));
+    EXPECT_TRUE(dst.empty());
+    EXPECT_NO_THROW(cv::dct(empty_mat, dst));
+    EXPECT_TRUE(dst.empty());
+
+    // cv::mulSpectrums, cv::divSpectrums
+    EXPECT_NO_THROW(cv::mulSpectrums(empty_mat, empty_mat, dst, 0));
+    EXPECT_TRUE(dst.empty());
+    EXPECT_NO_THROW(cv::divSpectrums(empty_mat, empty_mat, dst, 0));
+    EXPECT_TRUE(dst.empty());
+    cv::Mat spec_4x4 = cv::Mat::ones(4, 4, CV_32FC1);
+    EXPECT_THROW(cv::mulSpectrums(empty_mat, spec_4x4, dst, 0), cv::Exception);
+    EXPECT_THROW(cv::mulSpectrums(spec_4x4, empty_mat, dst, 0), cv::Exception);
+    EXPECT_THROW(cv::divSpectrums(empty_mat, spec_4x4, dst, 0), cv::Exception);
+    EXPECT_THROW(cv::divSpectrums(spec_4x4, empty_mat, dst, 0), cv::Exception);
+
+    // cv::transposeND, cv::repeat, cv::slice
+    EXPECT_THROW(cv::transposeND(empty_mat, {}, dst), cv::Exception);
+    EXPECT_THROW(cv::repeat(empty_mat, {}, dst), cv::Exception);
+    EXPECT_THROW(cv::slice(empty_mat, {}, {}, {}, dst), cv::Exception);
 }
 
 }} // namespace

@@ -202,13 +202,9 @@ template<> inline void EXPECT_COMPARE_EQ_<hfloat>(const hfloat a, const hfloat b
 }
 #endif
 
-// pack functions do not do saturation when converting from 64-bit types
+// every width saturates, 64-bit included
 template<typename T, typename W>
 inline T pack_saturate_cast(W a) { return saturate_cast<T>(a); }
-template<>
-inline int pack_saturate_cast<int, int64>(int64 a) { return static_cast<int>(a); }
-template<>
-inline unsigned pack_saturate_cast<unsigned, uint64>(uint64 a) { return static_cast<unsigned>(a); }
 
 template<typename R> struct TheTest
 {
@@ -730,6 +726,38 @@ template<typename R> struct TheTest
             EXPECT_EQ(dataA[i] <  dataB[i], resG[i] != 0);
             EXPECT_EQ(dataA[i] <= dataB[i], resH[i] != 0);
         }
+
+        if (std::numeric_limits<LaneType>::has_quiet_NaN || std::is_same<LaneType, hfloat>::value)
+        {
+            const LaneType qnan = (LaneType)std::numeric_limits<float>::quiet_NaN();
+            dataA[0] = qnan;
+            if (VTraits<R>::vlanes() > 1)
+            {
+                dataA[1] = qnan;
+                dataB[1] = qnan;
+            }
+            if (VTraits<R>::vlanes() > 2)
+                dataB[2] = qnan;
+            a = dataA; b = dataB;
+
+            resC = (v_eq(a, b));
+            resD = (v_ne(a, b));
+            resE = (v_gt(a, b));
+            resF = (v_ge(a, b));
+            resG = (v_lt(a, b));
+            resH = (v_le(a, b));
+
+            for (int i = 0; i < VTraits<R>::vlanes(); ++i)
+            {
+                SCOPED_TRACE(cv::format("nan i=%d", i));
+                EXPECT_EQ(dataA[i] == dataB[i], resC.as_int(i) != 0);
+                EXPECT_EQ(dataA[i] != dataB[i], resD.as_int(i) != 0);
+                EXPECT_EQ(dataA[i] >  dataB[i], resE.as_int(i) != 0);
+                EXPECT_EQ(dataA[i] >= dataB[i], resF.as_int(i) != 0);
+                EXPECT_EQ(dataA[i] <  dataB[i], resG.as_int(i) != 0);
+                EXPECT_EQ(dataA[i] <= dataB[i], resH.as_int(i) != 0);
+            }
+        }
         return *this;
     }
 
@@ -811,6 +839,22 @@ template<typename R> struct TheTest
                 resG = v_reduce_sum(v_dotprod_expand_fast(a, b, c));
         EXPECT_EQ(sumAB,  resF);
         EXPECT_EQ(sumABC, resG);
+
+        // 8-bit lanes at the minimum value: two such products already overflow a 16-bit sum
+        if (sizeof(LaneType) == 1)
+        {
+            Data<R> dataM;
+            for (int i = 0; i < VTraits<R>::vlanes(); ++i)
+                dataM[i] = std::numeric_limits<LaneType>::min();
+            R m = dataM;
+            const l4_type minsq = (l4_type)std::numeric_limits<LaneType>::min() *
+                                  (l4_type)std::numeric_limits<LaneType>::min();
+            Data<Rx4> resM = v_dotprod_expand(m, m);
+            for (int i = 0; i < VTraits<Rx4>::vlanes(); ++i)
+                EXPECT_EQ(4 * minsq, resM[i]);
+            EXPECT_EQ(4 * minsq * VTraits<Rx4>::vlanes(),
+                      v_reduce_sum(v_dotprod_expand_fast(m, m)));
+        }
 
         return *this;
     }
@@ -1014,6 +1058,17 @@ template<typename R> struct TheTest
         return *this;
     }
 
+    TheTest & test_reduce_sum_f64()
+    {
+        Data<R> dataA((LaneType)INT_MAX);   // every lane needs 31 mantissa bits
+        R a = dataA;
+        static_assert(std::is_same<decltype(v_reduce_sum(a)), double>::value,
+                      "v_reduce_sum(v_float64) must return double, not float");
+        const double expected = (double)INT_MAX * VTraits<R>::vlanes();
+        EXPECT_DOUBLE_EQ(expected, v_reduce_sum(a));
+        return *this;
+    }
+
     TheTest & test_reduce_sad()
     {
         Data<R> dataA, dataB((LaneType)VTraits<R>::vlanes() /2);
@@ -1025,6 +1080,36 @@ template<typename R> struct TheTest
             sum += std::abs(int(dataA[i] - dataB[i]));
         }
         EXPECT_EQ(sum, v_reduce_sad(a, b));
+        return *this;
+    }
+
+    // v_select() on its own. test_mask() also covers it, but its v_signmask() expectations assume
+    // more than two lanes, so the 64-bit types cannot use it.
+    TheTest & test_select()
+    {
+        typedef typename V_RegTraits<R>::int_reg int_reg;
+        typedef typename V_RegTraits<int_reg>::u_reg uint_reg;
+        typedef typename VTraits<int_reg>::lane_type int_type;
+        typedef typename VTraits<uint_reg>::lane_type uint_type;
+
+        union { LaneType l; uint_type ui; } all1s;
+        all1s.ui = (uint_type)-1;
+        const LaneType mask_one = all1s.l;
+
+        Data<R> dataMask((LaneType)0), dataA((LaneType)1), dataB((LaneType)2);
+        for (int i = 0; i < VTraits<R>::vlanes(); i += 2)
+            dataMask[i] = mask_one;
+        dataMask[VTraits<R>::vlanes() - 1] = mask_one;
+
+        R m = dataMask, a = dataA, b = dataB;
+        Data<R> res = v_select(m, a, b);
+        for (int i = 0; i < VTraits<R>::vlanes(); ++i)
+        {
+            SCOPED_TRACE(cv::format("i=%d", i));
+            int_type msk = dataMask.as_int(i);
+            EXPECT_EQ((dataA.as_int(i) & msk) | (dataB.as_int(i) & ~msk), res.as_int(i));
+        }
+
         return *this;
     }
 
@@ -1465,6 +1550,65 @@ template<typename R> struct TheTest
             EXPECT_COMPARE_EQ(data1[i]*data2[i] + data3[i], resH[i]);
         }
 
+        // Out-of-range, boundary and .5 inputs: the results must saturate to the destination range and
+        // agree with the scalar functions (see the cvRound() documentation for the exact bounds).
+        {
+            typedef typename VTraits<Ri>::lane_type ILaneType;
+            const float inf = std::numeric_limits<float>::infinity();
+            const float ovals32[] = { 3e9f, -3e9f, 1e30f, -1e30f, 2147483520.f, -2147483648.f, inf, -inf,
+                                      2.5f, -2.5f, 2.75f, -2.75f, 0.5f, -0.5f, 100.5f, -100.5f };
+            // 16-bit floats -> 16-bit ints: values that fit into f16, but not into int16
+            const float ovals16[] = { 40000.f, -40000.f, 65504.f, -65504.f, 32768.f, -32768.f, 33000.f, -33000.f,
+                                      2.5f, -2.5f, 2.75f, -2.75f, 0.5f, -0.5f, 100.5f, -100.5f };
+            const int novals = 16;
+            const float* ov = sizeof(ILaneType) == 2 ? ovals16 : ovals32;
+            Data<R> dataO;
+            for (int i = 0; i < VTraits<R>::vlanes(); ++i)
+                dataO[i] = (LaneType)ov[i % novals];
+            R aO = dataO;
+            Data<Ri> roundO = v_round(aO), truncO = v_trunc(aO), floorO = v_floor(aO), ceilO = v_ceil(aO);
+            for (int i = 0; i < VTraits<R>::vlanes(); ++i)
+            {
+                LaneType x = dataO[i];
+                double xd = (double)x;
+
+                // NOTE: Armv7 scalar cvRound and vector v_round may produce different result on the range edges and clams differently
+                auto check_big_int = [&](int v0, int v) {
+                    constexpr int F2INT_MAX = 2147483520;
+                    if (v0 < F2INT_MAX) {
+                        EXPECT_EQ(v0, v);
+                    } else {
+                        EXPECT_GE(v, F2INT_MAX);
+                    }
+                };
+                SCOPED_TRACE(cv::format("overflow: i=%d, x=%g", i, xd));
+                check_big_int(saturate_cast<ILaneType>(cvRound(x)), roundO[i]);
+                check_big_int(saturate_cast<ILaneType>(cvTrunc(x)), truncO[i]);
+                check_big_int(saturate_cast<ILaneType>(cvFloor(x)), floorO[i]);
+                check_big_int(saturate_cast<ILaneType>(cvCeil(x)), ceilO[i]);
+
+                if (sizeof(ILaneType) == 4)
+                {
+                    if (xd >= 2147483648.)
+                    {
+                        // INT_MAX is not representable as float, 2147483520 is the largest float below 2^31
+                        int lo = sizeof(LaneType) == 8 ? INT_MAX : 2147483520;
+                        EXPECT_GE((int)roundO[i], lo); EXPECT_LE((int)roundO[i], INT_MAX);
+                        EXPECT_GE((int)truncO[i], lo); EXPECT_LE((int)truncO[i], INT_MAX);
+                        EXPECT_GE((int)floorO[i], lo); EXPECT_LE((int)floorO[i], INT_MAX);
+                        EXPECT_GE((int)ceilO[i], lo);  EXPECT_LE((int)ceilO[i], INT_MAX);
+                    }
+                    else if (xd <= -2147483648.)
+                    {
+                        EXPECT_EQ(INT_MIN, (int)roundO[i]);
+                        EXPECT_EQ(INT_MIN, (int)truncO[i]);
+                        EXPECT_EQ(INT_MIN, (int)floorO[i]);
+                        EXPECT_EQ(INT_MIN, (int)ceilO[i]);
+                    }
+                }
+            }
+        }
+
         return *this;
     }
 #if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F)
@@ -1489,6 +1633,36 @@ template<typename R> struct TheTest
             EXPECT_EQ(cvRound(data1[i]), resA[i]);
             EXPECT_EQ(cvRound(data1_border[i]), resB[i]);
             EXPECT_EQ(cvRound(data2[i]), resC[i]);
+        }
+
+        // out-of-range inputs must saturate in both halves (see the cvRound() documentation)
+        {
+            const double inf = std::numeric_limits<double>::infinity();
+            const double ovals[] = { 3e9, -3e9, 1e30, -1e30, 2147483647.5, -2147483648.5, inf, -inf,
+                                     2.5, -2.5, 2147483646.5, -2147483647.5, 0.5, -0.5, 1e10, -1e10 };
+            const int novals = 16;
+            Data<R> dataO1, dataO2;
+            for (int i = 0; i < VTraits<R>::vlanes(); ++i)
+            {
+                dataO1[i] = ovals[i % novals];
+                dataO2[i] = ovals[(i + 5) % novals];
+            }
+            R aO1 = dataO1, aO2 = dataO2;
+            Data<Ri> resO = v_round(aO1, aO2);
+            for (int i = 0; i < VTraits<R>::vlanes(); ++i)
+            {
+                SCOPED_TRACE(cv::format("overflow: i=%d", i));
+                EXPECT_EQ(cvRound(dataO1[i]), resO[i]);
+                EXPECT_EQ(cvRound(dataO2[i]), resO[i + VTraits<R>::vlanes()]);
+                if (dataO1[i] >= 2147483648.)
+                {
+                    EXPECT_EQ(INT_MAX, resO[i]);
+                }
+                if (dataO1[i] <= -2147483648.)
+                {
+                    EXPECT_EQ(INT_MIN, resO[i]);
+                }
+            }
         }
 
         return *this;
@@ -1558,6 +1732,65 @@ template<typename R> struct TheTest
             EXPECT_EQ((double)dataB[i], resD[i]);
         }
 #endif
+        return *this;
+    }
+
+    // 64->32 now saturates like every other width, so check the three narrows at the boundaries
+    // that tell saturation and truncation apart. Truncation returns the low 32 bits, which for
+    // these inputs is a different value - and usually the wrong end of the range.
+    TheTest & test_pack64_saturation()
+    {
+        typedef typename V_RegTraits<R>::w_reg W;              // 64-bit, same signedness as R
+        typedef typename VTraits<W>::lane_type w_type;
+        const int n = VTraits<W>::vlanes();
+
+        Data<W> dataA, dataB;
+        for (int i = 0; i < n; ++i)
+        {
+            dataA[i] = (w_type)((int64)INT_MAX + 1 + i);       // just above the int32 range
+            dataB[i] = (w_type)((int64)1 << 40);               // far above both 32-bit ranges
+        }
+        W a = dataA, b = dataB;
+
+        Data<R> res = v_pack(a, b);
+        for (int i = 0; i < n; ++i)
+        {
+            SCOPED_TRACE(cv::format("i=%d", i));
+            EXPECT_EQ(saturate_cast<LaneType>(dataA[i]), res[i]);
+            EXPECT_EQ(saturate_cast<LaneType>(dataB[i]), res[i + n]);
+        }
+
+        Data<R> stored(0);
+        v_pack_store(stored.d, b);
+        for (int i = 0; i < n; ++i)
+            EXPECT_EQ(saturate_cast<LaneType>(dataB[i]), stored[i]);
+        return *this;
+    }
+
+    // v_pack_u: int64 -> uint32, so negatives clamp to 0 and anything above UINT_MAX to UINT_MAX
+    TheTest & test_pack64_u_saturation()
+    {
+        const int n = VTraits<v_int64>::vlanes();
+        Data<v_int64> dataA, dataB;
+        for (int i = 0; i < n; ++i)
+        {
+            dataA[i] = -((int64)1 << 40) - i;                  // below zero by a long way
+            dataB[i] = ((int64)1 << 40) + i;                   // above UINT_MAX
+        }
+        v_int64 a = dataA, b = dataB;
+
+        Data<v_uint32> res = v_pack_u(a, b);
+        for (int i = 0; i < n; ++i)
+        {
+            SCOPED_TRACE(cv::format("i=%d", i));
+            EXPECT_EQ(saturate_cast<unsigned>(dataA[i]), res[i]);
+            EXPECT_EQ(saturate_cast<unsigned>(dataB[i]), res[i + n]);
+        }
+
+        Data<v_uint32> stored(0);
+        v_pack_u_store(stored.d, a);
+        for (int i = 0; i < n; ++i)
+            EXPECT_EQ(saturate_cast<unsigned>(dataA[i]), stored[i]);
         return *this;
     }
 
@@ -2389,6 +2622,8 @@ void test_hal_intrin_uint32()
         .test_mask()
         .test_popcount()
         .test_pack<1>().test_pack<2>().test_pack<15>().test_pack<32>()
+        .test_pack64_saturation()
+        .test_pack64_u_saturation()
         .test_unpack()
         .test_reverse()
         .test_extract<0>().test_extract<1>().test_extract<2>().test_extract<3>()
@@ -2425,6 +2660,7 @@ void test_hal_intrin_int32()
         .test_reduce_sad()
         .test_mask()
         .test_pack<1>().test_pack<2>().test_pack<15>().test_pack<32>()
+        .test_pack64_saturation()
         .test_unpack()
         .test_reverse()
         .test_extract<0>().test_extract<1>().test_extract<2>().test_extract<3>()
@@ -2449,6 +2685,7 @@ void test_hal_intrin_uint64()
         .test_loadstore()
         .test_addsub()
         .test_cmp64()
+        .test_select()
         //.test_cmp() - not declared as supported
         .test_shift<1>().test_shift<8>()
         .test_logic()
@@ -2469,6 +2706,7 @@ void test_hal_intrin_int64()
         .test_loadstore()
         .test_addsub()
         .test_cmp64()
+        .test_select()
         //.test_cmp() - not declared as supported
         .test_shift<1>().test_shift<8>()
         .test_logic()
@@ -2555,6 +2793,7 @@ void test_hal_intrin_float64()
         .test_exp_fp64()
         .test_log_fp64()
         .test_sincos_fp64()
+        .test_reduce_sum_f64()
         //.test_broadcast_element<0>().test_broadcast_element<1>()
 #if CV_SIMD_WIDTH == 32
         .test_extract<2>().test_extract<3>()

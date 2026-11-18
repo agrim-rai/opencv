@@ -6,24 +6,48 @@
 #include "npy_blob.hpp"
 
 #ifdef HAVE_OPENCV_DNN
-
 #include "opencv2/dnn.hpp"
-#include "opencv2/core/utils/configuration.private.hpp"
+#endif
 
 namespace opencv_test { namespace {
 
-static void skipIfClassicDnnEngine()
+#ifdef HAVE_OPENCV_DNN
+
+// ALIKED's top-k output order is not stable across inference engines, so the
+// references and these tests share one canonical order: keypoint position, x
+// then y. Responses make a poor key here, because engines disagree on them by
+// more than the gaps between the closest responses, while distinct keypoints
+// are at least 0.4 px apart.
+static void sortFeaturesByPosition(std::vector<KeyPoint>& keypoints, Mat& descriptors)
 {
-    const auto engine = static_cast<cv::dnn::EngineType>(
-        cv::utils::getConfigurationParameterSizeT("OPENCV_FORCE_DNN_ENGINE", cv::dnn::ENGINE_AUTO));
-    if (engine == cv::dnn::ENGINE_CLASSIC)
-        throw SkipTestException("ALIKED/LightGlue reference outputs are generated with the new DNN engine");
+    ASSERT_EQ(descriptors.rows, static_cast<int>(keypoints.size()));
+
+    std::vector<int> order(keypoints.size());
+    for (size_t i = 0; i < order.size(); i++)
+        order[i] = static_cast<int>(i);
+    std::sort(order.begin(), order.end(), [&keypoints](int a, int b)
+    {
+        const Point2f& pa = keypoints[a].pt;
+        const Point2f& pb = keypoints[b].pt;
+        if (pa.x != pb.x)
+            return pa.x < pb.x;
+        return pa.y < pb.y;
+    });
+
+    std::vector<KeyPoint> sortedKeypoints(keypoints.size());
+    Mat sortedDescriptors(descriptors.size(), descriptors.type());
+    for (size_t i = 0; i < order.size(); i++)
+    {
+        sortedKeypoints[i] = keypoints[order[i]];
+        descriptors.row(order[i]).copyTo(sortedDescriptors.row(static_cast<int>(i)));
+    }
+    keypoints.swap(sortedKeypoints);
+    descriptors = sortedDescriptors;
 }
 
 TEST(Features2d_ALIKED, Regression)
 {
     applyTestTag( CV_TEST_TAG_MEMORY_2GB);
-    skipIfClassicDnnEngine();
 
     const std::string modelPath = cvtest::findDataFile("dnn/onnx/models/aliked-n16rot-top1k-640.onnx", false);
 
@@ -56,6 +80,9 @@ TEST(Features2d_ALIKED, Regression)
         EXPECT_GT(kp.response, 0.f);
     }
 
+    // Compare in the canonical order used by the reference generator
+    sortFeaturesByPosition(keypoints, descriptors);
+
     // Load ORT reference outputs (generated with same OpenCV preprocessing)
     Mat refKpts   = blobFromNPY(cvtest::findDataFile("dnn/aliked_keypoints_box.npy"));
     Mat refDescs  = blobFromNPY(cvtest::findDataFile("dnn/aliked_descriptors_box.npy"));
@@ -85,10 +112,9 @@ TEST(Features2d_ALIKED, Regression)
     }
 }
 
-TEST(Features2d_LightGlue, Regression)
+TEST(Features2d_LightGlue_ALIKED, Regression)
 {
     applyTestTag( CV_TEST_TAG_MEMORY_2GB);
-    skipIfClassicDnnEngine();
 
     const std::string alikedPath = cvtest::findDataFile("dnn/onnx/models/aliked-n16rot-top1k-640.onnx", false);
     const std::string lgPath = cvtest::findDataFile("dnn/onnx/models/aliked_lightglue.onnx", false);
@@ -111,6 +137,11 @@ TEST(Features2d_LightGlue, Regression)
 
     ASSERT_GT(static_cast<int>(kpts1.size()), 0);
     ASSERT_GT(static_cast<int>(kpts2.size()), 0);
+
+    // The reference match indices refer to the canonical feature order, so
+    // match on features sorted the same way as in the reference generator.
+    sortFeaturesByPosition(kpts1, descs1);
+    sortFeaturesByPosition(kpts2, descs2);
 
     // Build keypoint matrices (pixel coordinates)
     Mat kpts1Mat(static_cast<int>(kpts1.size()), 2, CV_32F);
@@ -140,6 +171,16 @@ TEST(Features2d_LightGlue, Regression)
         EXPECT_LT(m.trainIdx, static_cast<int>(kpts2.size()));
     }
 
+    // The reference stores the match rows in the canonical order used by the
+    // generator. The features are position-sorted, so ordering by index pair
+    // is ordering by the matched query keypoint and then the matched train one.
+    std::sort(matches.begin(), matches.end(), [](const DMatch& a, const DMatch& b)
+    {
+        if (a.queryIdx != b.queryIdx)
+            return a.queryIdx < b.queryIdx;
+        return a.trainIdx < b.trainIdx;
+    });
+
     // Load ORT reference outputs
     Mat refMatches = blobFromNPY(cvtest::findDataFile("dnn/lightglue_matches.npy"));
 
@@ -165,7 +206,7 @@ TEST(Features2d_ALIKED, not_available)
     EXPECT_THROW(ALIKED::create("dummy.onnx"), cv::Exception);
 }
 
-TEST(Features2d_LightGlueMatcher, not_available)
+TEST(Features2d_LightGlueMatcher_ALIKED, not_available)
 {
     EXPECT_THROW(LightGlueMatcher::create("dummy.onnx"), cv::Exception);
 }

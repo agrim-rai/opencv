@@ -7,6 +7,13 @@
 #include "../ie_ngraph.hpp"
 #include "layers_common.hpp"
 #include "../net_impl.hpp"
+#include "../op_cuda.hpp"
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/primitives/cast.hpp"
+#include "../cuda4dnn/primitives/reshape.hpp"
+#endif
+
+#include "../onnx/onnx_dtype_convert.hpp"
 
 namespace cv { namespace dnn {
 
@@ -19,13 +26,18 @@ namespace cv { namespace dnn {
 
 namespace
 {
-    // ONNX Cast float->int truncates toward zero; Mat::convertTo rounds. Truncate to match the spec.
     template<typename DT>
     inline void truncateToIntImpl(const Mat& src, Mat& dst)
     {
         const int n = (int)src.total() * src.channels();
         DT* d = dst.ptr<DT>();
-        if (src.depth() == CV_32F)
+        if (src.depth() == CV_16F)
+        {
+            const hfloat* s = src.ptr<hfloat>();
+            for (int i = 0; i < n; ++i)
+                d[i] = saturate_cast<DT>(std::trunc((float)s[i]));
+        }
+        else if (src.depth() == CV_32F)
         {
             const float* s = src.ptr<float>();
             for (int i = 0; i < n; ++i)
@@ -53,87 +65,6 @@ namespace
         }
     }
 
-    inline void castQuantized(const Mat& src, Mat& dst, int targetDepth)
-    {
-        if (targetDepth == CV_16F)
-        {
-            CV_Assert(dst.depth() == CV_32F);
-            if (src.depth() == CV_32F)
-            {
-                MatConstIterator_<float> sIt = src.begin<float>(), sEnd = src.end<float>();
-                MatIterator_<float> dIt = dst.begin<float>();
-                for (; sIt != sEnd; ++sIt, ++dIt)
-                {
-                    *dIt = (float)hfloat(*sIt);
-                }
-            }
-            else if (src.depth() == CV_64F)
-            {
-                MatConstIterator_<double> sIt = src.begin<double>(), sEnd = src.end<double>();
-                MatIterator_<float> dIt = dst.begin<float>();
-                for (; sIt != sEnd; ++sIt, ++dIt)
-                {
-                    float v = (float)*sIt;
-                    *dIt = (float)hfloat(v);
-                }
-            }
-            else
-            {
-                Mat src32; src.convertTo(src32, CV_32F);
-                MatConstIterator_<float> sIt = src32.begin<float>(), sEnd = src32.end<float>();
-                MatIterator_<float> dIt = dst.begin<float>();
-                for (; sIt != sEnd; ++sIt, ++dIt)
-                {
-                    *dIt = (float)hfloat(*sIt);
-                }
-            }
-            return;
-        }
-
-        if (targetDepth == CV_16BF)
-        {
-            const int ddepth = dst.depth();
-            if (!(ddepth == CV_16BF || ddepth == CV_16U))
-            {
-                CV_Error(Error::StsNotImplemented, "Unsupported destination depth for BF16 cast");
-            }
-
-            Mat dst_bits(dst.size(), CV_MAKETYPE(CV_16U, dst.channels()), dst.data, dst.step);
-
-            const Mat* src32p;
-            Mat src32;
-            if (src.depth() == CV_32F)
-                src32p = &src;
-            else
-            {
-                src.convertTo(src32, CV_32F);
-                src32p = &src32;
-            }
-
-            const int rows = src32p->rows;
-            const int cols_x_cn = src32p->cols * src32p->channels();
-            for (int r = 0; r < rows; ++r)
-            {
-                const float* in = src32p->ptr<float>(r);
-                ushort* out = dst_bits.ptr<ushort>(r);
-                for (int i = 0; i < cols_x_cn; ++i)
-                {
-                    // float32 -> bfloat16 with round-to-nearest-even (matches ONNX).
-                    Cv32suf u; u.f = in[i];
-                    const uint32_t x = u.u;
-                    if ((x & 0x7fffffffu) > 0x7f800000u)      // NaN: keep it NaN
-                        out[i] = (ushort)((x >> 16) | 0x0040u);
-                    else
-                    {
-                        const uint32_t bias = 0x7fffu + ((x >> 16) & 1u);
-                        out[i] = (ushort)((x + bias) >> 16);
-                    }
-                }
-            }
-            return;
-        }
-        src.convertTo(dst, dst.depth());
-    }
 }
 
 class Cast2LayerImpl CV_FINAL : public Cast2Layer
@@ -144,10 +75,13 @@ public:
         setParamsFrom(params);
         hasToParam = false;
         toCvDepth_ = -1;
+        toOnnxType_ = -1;
+        saturate_ = params.get<int>("saturate", 1) != 0;
         if (params.has("to"))
         {
             hasToParam = true;
-            toCvDepth_ = mapToCvDepth(params.get<int>("to"));
+            toOnnxType_ = params.get<int>("to");
+            toCvDepth_ = mapToCvDepth(toOnnxType_);
         }
         else if (params.has("outputType"))
         {
@@ -167,9 +101,71 @@ public:
 
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
+        // Exotic dtypes (FP8/FP4/INT4/UINT4) are handled on the CPU path only.
+        if (onnx_dtype::isExotic(toOnnxType_))
+            return backendId == DNN_BACKEND_OPENCV;
+#ifdef HAVE_CUDA
+        if (backendId == DNN_BACKEND_CUDA) {
+            Net::Impl* netimpl_ = getNetImpl(this);
+            if (!netimpl_ || inputs.size() != 1 || outputs.size() != 1)
+                return false;
+            // storage types, not toCvDepth_: resolveStorageDepth() may keep a half target as FP32
+            const int inType = netimpl_->argData(inputs[0]).type;
+            const int outType = netimpl_->argData(outputs[0]).type;
+            if (inType >= 0 && inType == outType)
+                return isCudaNodeType(inType);
+            // an intermediate arg has no type until the first forward; check only the known side(s)
+            auto castable = [](int t) { return t < 0 || t == CV_Bool || t == CV_32S || t == CV_64S || t == CV_32F; };
+            if (!castable(inType) || !castable(outType))
+                return false;
+            // the FP16 target stores float as half, which has no CastOp instantiation; an unknown type may be float
+            return netimpl_->preferableTarget != DNN_TARGET_CUDA_FP16 ||
+                   (inType >= 0 && outType >= 0 && inType != CV_32F && outType != CV_32F);
+        }
+#endif
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH;
     }
+
+#ifdef HAVE_CUDA
+    Ptr<BackendNode> initCUDA(void* context_,
+                              InputArrayOfArrays inputs_arr,
+                              InputArrayOfArrays outputs_arr) CV_OVERRIDE
+    {
+        auto context = reinterpret_cast<cuda4dnn::csl::CSLContext*>(context_);
+        const int inDepth = inputs_arr.depth(0);
+        const int outDepth = outputs_arr.depth(0);
+        if (inDepth == outDepth) {
+            if (inDepth == CV_Bool)
+                return make_cuda_node_bool<cuda4dnn::ReshapeOp>(std::move(context->stream));
+            return make_cuda_node_with_type<cuda4dnn::ReshapeOp>(preferableTarget, inputs_arr.type(0),
+                                                                 std::move(context->stream));
+        }
+        switch (inDepth)
+        {
+        case CV_Bool: return makeCastFrom<bool>(outDepth, std::move(context->stream));
+        case CV_32S: return makeCastFrom<int32_t>(outDepth, std::move(context->stream));
+        case CV_64S: return makeCastFrom<int64_t>(outDepth, std::move(context->stream));
+        case CV_32F: return makeCastFrom<float>(outDepth, std::move(context->stream));
+        }
+        CV_Error(Error::BadDepth, "Cast: unsupported input type on CUDA");
+        return Ptr<BackendNode>();
+    }
+
+    template <class TIn>
+    static Ptr<BackendNode> makeCastFrom(int outDepth, cuda4dnn::csl::Stream stream)
+    {
+        switch (outDepth)
+        {
+        case CV_Bool: return Ptr<BackendNode>(new cuda4dnn::CastOp<bool, TIn>(std::move(stream)));
+        case CV_32S: return Ptr<BackendNode>(new cuda4dnn::CastOp<int32_t, TIn>(std::move(stream)));
+        case CV_64S: return Ptr<BackendNode>(new cuda4dnn::CastOp<int64_t, TIn>(std::move(stream)));
+        case CV_32F: return Ptr<BackendNode>(new cuda4dnn::CastOp<float, TIn>(std::move(stream)));
+        }
+        CV_Error(Error::BadDepth, "Cast: unsupported output type on CUDA");
+        return Ptr<BackendNode>();
+    }
+#endif
 
     virtual bool getMemoryShapes(const std::vector<MatShape> &inputs,
                                 const int requiredOutputs,
@@ -179,6 +175,18 @@ public:
         CV_Check(inputs.size(), inputs.size() == 1 || inputs.size() == 2, "Cast expects 1 (Cast) or 2 (CastLike) inputs");
         outputs.assign(1, inputs[0]);
         return false;
+    }
+
+    // Half targets are stored as FP32 unless native FP16 is enabled; forward() still rounds.
+    int resolveStorageDepth(int targetDepth, bool exotic) const
+    {
+        if (!exotic && (targetDepth == CV_16F || targetDepth == CV_16BF))
+        {
+            Net::Impl* ni = getNetImpl(const_cast<Cast2LayerImpl*>(this));
+            if (ni && !ni->enableFP16)
+                return CV_32F;
+        }
+        return targetDepth;
     }
 
     virtual  void getTypes(const std::vector<MatType>& inputs,
@@ -216,9 +224,8 @@ public:
 
         const int in0Type = inputs[0];
         const int in0CN   = in0Type >= 0 ? CV_MAT_CN(in0Type) : 1;
-        int planDepth = targetDepth;
-        if (planDepth == CV_16F)   planDepth = CV_32F;
-        const int outType = CV_MAKETYPE(planDepth, in0CN);
+        const bool exotic = hasToParam && onnx_dtype::isExotic(toOnnxType_);
+        const int outType = CV_MAKETYPE(resolveStorageDepth(targetDepth, exotic), in0CN);
         outputs.assign(1, outType);
     }
 
@@ -226,6 +233,9 @@ public:
     bool forward_ocl(InputArrayOfArrays inputs_, OutputArrayOfArrays outputs_, OutputArrayOfArrays internals_)
     {
         std::vector<UMat> inputs, outputs;
+
+        if (hasToParam && onnx_dtype::isExotic(toOnnxType_))
+            return false; // exotic conversions run on the CPU path
 
         inputs_.getUMatVector(inputs);
         outputs_.getUMatVector(outputs);
@@ -305,46 +315,42 @@ public:
         }
         CV_CheckGE(runtimeTargetDepth, 0, "Cast: failed to resolve target data type at runtime");
 
-        int plannedDDepth = (runtimeTargetDepth == CV_16F) ? CV_32F : runtimeTargetDepth;
-        if (dst0.depth() != plannedDDepth)
-            dst0.create(dst0.size(), CV_MAKETYPE(plannedDDepth, src0.channels()));
+        const bool exotic = hasToParam && onnx_dtype::isExotic(toOnnxType_);
+        const int storeDepth = resolveStorageDepth(runtimeTargetDepth, exotic);
+        if (dst0.depth() != storeDepth)
+            dst0.create(dst0.size(), CV_MAKETYPE(storeDepth, src0.channels()));
 
         Mat src = src0;
         Mat dst = dst0;
 
+        if (exotic)
+        {
+            castExotic(src, dst, toOnnxType_, saturate_);
+            return;
+        }
+
+        // Cast to half yields half-representable values even when FP32 carries them.
+        if (storeDepth != runtimeTargetDepth &&
+            (runtimeTargetDepth == CV_16F || runtimeTargetDepth == CV_16BF))
+        {
+            Mat half;
+            src.convertTo(half, runtimeTargetDepth);
+            half.convertTo(dst, storeDepth);
+            return;
+        }
+
         const int sdepth = src.depth();
         const int ddepth = dst.depth();
 
-        if (sdepth == runtimeTargetDepth && !(runtimeTargetDepth == CV_16F && ddepth == CV_32F))
+        if (sdepth == ddepth && sdepth == runtimeTargetDepth)
         {
             src0.copyTo(dst0);
             return;
         }
 
-        if (runtimeTargetDepth == CV_16BF && (ddepth == CV_16BF || ddepth == CV_16U))
+        if ((sdepth == CV_16F || sdepth == CV_32F || sdepth == CV_64F) && CV_IS_INT_TYPE(ddepth))
         {
-            castQuantized(src, dst, CV_16BF);
-        }
-        else if (sdepth == CV_16BF)
-        {
-            src.convertTo(dst, ddepth);
-        }
-        else if (runtimeTargetDepth == CV_16F && ddepth == CV_32F)
-        {
-            castQuantized(src, dst, CV_16F);
-        }
-        else if (runtimeTargetDepth == CV_64F && ddepth != CV_64F)
-        {
-            if (ddepth == CV_16U || ddepth == CV_16BF)
-            {
-                castQuantized(src, dst, CV_16BF);
-            }
-            else
-                src.convertTo(dst, ddepth);
-        }
-        else if ((sdepth == CV_32F || sdepth == CV_64F) && CV_IS_INT_TYPE(ddepth))
-        {
-            truncateFloatToInt(src, dst);
+            truncateFloatToInt(src, dst);       // ONNX float->int truncates toward zero
         }
         else
         {
@@ -374,9 +380,67 @@ public:
     }
 #endif  // HAVE_DNN_NGRAPH
 
+    void castExotic(const Mat& src, Mat& dst, int onnxType, bool saturate)
+    {
+        const int sdepth = src.depth();
+        const float*  sf = (sdepth == CV_32F) ? src.ptr<float>()  : nullptr;
+        const hfloat* sh = (sdepth == CV_16F) ? src.ptr<hfloat>() : nullptr;
+        Mat src32;
+        if (!sf && !sh) { src.convertTo(src32, CV_32F); sf = src32.ptr<float>(); }
+        const size_t total = src.total() * src.channels();
+        #define CV_DNN_SRC_F(i) (sf ? sf[i] : (float)sh[i])
+
+        if (onnx_dtype::isFp8(onnxType))
+        {
+            const onnx_dtype::Fp8Fmt fmt = onnx_dtype::fp8FmtFor(onnxType);
+            const int ddepth = dst.depth();
+            if (ddepth == CV_8F_E4M3FN || ddepth == CV_8F_E4M3FNUZ)
+            {
+                // Native depth: store the raw FP8 byte.
+                uchar* d = dst.ptr<uchar>();
+                for (size_t i = 0; i < total; i++)
+                    d[i] = onnx_dtype::f32ToFp8(CV_DNN_SRC_F(i), fmt, saturate);
+            }
+            else
+            {
+                // E5M2/E5M2FNUZ have no native depth: round onto the FP8 grid, keep CV_16F.
+                hfloat* d = dst.ptr<hfloat>();
+                for (size_t i = 0; i < total; i++)
+                    d[i] = hfloat(onnx_dtype::fp8ToF32(onnx_dtype::f32ToFp8(CV_DNN_SRC_F(i), fmt, saturate), fmt));
+            }
+        }
+        else if (onnxType == onnx_dtype::ONNX_FLOAT8E8M0)
+        {
+            float* d = dst.ptr<float>();   // E8M0 range exceeds FP16, stays CV_32F
+            for (size_t i = 0; i < total; i++)
+                d[i] = onnx_dtype::e8m0ToF32(onnx_dtype::f32ToE8M0(CV_DNN_SRC_F(i)));
+        }
+        else if (onnxType == onnx_dtype::ONNX_FLOAT4E2M1)
+        {
+            hfloat* d = dst.ptr<hfloat>();
+            for (size_t i = 0; i < total; i++)
+                d[i] = hfloat(onnx_dtype::fp4ToF32(onnx_dtype::f32ToFp4(CV_DNN_SRC_F(i))));
+        }
+        else if (onnx_dtype::isInt4(onnxType))
+        {
+            schar* d = dst.ptr<schar>();
+            for (size_t i = 0; i < total; i++)
+                d[i] = onnx_dtype::f32ToInt4(CV_DNN_SRC_F(i));
+        }
+        else // UINT4
+        {
+            uchar* d = dst.ptr<uchar>();
+            for (size_t i = 0; i < total; i++)
+                d[i] = onnx_dtype::f32ToUint4(CV_DNN_SRC_F(i));
+        }
+        #undef CV_DNN_SRC_F
+    }
+
 private:
     bool hasToParam = false;
     int  toCvDepth_ = -1;
+    int  toOnnxType_ = -1;
+    bool saturate_ = true;
 
     // ONNX TensorProto::DataType values (see opencv-onnx.proto); the 'to'
     // attribute stores the raw ONNX value. Fixed by the ONNX specification,
@@ -398,6 +462,11 @@ private:
 
     static int mapToCvDepth(int v)
     {
+        if (v == onnx_dtype::ONNX_FLOAT8E8M0) return CV_32F;                  // range exceeds FP16
+        if (onnx_dtype::isFp8Native(v)) return onnx_dtype::fp8NativeDepth(v); // E4M3FN/E4M3FNUZ
+        if (onnx_dtype::isExoticFloat(v)) return CV_16F;                     // E5M2/FP4
+        if (onnx_dtype::isInt4(v))        return CV_8S;
+        if (onnx_dtype::isUint4(v))       return CV_8U;
         switch (v)
         {
             case ONNX_DT_FLOAT:    return CV_32F;

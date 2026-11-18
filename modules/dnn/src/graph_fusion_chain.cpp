@@ -1,0 +1,546 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+// Copyright (C) 2026, BigVision LLC, all rights reserved.
+// Third party copyrights are property of their respective owners.
+
+#include "precomp.hpp"
+#include "net_impl.hpp"
+#include "adjacency_graph.hpp"
+
+namespace cv { namespace dnn {
+CV__DNN_INLINE_NS_BEGIN
+
+using std::vector;
+
+namespace {
+
+void firstConsumerOf(const vector<Ptr<LayerInfo> >& prog, int nargs,
+                     vector<int>& firstConsumer)
+{
+    firstConsumer.assign((size_t)nargs, -1);
+    for (size_t j = 0; j < prog.size(); j++) {
+        if (!prog[j]) continue;
+        for (Arg in : prog[j]->inputs) {
+            if (in.idx > 0 && in.idx < nargs && firstConsumer[in.idx] < 0)
+                firstConsumer[in.idx] = (int)j;
+        }
+    }
+}
+
+void producerOf(const vector<Ptr<LayerInfo> >& prog, int nargs, vector<int>& producer)
+{
+    producer.assign((size_t)nargs, -1);
+    for (size_t j = 0; j < prog.size(); j++) {
+        if (!prog[j]) continue;
+        for (Arg out : prog[j]->outputs) {
+            if (out.idx > 0 && out.idx < nargs)
+                producer[out.idx] = (int)j;
+        }
+    }
+}
+
+class ChainFuser
+{
+public:
+    ChainFuser(Net::Impl& net, const Ptr<Graph>& graph, const vector<int>& usecounts,
+               bool transformLayoutOnly)
+        : net_(net), graph_(graph), usecounts_(usecounts),
+          transformLayoutOnly_(transformLayoutOnly)
+    {
+        CV_Assert((int)usecounts_.size() == (int)net_.args.size());
+        claimed_.assign(prog().size(), false);
+        const int inputNode = arena_.internNode(FusionEltwiseOp::INPUT, {});
+        CV_Assert(inputNode == 0);
+    }
+    ChainFuser(const ChainFuser&) = delete;
+    ChainFuser& operator=(const ChainFuser&) = delete;
+
+    bool fuse()
+    {
+        collectChains();
+        if (chains_.empty())
+            return false;
+        freezeArena();
+        fuseLongestChains();
+        if (nfused_ == 0)
+            return false;
+        dropAbsorbedLayers();
+        return true;
+    }
+
+private:
+    //! A per-channel constant the chain carries. Its slot id is the index here, and the
+    //! arena interns that id, so slots are only ever appended or trimmed off the end.
+    struct ConstSlot
+    {
+        Mat   buf;
+        Arg   arg;            //!< default when the layer owns the data
+        uchar perChannel = 0; //!< 1 varies along the channel axis, 0 along the last
+    };
+
+    struct ChainCandidate
+    {
+        vector<int> layerIdx;
+        vector<int> rootAfterStep;
+        vector<ConstSlot> constSlots;
+        //! First step's kernel; a chain that lands at one step runs it instead of the DAG.
+        FusionKernel singleStepKernel;
+        //! Live tensors the steps read, in the order their slots were handed out.
+        vector<Arg> tensorArgs;
+    };
+
+    const vector<Ptr<LayerInfo> >& prog() const { return graph_->prog(); }
+
+    bool isFusableConstArg(Arg a, bool& isScalar, float& scalarVal) const
+    {
+        if (!net_.isConstArg(a))
+            return false;
+        Mat t = net_.argTensor(a);
+        if (t.total() == 1) {
+            if (t.type() == CV_32F) { isScalar = true; scalarVal = t.ptr<float>()[0]; return true; }
+            if (t.type() == CV_64F) { isScalar = true; scalarVal = (float)t.ptr<double>()[0]; return true; }
+            return false;
+        }
+        if (t.type() != CV_32F)
+            return false;
+        int nonUnit = 0;
+        for (int d = 0; d < t.dims; d++)
+            if (t.size[d] != 1) nonUnit++;
+        if (nonUnit != 1)
+            return false;
+        isScalar = false;
+        return true;
+    }
+
+    //! [C,1,1] / [1,C,1,1] lies on the channel axis only when @p flow is 4D.
+    uchar onChannelAxis(Arg constArg, Arg flow) const
+    {
+        Mat t = net_.argTensor(constArg);
+        int d = t.dims;
+        if (!(d == 3 || (d == 4 && t.size[0] == 1)) || t.size[d-2] != 1 || t.size[d-1] != 1)
+            return 0;
+        return isRank4(flow) ? 1 : 0;
+    }
+
+    //! Intermediates have no shape at fusion time, so the rank is taken from the declared shape
+    //! reached through ops that keep their input's rank; anything else counts as unknown.
+    bool isRank4(Arg a) const
+    {
+        for (int last = (int)prog().size();;) {
+            int dims = net_.argData(a).shape.dims;
+            if (dims > 0)
+                return dims == 4;
+            int p = a.idx > 0 && a.idx < (int)producerOf_.size() ? producerOf_[a.idx] : -1;
+            if (p < 0 || p >= last)
+                return false;
+            last = p;
+            const LayerInfo* l = prog()[p].get();
+            int next = -1;
+            if (dynamic_cast<const NaryEltwiseLayer*>(l)) {
+                // with constants of rank <= 4 only, the output keeps the other input's rank
+                for (size_t k = 0; k < l->inputs.size(); k++) {
+                    if (!net_.isConstArg(l->inputs[k]))
+                        next = next < 0 ? (int)k : INT_MAX;
+                    else if (net_.argTensor(l->inputs[k]).dims > 4)
+                        return false;
+                }
+            } else if (keepsRank(l)) {
+                next = 0;
+            }
+            if (next < 0 || next >= (int)l->inputs.size())
+                return false;
+            a = l->inputs[next];
+        }
+    }
+
+    static bool keepsRank(const LayerInfo* l)
+    {
+        return dynamic_cast<const Conv2Layer*>(l) || dynamic_cast<const ConvTranspose2Layer*>(l) ||
+               dynamic_cast<const Concat2Layer*>(l) || dynamic_cast<const MaxPoolLayer*>(l) ||
+               dynamic_cast<const AveragePoolLayer*>(l) || dynamic_cast<const LpPoolLayer*>(l) ||
+               dynamic_cast<const PoolingLayer*>(l) || dynamic_cast<const BatchNorm2Layer*>(l) ||
+               dynamic_cast<const ActivationLayer*>(l);
+    }
+
+    //! Releases the slots a refused step claimed, so the next step's ids start where it did.
+    static void dropSlotsAfter(ChainCandidate& c, size_t keepBufs, size_t keepTensors)
+    {
+        c.constSlots.resize(keepBufs);
+        c.tensorArgs.resize(keepTensors);
+    }
+
+    //! The slot @p a occupies in the chain's live-tensor list, adding it if new.
+    static int tensorSlotFor(Arg a, ChainCandidate& c)
+    {
+        for (size_t k = 0; k < c.tensorArgs.size(); k++) {
+            if (c.tensorArgs[k].idx == a.idx)
+                return (int)k;
+        }
+        c.tensorArgs.push_back(a);
+        return (int)c.tensorArgs.size() - 1;
+    }
+
+    //! Producer must precede @p anchor and the arg must not be a graph output. No type check:
+    //! an intermediate's ArgData is filled only at run time, so a gate here rejects them all.
+    //! The TransformLayout pass also takes a graph input (no producer), e.g. a skip connection.
+    bool isFusableTensorArg(Arg a, size_t anchor) const
+    {
+        if (a.idx <= 0 || a.idx >= (int)producerOf_.size())
+            return false;
+        const int prod = producerOf_[a.idx];
+        if ((prod < 0 && !transformLayoutOnly_) || prod >= (int)anchor)
+            return false;
+        return externalArgs_.find(a.idx) == externalArgs_.end();
+    }
+
+    //! The slot @p a occupies in the chain's per-channel buffer list, adding it if new.
+    int bufferSlotFor(Arg a, uchar perChannel, ChainCandidate& c) const
+    {
+        // Owned buffers park Arg() in the table, so a real input must never match one.
+        CV_DbgAssert(a.idx != 0);
+        for (size_t k = 0; k < c.constSlots.size(); k++) {
+            if (c.constSlots[k].arg.idx == a.idx && c.constSlots[k].perChannel == perChannel)
+                return (int)k;
+        }
+        c.constSlots.push_back({net_.argTensor(a), a, perChannel});
+        return (int)c.constSlots.size() - 1;
+    }
+
+    //! Per-channel data the layer folded into its members has no Arg, so it is slotted here
+    //! and its ids join the ones readConstOperand() took from the layer's inputs.
+    static bool addOwnedBuffers(const FusionOps* ops, Layer* l, ChainCandidate& c,
+                                ConstOperand& out)
+    {
+        if (!ops->ownedBuffers)
+            return true;
+        std::vector<Mat> owned;
+        if (!ops->ownedBuffers(l, owned))
+            return false;
+        if (out.count + (int)owned.size() > ConstOperand::MAX_CONSTS)
+            return false;
+        for (const Mat& buf : owned) {
+            c.constSlots.push_back({buf, Arg(), 1});
+            out.consts[out.count++].bufferId = (int)c.constSlots.size() - 1;
+        }
+        return true;
+    }
+
+    bool readConstOperand(const Ptr<LayerInfo>& L, Arg cur, ChainCandidate& c,
+                          ConstOperand& out, size_t anchor, bool acceptsTensors) const
+    {
+        vector<Arg> sideInputs;
+        for (Arg in : L->inputs) {
+            if (in.idx == cur.idx || in.idx == 0)
+                continue;
+            sideInputs.push_back(in);
+        }
+        if (sideInputs.empty())
+            return true;
+        if (sideInputs.size() > (size_t)ConstOperand::MAX_CONSTS)
+            return false;
+
+        out.flowIsFirstInput = !L->inputs.empty() && L->inputs[0].idx == cur.idx;
+
+        for (size_t i = 0; i < sideInputs.size(); i++) {
+            bool isScalar = false;
+            float scalarVal = 0.f;
+            if (isFusableConstArg(sideInputs[i], isScalar, scalarVal)) {
+                if (isScalar)
+                    out.consts[i].value = scalarVal;
+                else
+                    out.consts[i].bufferId = bufferSlotFor(sideInputs[i],
+                                                           onChannelAxis(sideInputs[i], cur), c);
+                continue;
+            }
+            if (!acceptsTensors || !isFusableTensorArg(sideInputs[i], anchor))
+                return false;
+            out.consts[i].tensorId = tensorSlotFor(sideInputs[i], c);
+        }
+        out.count = (int)sideInputs.size();
+        return true;
+    }
+
+    void growChain(size_t anchor, bool acceptsTensors, ChainCandidate& c)
+    {
+        CV_Assert(!arenaPtr_);
+
+        int chainRoot = 0;
+        Arg curArg = prog()[anchor]->outputs[0];
+        int producer = (int)anchor;
+
+        while (curArg.idx > 0 && curArg.idx < (int)usecounts_.size() &&
+               usecounts_[curArg.idx] == 1) {
+            const int j = firstConsumer_[curArg.idx];
+            if (j <= producer || j >= (int)prog().size() || claimed_[j])
+                break;
+
+            const Ptr<LayerInfo>& L = prog()[j];
+            if (!L || L->outputs.size() != 1 || L->subgraphs())
+                break;
+            Layer* l = dynamic_cast<Layer*>(L.get());
+            if (!l)
+                break;
+
+            if (arena_.size() >= (size_t)FUSION_MAX_ARENA_NODES) {
+                CV_LOG_DEBUG(NULL, cv::format("[fusion] arena full (%d nodes), chain truncated",
+                                              (int)arena_.size()));
+                break;
+            }
+
+            const FusionOps* ops = fusionOpsFor(l);
+            if (!ops || !ops->unfold)
+                break;
+
+            const size_t savedBufs = c.constSlots.size();
+            const size_t savedTensors = c.tensorArgs.size();
+            ConstOperand side;
+            LayerMath r;
+            if (!readConstOperand(L, curArg, c, side, anchor, acceptsTensors) ||
+                !addOwnedBuffers(ops, l, c, side) ||
+                !ops->unfold(l, r, side)) {
+                dropSlotsAfter(c, savedBufs, savedTensors);
+                break;
+            }
+
+            if (r.nodeCount() == 0) {
+                // A kernel is the whole expression, so it can only be a chain's sole step.
+                // chainRoot stays the arena's INPUT node, which is what extract() returns.
+                if (!r.kernel.fn || !c.rootAfterStep.empty()) {
+                    dropSlotsAfter(c, savedBufs, savedTensors);
+                    break;
+                }
+                c.singleStepKernel = r.kernel;
+                c.rootAfterStep.push_back(chainRoot);
+                c.layerIdx.push_back(j);
+                break;
+            }
+
+            const int next = fusion::instantiate(arena_, chainRoot, r);
+            if (next < 0 || fusion::detail::markLive(arena_.graph(), next, reachScratch_) > FUSION_MAX_EXPR_NODES) {
+                dropSlotsAfter(c, savedBufs, savedTensors);
+                break;
+            }
+
+            CV_DbgAssert(next > chainRoot);
+            if (c.rootAfterStep.empty())
+                c.singleStepKernel = r.kernel;
+            chainRoot = next;
+            c.rootAfterStep.push_back(next);
+            c.layerIdx.push_back(j);
+            curArg = L->outputs[0];
+            producer = j;
+        }
+    }
+
+    void collectChains()
+    {
+        const int nargs = (int)net_.args.size();
+        firstConsumerOf(prog(), nargs, firstConsumer_);
+        producerOf(prog(), nargs, producerOf_);
+        for (Arg out : graph_->outputs())
+            externalArgs_.insert(out.idx);
+
+        for (size_t i = 0; i < prog().size(); i++) {
+            const Ptr<LayerInfo>& L = prog()[i];
+            if (!L || claimed_[i])
+                continue;
+            if (L->outputs.size() != 1 || L->subgraphs())
+                continue;
+            Layer* anchor = dynamic_cast<Layer*>(L.get());
+            if (!anchor)
+                continue;
+            // A layer that cannot take anything on is no use as the head of a chain.
+            const FusionOps* anchorOps = fusionOpsFor(anchor);
+            if (!anchorOps || !anchorOps->absorb)
+                continue;
+            // Conv also takes tensor operands, but it was already offered its chains before
+            // the snapshot; after useBlockLayout() only the new TransformLayout nodes are.
+            if (transformLayoutOnly_ && !dynamic_cast<TransformLayoutLayer*>(anchor))
+                continue;
+
+            ChainCandidate c;
+            c.layerIdx.push_back((int)i);
+            growChain(i, anchorOps->acceptsTensorOperands, c);
+
+            if (c.rootAfterStep.empty())
+                continue;
+            for (int n : c.layerIdx)
+                claimed_[n] = true;
+            chains_.push_back(c);
+        }
+    }
+
+    //! Carries a kernel when there is no expression. The lone INPUT node is an identity,
+    //! so this is only ever built with a kernel attached.
+    void freezeArena()
+    {
+        arenaPtr_ = arena_.sharedGraph();
+    }
+
+    void fuseLongestChains()
+    {
+        dropped_.assign(prog().size(), false);
+
+        for (ChainCandidate& c : chains_) {
+            const Ptr<LayerInfo>& anchorInfo = prog()[c.layerIdx[0]];
+            Layer* sink = dynamic_cast<Layer*>(anchorInfo.get());
+            if (!sink)
+                continue;
+
+            const FusionOps* sinkOps = fusionOpsFor(sink);
+            if (!sinkOps || !sinkOps->absorb)
+                continue;
+
+            vector<Mat> constBufs;
+            vector<uchar> constBufPerChannel;
+            constBufs.reserve(c.constSlots.size());
+            constBufPerChannel.reserve(c.constSlots.size());
+            for (const ConstSlot& s : c.constSlots) {
+                constBufs.push_back(s.buf);
+                constBufPerChannel.push_back(s.perChannel);
+            }
+
+            size_t accepted = 0;
+            Ptr<AdjacencyGraph> expr;
+            for (size_t n = c.rootAfterStep.size(); n >= 1; n--) {
+                expr = fusion::extract(*arenaPtr_, c.rootAfterStep[n - 1],
+                                       constBufs, constBufPerChannel, c.tensorArgs);
+                if (!expr)
+                    continue;
+                if (n == 1)
+                    expr->kernel = c.singleStepKernel;
+                if (sinkOps->absorb(sink, expr)) {
+                    accepted = n;
+                    break;
+                }
+            }
+            if (accepted == 0) {
+                CV_LOG_DEBUG(NULL, cv::format("[fusion] refused %s (+%d)",
+                                              anchorInfo->type.c_str(),
+                                              (int)c.rootAfterStep.size()));
+                continue;
+            }
+
+            // Wired on here rather than in absorb(), which the retry loop above may call
+            // more than once per chain.
+            for (Arg t : expr->tensorArgs)
+                anchorInfo->inputs.push_back(t);
+
+            anchorInfo->outputs[0] = prog()[c.layerIdx[accepted]]->outputs[0];
+            for (size_t k = 1; k <= accepted; k++)
+                dropped_[c.layerIdx[k]] = true;
+            nfused_++;
+
+            CV_LOG_DEBUG(NULL, cv::format("[fusion] FUSED %s +%d of %d",
+                                          anchorInfo->type.c_str(),
+                                          (int)accepted, (int)c.rootAfterStep.size()));
+        }
+    }
+
+    void dropAbsorbedLayers()
+    {
+        const size_t nops = prog().size();
+        vector<Ptr<LayerInfo> > newprog;
+        newprog.reserve(nops);
+        for (size_t i = 0; i < nops; i++) {
+            if (!dropped_[i] && prog()[i])
+                newprog.push_back(prog()[i]);
+        }
+        graph_->setProg(newprog);
+
+        CV_LOG_DEBUG(NULL, cv::format("fuseChains: fused %d chain(s) in graph '%s', arena %d nodes",
+                                      nfused_, graph_->name().c_str(), (int)arenaPtr_->size()));
+    }
+
+    Net::Impl& net_;
+    const Ptr<Graph>& graph_;
+    const vector<int>& usecounts_;
+    const bool transformLayoutOnly_;
+
+    AdjacencyGraphBuilder arena_;
+    Ptr<AdjacencyGraph>   arenaPtr_;
+    vector<int>        firstConsumer_, producerOf_;
+    std::set<int>      externalArgs_;
+    vector<bool>       claimed_, dropped_;
+    vector<ChainCandidate>  chains_;
+    vector<char>       reachScratch_;
+    int nfused_ = 0;
+};
+
+bool fuseChainsInGraph(Net::Impl& net, const Ptr<Graph>& graph,
+                       const vector<int>& usecounts, bool transformLayoutOnly)
+{
+    if (!graph)
+        return false;
+
+    bool subFused = false;
+    for (const Ptr<LayerInfo>& layer : graph->prog()) {
+        if (!layer) continue;
+        if (vector<Ptr<Graph> >* subs = layer->subgraphs()) {
+            for (Ptr<Graph>& g : *subs) {
+                if (fuseChainsInGraph(net, g, usecounts, transformLayoutOnly))
+                    subFused = true;
+            }
+        }
+    }
+
+    vector<int> recounted;
+    if (subFused)
+        net.useCounts(recounted);
+
+    ChainFuser fuser(net, graph, subFused ? recounted : usecounts, transformLayoutOnly);
+    const bool fusedHere = fuser.fuse();
+    return fusedHere || subFused;
+}
+
+} // namespace
+
+void Net::Impl::fuseChains()
+{
+    if (!mainGraph)
+        return;
+
+    // First: it deletes a layer, and if the chain pass absorbed the BatchNorm backwards into
+    // the preceding conv it would find nothing left.
+    fuseBN();
+
+    // Order is load-bearing: each pass matches shapes the one before it leaves.
+    fuseAttention();
+    fuseMatMulConstBToGemm();
+    fuseSharedInputGemm();
+    fuseReshapeTranspose();
+    fuseTransposeMatMul();
+    fuseScaleSoftmax();
+
+    // A sink runs the math it absorbs in its own CPU kernel. setPreferableTarget resolves
+    // only CPU and CUDA while mainGraph is set, so nothing reaches here on OpenCL today.
+    if (!IS_DNN_OPENCL_TARGET(preferableTarget)) {
+        // Only a one-step chain carries the layer's kernel, so absorbing a step can
+        // expose a fusable next one.
+        vector<int> usecounts;
+        for (int iter = 0; iter < 10; iter++) {
+            useCounts(usecounts);
+            if (!fuseChainsInGraph(*this, mainGraph, usecounts, false))
+                break;
+        }
+    }
+
+    // Leaves a whole layer behind rather than handing math to a sink, so unlike the
+    // chain pass it is not restricted to the CPU path.
+    fuseInstanceNormAffine();
+}
+
+void Net::Impl::fuseTransformLayoutChains()
+{
+    // Chain pass only: the passes above already ran before the snapshot. TransformLayout
+    // absorbs a single Add, so there is no next step to expose and one round is enough.
+    if (!mainGraph || IS_DNN_OPENCL_TARGET(preferableTarget))
+        return;
+    vector<int> usecounts;
+    useCounts(usecounts);
+    fuseChainsInGraph(*this, mainGraph, usecounts, true);
+}
+
+CV__DNN_INLINE_NS_END
+}} // namespace cv::dnn

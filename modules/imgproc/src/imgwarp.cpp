@@ -48,6 +48,9 @@
 // */
 
 #include "precomp.hpp"
+#if CV_AVX512_SKX
+#define CV__SIMD_FORCE_WIDTH 256
+#endif
 #include "opencl_kernels_imgproc.hpp"
 #include "hal_replacement.hpp"
 #include <opencv2/core/utils/configuration.private.hpp>
@@ -851,7 +854,24 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
                         int sx = XY[dx*2]+(isRelative ? (_offset.x+dx) : 0), sy = XY[dx*2+1]+off_y;
                         const AT* w = wtab + FXY[dx]*4;
                         const T* S = S0 + sy*sstep + sx*cn;
-                        for(int k = 0; k < cn; k++ )
+                        int k = 0;
+#if CV_SIMD || CV_SIMD_SCALABLE
+                        if constexpr (std::is_same_v<T, float> && std::is_same_v<AT, float>)
+                        {
+                            const int lanes = VTraits<v_float32>::vlanes();
+                            const v_float32 w0 = vx_setall_f32(w[0]), w1 = vx_setall_f32(w[1]);
+                            const v_float32 w2 = vx_setall_f32(w[2]), w3 = vx_setall_f32(w[3]);
+                            for (; k <= cn - lanes; k += lanes)
+                            {
+                                v_float32 sum = v_add(v_mul(vx_load(S + k), w0),
+                                                     v_mul(vx_load(S + cn + k), w1));
+                                sum = v_add(sum, v_mul(vx_load(S + sstep + k), w2));
+                                sum = v_add(sum, v_mul(vx_load(S + sstep + cn + k), w3));
+                                vx_store(D + k, sum);
+                            }
+                        }
+#endif
+                        for(; k < cn; k++ )
                         {
                             WT t0 = S[k]*w[0] + S[k+cn]*w[1] + S[sstep+k]*w[2] + S[sstep+k+cn]*w[3];
                             D[k] = castOp(t0);
@@ -1414,13 +1434,20 @@ void cv::remap( InputArray _src, OutputArray _dst,
     if (hint == cv::ALGO_HINT_DEFAULT)
         hint = cv::getDefaultAlgorithmHint();
 
+    CV_CheckLE(_src.dims(), 2, "Only 2D images are supported, N-D input (e.g. a batch of images) must be processed image by image");
+
+    CV_Assert( !_src.empty() );
     CV_Assert( !_map1.empty() );
+    Mat map1 = _map1.getMat(), map2 = _map2.getMat();
+    CV_Assert( (map1.type() == CV_16SC2 && (map2.empty() || map2.type() == CV_16UC1 || map2.type() == CV_16SC1)) ||
+               (map1.type() == CV_32FC1 && map2.type() == CV_32FC1) ||
+               (map1.type() == CV_32FC2 && map2.empty()) );
     CV_Assert( _map2.empty() || (_map2.size() == _map1.size()));
 
     CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat(),
                ocl_remap(_src, _dst, _map1, _map2, interpolation, borderType, borderValue))
 
-    Mat src = _src.getMat(), map1 = _map1.getMat(), map2 = _map2.getMat();
+    Mat src = _src.getMat();
     _dst.create( map1.size(), src.type() );
     Mat dst = _dst.getMat();
 
@@ -1607,7 +1634,7 @@ void cv::remap( InputArray _src, OutputArray _dst,
         }
     };
 
-    static RemapFunc lanczos4_tab[2][8] =
+    static RemapFunc lanczos4_tab[2][CV_DEPTH_MAX] =
     {
         {
             remapLanczos4<FixedPtCast<int, uchar, INTER_REMAP_COEF_BITS>, short, INTER_REMAP_COEF_SCALE, false>, 0,
@@ -1674,7 +1701,14 @@ void cv::convertMaps( InputArray _map1, InputArray _map2,
     CV_INSTRUMENT_REGION();
 
     Mat map1 = _map1.getMat(), map2 = _map2.getMat(), dstmap1, dstmap2;
+    if( map1.empty() )
+    {
+        _dstmap1.release();
+        _dstmap2.release();
+        return;
+    }
     Size size = map1.size();
+    CV_Assert( map2.empty() || map1.size() == map2.size() );
     const Mat *m1 = &map1, *m2 = &map2;
     int m1type = m1->type(), m2type = m2->type();
 
@@ -1743,12 +1777,12 @@ void cv::convertMaps( InputArray _map1, InputArray _map2,
     for( y = 0; y < size.height; y++ )
     {
         const float* src1f = m1->ptr<float>(y);
-        const float* src2f = m2->ptr<float>(y);
+        const float* src2f = !m2->empty() ? m2->ptr<float>(y) : nullptr;
         const short* src1 = (const short*)src1f;
         const ushort* src2 = (const ushort*)src2f;
 
         float* dst1f = dstmap1.ptr<float>(y);
-        float* dst2f = dstmap2.ptr<float>(y);
+        float* dst2f = !dstmap2.empty() ? dstmap2.ptr<float>(y) : nullptr;
         short* dst1 = (short*)dst1f;
         ushort* dst2 = (ushort*)dst2f;
         x = 0;
@@ -2015,8 +2049,8 @@ public:
                 for( y1 = 0; y1 < bh; y1++ )
                 {
                     short* xy = XY + y1*bw*2;
-                    int X0 = saturate_cast<int>((M[1]*(y + y1) + M[2])*AB_SCALE) + round_delta;
-                    int Y0 = saturate_cast<int>((M[4]*(y + y1) + M[5])*AB_SCALE) + round_delta;
+                    int X0 = saturate_cast<int>((M[1]*(y + y1) + M[2])*AB_SCALE + round_delta);
+                    int Y0 = saturate_cast<int>((M[4]*(y + y1) + M[5])*AB_SCALE + round_delta);
 
                     if( interpolation == INTER_NEAREST )
                         hal::warpAffineBlocklineNN(adelta + x, bdelta + x, xy, X0, Y0, bw);
@@ -2457,6 +2491,8 @@ void cv::warpAffine( InputArray _src, OutputArray _dst,
 
     if (hint == cv::ALGO_HINT_DEFAULT)
         hint = cv::getDefaultAlgorithmHint();
+
+    CV_CheckLE(_src.dims(), 2, "Only 2D images are supported, N-D input (e.g. a batch of images) must be processed image by image");
 
     int interpolation = flags & INTER_MAX;
     CV_Assert( _src.channels() <= 4 || (interpolation != INTER_LANCZOS4 &&
@@ -3019,6 +3055,8 @@ void cv::warpPerspective( InputArray _src, OutputArray _dst, InputArray _M0,
     if (hint == cv::ALGO_HINT_DEFAULT)
         hint = cv::getDefaultAlgorithmHint();
 
+    CV_CheckLE(_src.dims(), 2, "Only 2D images are supported, N-D input (e.g. a batch of images) must be processed image by image");
+
     CV_Assert( _src.total() > 0 );
 
     int interpolation = flags & INTER_MAX;
@@ -3065,6 +3103,9 @@ PkLab.net 2018 based on cv::linearPolar from OpenCV by J.L. Blanco, Apr 2009
 void cv::warpPolar(InputArray _src, OutputArray _dst, Size dsize,
                    Point2f center, double maxRadius, int flags)
 {
+    CV_Assert( !_src.empty() );
+    CV_Assert( std::isfinite(maxRadius) && maxRadius > 0);
+
     // if dest size is empty given than calculate using proportional setting
     // thus we calculate needed angles to keep same area as bounding circle
     if ((dsize.width <= 0) && (dsize.height <= 0))

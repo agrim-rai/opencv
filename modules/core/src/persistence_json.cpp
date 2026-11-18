@@ -95,7 +95,7 @@ public:
 
     void write(const char* key, const char* str, bool quote)
     {
-        char buf[CV_FS_MAX_LEN*4+16];
+        char buf[CV_FS_MAX_LEN*6+16];
         char* data = (char*)str;
         int i, len;
 
@@ -114,18 +114,27 @@ public:
             for( i = 0; i < len; i++ )
             {
                 char c = str[i];
+                const unsigned char byte = static_cast<unsigned char>(c);
 
                 switch ( c )
                 {
                 case '\\':
-                case '\"':
-                case '\'': { *data++ = '\\'; *data++ = c;   break; }
+                case '\"': { *data++ = '\\'; *data++ = c;   break; }
                 case '\n': { *data++ = '\\'; *data++ = 'n'; break; }
                 case '\r': { *data++ = '\\'; *data++ = 'r'; break; }
                 case '\t': { *data++ = '\\'; *data++ = 't'; break; }
                 case '\b': { *data++ = '\\'; *data++ = 'b'; break; }
                 case '\f': { *data++ = '\\'; *data++ = 'f'; break; }
-                default  : { *data++ = c; }
+                default  :
+                    if (byte < 0x20)
+                    {
+                        static const char hex[] = "0123456789abcdef";
+                        *data++ = '\\'; *data++ = 'u'; *data++ = '0'; *data++ = '0';
+                        *data++ = hex[byte >> 4]; *data++ = hex[byte & 0xf];
+                    }
+                    else
+                        *data++ = c;
+                    break;
                 }
             }
 
@@ -410,6 +419,65 @@ public:
         return ptr;
     }
 
+    uint32_t parseUnicodeEscape(char*& ptr)
+    {
+        uint32_t codepoint = 0;
+        for (int k = 0; k < 4; k++, ptr++) {
+            CV_PERSISTENCE_CHECK_END_OF_BUFFER_BUG_CPP();
+            char hex = *ptr;
+            uint32_t digit = 0;
+            if      (hex >= '0' && hex <= '9') digit = (uint32_t)(hex - '0');
+            else if (hex >= 'a' && hex <= 'f') digit = (uint32_t)(hex - 'a') + 10u;
+            else if (hex >= 'A' && hex <= 'F') digit = (uint32_t)(hex - 'A') + 10u;
+            else CV_PARSE_ERROR_CPP("invalid \\uXXXX escape sequence");
+            codepoint = (codepoint << 4) | digit;
+        }
+        return codepoint;
+    }
+
+    static void appendUtf8(std::string& out, uint32_t codepoint)
+    {
+        if (codepoint < 0x80) {
+            out += (char)codepoint;
+        } else if (codepoint < 0x800) {
+            out += (char)(0xC0 | (codepoint >> 6));
+            out += (char)(0x80 | (codepoint & 0x3F));
+        } else if (codepoint < 0x10000) {
+            out += (char)(0xE0 | (codepoint >> 12));
+            out += (char)(0x80 | ((codepoint >> 6) & 0x3F));
+            out += (char)(0x80 | (codepoint & 0x3F));
+        } else {
+            out += (char)(0xF0 | (codepoint >> 18));
+            out += (char)(0x80 | ((codepoint >> 12) & 0x3F));
+            out += (char)(0x80 | ((codepoint >> 6) & 0x3F));
+            out += (char)(0x80 | (codepoint & 0x3F));
+        }
+    }
+
+    // A \uXXXX escape carries one UTF-16 code unit, so anything above the BMP arrives as a
+    // surrogate pair and has to be recombined here. Encoding the halves separately would
+    // emit three bytes each for code points that are not Unicode scalar values at all --
+    // CESU-8, which no UTF-8 reader accepts.
+    void parseUnicodeEscapeToUtf8(char*& ptr, std::string& out)
+    {
+        uint32_t codepoint = parseUnicodeEscape(ptr);
+        if (codepoint >= 0xD800 && codepoint <= 0xDBFF)
+        {
+            // ptr is just past the four hex digits; the low half must be its own escape.
+            // Short-circuits before ptr[1] when ptr[0] is the buffer's terminating NUL.
+            if (ptr[0] != '\\' || ptr[1] != 'u')
+                CV_PARSE_ERROR_CPP("high surrogate is not followed by a \\uXXXX low surrogate");
+            ptr += 2;
+            uint32_t low = parseUnicodeEscape(ptr);
+            if (low < 0xDC00 || low > 0xDFFF)
+                CV_PARSE_ERROR_CPP("high surrogate is not followed by a \\uXXXX low surrogate");
+            codepoint = 0x10000u + ((codepoint - 0xD800u) << 10) + (low - 0xDC00u);
+        }
+        else if (codepoint >= 0xDC00 && codepoint <= 0xDFFF)
+            CV_PARSE_ERROR_CPP("unpaired \\uXXXX low surrogate");
+        appendUtf8(out, codepoint);
+    }
+
     char* parseKey( char* ptr, FileNode& collection, FileNode& value_placeholder )
     {
         if (!ptr)
@@ -424,6 +492,11 @@ public:
             if (*ptr == '\\') { // skip the next character if current is back slash
                 ++ptr;
                 CV_PERSISTENCE_CHECK_END_OF_BUFFER_BUG_CPP();
+                if (*ptr == 'u') {
+                    ++ptr;
+                    parseUnicodeEscapeToUtf8(ptr, key_name);
+                    continue;
+                }
                 key_name += *ptr;
             } else if (*ptr != '"') {
                 // normal byte: append current, do NOT skip ahead first
@@ -528,29 +601,13 @@ public:
                             case 'b' : { buf[i++] = '\b'; break; }
                             case 'f' : { buf[i++] = '\f'; break; }
                             case 'u' : {
-                                if (i + 4 >= CV_FS_MAX_LEN)
-                                    CV_PARSE_ERROR_CPP("string is too long");
                                 ptr++;
-                                uint32_t codepoint = 0;
-                                for (int k = 0; k < 4; k++, ptr++) {
-                                    char hex = *ptr;
-                                    uint32_t digit = 0;
-                                    if      (hex >= '0' && hex <= '9') digit = (uint32_t)(hex - '0');
-                                    else if (hex >= 'a' && hex <= 'f') digit = (uint32_t)(hex - 'a') + 10u;
-                                    else if (hex >= 'A' && hex <= 'F') digit = (uint32_t)(hex - 'A') + 10u;
-                                    else CV_PARSE_ERROR_CPP("invalid \\uXXXX escape sequence");
-                                    codepoint = (codepoint << 4) | digit;
-                                }
-                                if (codepoint < 0x80) {
-                                    buf[i++] = (char)codepoint;
-                                } else if (codepoint < 0x800) {
-                                    buf[i++] = (char)(0xC0 | (codepoint >> 6));
-                                    buf[i++] = (char)(0x80 | (codepoint & 0x3F));
-                                } else {
-                                    buf[i++] = (char)(0xE0 | (codepoint >> 12));
-                                    buf[i++] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
-                                    buf[i++] = (char)(0x80 | (codepoint & 0x3F));
-                                }
+                                std::string utf8;
+                                parseUnicodeEscapeToUtf8(ptr, utf8);
+                                if (i + (int)utf8.size() >= CV_FS_MAX_LEN)
+                                    CV_PARSE_ERROR_CPP("string is too long");
+                                memcpy(buf + i, utf8.data(), utf8.size());
+                                i += (int)utf8.size();
                                 beg = ptr;
                                 continue;
                             }
@@ -627,7 +684,7 @@ public:
                 ptr++;
                 CV_PERSISTENCE_CHECK_END_OF_BUFFER_BUG_CPP();
             }
-            if (*ptr == '.' || *ptr == 'e')
+            if (*ptr == '.' || *ptr == 'e' || *ptr == 'E')
             {
                 double fval = fs->strtod( beg, &ptr );
                 CV_PERSISTENCE_CHECK_END_OF_BUFFER_BUG_CPP();
@@ -673,10 +730,13 @@ public:
         return ptr;
     }
 
-    char* parseSeq( char* ptr, FileNode& node )
+    char* parseSeq( char* ptr, FileNode& node, int depth = 0 )
     {
         if (!ptr)
             CV_PARSE_ERROR_CPP( "ptr is NULL" );
+
+        if( depth > CV_PERSISTENCE_MAX_DEPTH )
+            CV_PARSE_ERROR_CPP("Too many nested collections");
 
         if ( *ptr != '[' )
             CV_PARSE_ERROR_CPP( "'[' - left-brace of seq is missing" );
@@ -696,9 +756,9 @@ public:
                 FileNode child = fs->addNode(node, std::string(), FileNode::NONE );
 
                 if ( *ptr == '[' )
-                    ptr = parseSeq( ptr, child );
+                    ptr = parseSeq( ptr, child, depth + 1 );
                 else if ( *ptr == '{' )
-                    ptr = parseMap( ptr, child );
+                    ptr = parseMap( ptr, child, depth + 1 );
                 else
                     ptr = parseValue( ptr, child );
             }
@@ -727,10 +787,13 @@ public:
         return ptr;
     }
 
-    char* parseMap( char* ptr, FileNode& node )
+    char* parseMap( char* ptr, FileNode& node, int depth = 0 )
     {
         if (!ptr)
             CV_PARSE_ERROR_CPP("ptr is NULL");
+
+        if( depth > CV_PERSISTENCE_MAX_DEPTH )
+            CV_PARSE_ERROR_CPP("Too many nested collections");
 
         if ( *ptr != '{' )
             CV_PARSE_ERROR_CPP( "'{' - left-brace of map is missing" );
@@ -756,9 +819,9 @@ public:
                     break;
 
                 if ( *ptr == '[' )
-                    ptr = parseSeq( ptr, child );
+                    ptr = parseSeq( ptr, child, depth + 1 );
                 else if ( *ptr == '{' )
-                    ptr = parseMap( ptr, child );
+                    ptr = parseMap( ptr, child, depth + 1 );
                 else
                     ptr = parseValue( ptr, child );
             }

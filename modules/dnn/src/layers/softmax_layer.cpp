@@ -61,6 +61,7 @@ using namespace cv::dnn::ocl4dnn;
 
 #ifdef HAVE_CUDA
 #include "../cuda4dnn/primitives/softmax.hpp"
+#include "../cuda4dnn/primitives/softmax_kernel.hpp"
 using namespace cv::dnn::cuda4dnn;
 #endif
 
@@ -78,6 +79,7 @@ public:
         axisRaw = params.get<int>("axis", -1);
         logSoftMax = params.get<bool>("log_softmax", false);
         scale = params.get<float>("scale", 1.f);
+        coerced2d = params.get<bool>("coerced_2d", false);
         setParamsFrom(params);
     }
 
@@ -142,6 +144,11 @@ public:
         UMat& dstMat = outputs[0];
         int axis = normalize_axis(axisRaw, src.dims);
 
+        // The kernels below reduce over a single axis; the pre-opset-13 semantics reduce
+        // over the flattened dims [axis, rank) and are handled by the CPU path.
+        if (coerced2d && axis != src.dims - 1)
+            return false;
+
         if (softmaxOp.empty())
         {
             OCL4DNNSoftmaxConfig config;
@@ -169,13 +176,14 @@ public:
         if (!kmax.create("kernel_channel_max", ocl::dnn::softmax_oclsrc, buildOpts))
             return false;
 
+        // With LOG_SOFTMAX, subtract keeps x - max and sum adds up exp(x - max).
+        if (logSoftMax) buildOpts += " -DLOG_SOFTMAX ";
         if (!ksub.create("kernel_channel_subtract", ocl::dnn::softmax_oclsrc, buildOpts))
             return false;
 
         if (!ksum.create("kernel_channel_sum", ocl::dnn::softmax_oclsrc, buildOpts))
             return false;
 
-        if (logSoftMax) buildOpts += " -DLOG_SOFTMAX ";
         if (!kdiv.create("kernel_channel_div", ocl::dnn::softmax_oclsrc, buildOpts))
             return false;
 
@@ -232,6 +240,29 @@ public:
         Mat &dst = outputs[0];
         int axis = normalize_axis(axisRaw, src.dims);
 
+        // Softmax/LogSoftmax before opset 13 coerce the input to the 2D tensor
+        // [a_0 * ... * a_{axis-1}, a_axis * ... * a_{n-1}] and normalise over its second
+        // dimension, so the reduced range is the whole flattened tail and not just the
+        // one axis.  The tail is contiguous, so a 2D view of the blob expresses that.
+        if (coerced2d && axis != src.dims - 1)
+        {
+            MatShape s = shape(src);
+            std::vector<int> twoDims{static_cast<int>(total(s, 0, axis)),
+                                     static_cast<int>(total(s, axis))};
+            Mat src2d = src.reshape(1, twoDims);
+            Mat dst2d = dst.reshape(1, twoDims);
+
+            if (logSoftMax) {
+                CV_Assert(scale == 1.f);
+                logSoftmax(dst2d, src2d, 1);
+            } else if (scale != 1.f) {
+                softmax(dst2d, src2d, 1, scale);
+            } else {
+                softmax(dst2d, src2d, 1);
+            }
+            return;
+        }
+
         if (logSoftMax) {
             CV_Assert(scale == 1.f);
             logSoftmax(dst, src, axis);
@@ -245,15 +276,29 @@ public:
 #ifdef HAVE_CUDA
     Ptr<BackendNode> initCUDA(
         void *context_,
-        const std::vector<Ptr<BackendWrapper>>& inputs,
-        const std::vector<Ptr<BackendWrapper>>& outputs
+        InputArrayOfArrays inputs_,
+        InputArrayOfArrays
     ) override
     {
         auto context = reinterpret_cast<csl::CSLContext*>(context_);
 
-        auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
-        auto channel_axis = normalize_axis(axisRaw, input_wrapper->getRank());
+        std::vector<UMat> inputs;
+        inputs_.getUMatVector(inputs);
+        CV_Assert(!inputs.empty());
+
+        const int rank = cv::dnn::shape(inputs[0]).dims;
+        auto channel_axis = normalize_axis(axisRaw, rank);
+        // pre-opset-13 reduces the flattened tail [axis, rank), which is one axis only when axis is last
+        const bool flattenTail = coerced2d && channel_axis != rank - 1;
+#if defined(HAVE_CUDNNJIT) && !defined(HAVE_CUDNN)
+        // a JIT-only build does not link cudnnSoftmaxForward, so use the hand-written kernel
+        return make_cuda_node<cuda4dnn::SoftmaxKernelOp>(preferableTarget, std::move(context->stream), channel_axis, logSoftMax, scale, flattenTail);
+#else
+        // the cuDNN SoftmaxOp has no scale and reduces one axis; the hand-written kernel does both
+        if (scale != 1.f || flattenTail)
+            return make_cuda_node<cuda4dnn::SoftmaxKernelOp>(preferableTarget, std::move(context->stream), channel_axis, logSoftMax, scale, flattenTail);
         return make_cuda_node<cuda4dnn::SoftmaxOp>(preferableTarget, std::move(context->cudnn_handle), channel_axis, logSoftMax);
+#endif
     }
 #endif
 
@@ -328,6 +373,7 @@ public:
     }
 
     int axisRaw;
+    bool coerced2d;  // ONNX Softmax/LogSoftmax before opset 13 reduce the flattened tail
 };
 
 Ptr<SoftmaxLayer> SoftmaxLayer::create(const LayerParams& params)

@@ -175,7 +175,7 @@ public:
     inline void push_back( _Tp&& value )
     { if (sz >= cap) reserve(cap + cap/2 > sz ? cap + cap/2 : sz + 1); ptr[sz++] = std::move(value); }
     inline void emplace_back( _Tp&& value ) {push_back(value);}
-    inline void pop_back() {CV_DbgCheckGT(sz, (size_t)0, "out of range"); resize(size()-1);}
+    inline void pop_back() {CV_DbgCheckGT(sz, (size_t)0, "out of range"); if (sz > 0) --sz;}
 protected:
     //! pointer to the real buffer, can point to buf if the buffer is small enough
     _Tp* ptr;
@@ -183,8 +183,11 @@ protected:
     size_t sz;
     //! capacity - allocated element count (>= sz). Starts at fixed_size (the local buf), grows on demand.
     size_t cap;
-    //! pre-allocated buffer. At least 1 element to confirm C++ standard requirements
-    _Tp buf[(fixed_size > 0) ? fixed_size : 1];
+    //! pre-allocated buffer. At least 1 element to confirm C++ standard requirements.
+    //! Aligned to at least 8 bytes whatever _Tp is, so that a byte buffer (AutoBuffer<uchar>)
+    //! can hold doubles/int64 even when the local storage is used; the heap path (new _Tp[])
+    //! is at least that aligned on every supported platform.
+    alignas(alignof(_Tp) > 8 ? alignof(_Tp) : 8) _Tp buf[(fixed_size > 0) ? fixed_size : 1];
 };
 
 /**  @brief Sets/resets the break-on-error mode.
@@ -672,6 +675,10 @@ The function returns true if the optimized code is enabled. Otherwise, it return
  */
 CV_EXPORTS_W bool useOptimized();
 
+/** @brief Returns matrix element size.
+ * Returns matrix element size including channels. Analog of CV_ELEM_SIZE macro. Example: getElemSize(CV_32SC3) returns 12.
+ * @param type Matrix data type, e.g. CV_8UC3.
+ */
 inline size_t getElemSize(int type) { return (size_t)CV_ELEM_SIZE(type); }
 
 /////////////////////////////// Parallel Primitives //////////////////////////////////
@@ -803,9 +810,11 @@ void Mat::forEach_impl(const Functor& operation) {
 
             _Tp* pixel = &(mat->template at<_Tp>(idx));
             const _Tp* const pixel_end = pixel + COLS;
+            // a 1D Mat has a single index, so count along idx[0]
+            const int col_idx = mat->dims == 1 ? 0 : 1;
             while(pixel < pixel_end) {
                 op(*pixel++, static_cast<const int*>(idx));
-                idx[1]++;
+                idx[col_idx]++;
             }
         }
         PixelOperationWrapper& operator=(const PixelOperationWrapper &) {

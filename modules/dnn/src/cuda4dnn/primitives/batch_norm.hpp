@@ -19,8 +19,6 @@ namespace cv { namespace dnn { namespace cuda4dnn {
     template <class T>
     class BatchNormOp final : public CUDABackendNode {
     public:
-        using wrapper_type = GetCUDABackendWrapperType<T>;
-
         BatchNormOp(csl::Stream stream_, const cv::Mat& weights, const cv::Mat& bias)
             : stream(std::move(stream_))
         {
@@ -32,17 +30,14 @@ namespace cv { namespace dnn { namespace cuda4dnn {
         }
 
         void forward(
-            const std::vector<cv::Ptr<BackendWrapper>>& inputs,
-            const std::vector<cv::Ptr<BackendWrapper>>& outputs,
+            const std::vector<UMat>& inputs,
+            const std::vector<UMat>& outputs,
             csl::Workspace& workspace) override
         {
             CV_Assert(inputs.size() == 1 && outputs.size() == 1);
 
-            auto input_wrapper = inputs[0].dynamicCast<wrapper_type>();
-            auto input = input_wrapper->getView();
-
-            auto output_wrapper = outputs[0].dynamicCast<wrapper_type>();
-            auto output = output_wrapper->getSpan();
+            auto input = csl::viewOf<T>(inputs[0]);
+            auto output = csl::spanOf<T>(outputs[0]);
 
             std::size_t inner_size = input.size_range(2, input.rank());
             kernels::scaleN_with_biasN<T>(stream, output, input, inner_size, weightsTensor, biasTensor);

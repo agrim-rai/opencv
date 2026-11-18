@@ -48,6 +48,7 @@ const char* opName(TOp op)
     case OP_MIN:           return "min";
     case OP_MAX:           return "max";
     case OP_ABSDIFF:       return "absdiff";
+    case OP_ADDW:          return "addWeighted";
     case OP_HYPOT:         return "hypot";
     case OP_ATAN2:         return "atan2";
     case OP_AND:           return "and";
@@ -294,6 +295,63 @@ static inline bool isFlexConst(const TExpr& e, int s)
     return e.arginfo[s].kind == TExpr::CONST && e.arginfo[s].depth == EW_DEPTH_NONE;
 }
 
+// Read a CONST slot that carries exactly ONE value. OP_ADDW transports alpha/beta/gamma in the
+// instruction's params block - a single value applied to every channel - so a per-channel const
+// cannot ride it and must keep the expanded form.
+static bool scalarConstValue(const TExpr& e, int s, double& v)
+{
+    const TExpr::Arg& a = e.arginfo[s];
+    if (a.kind != TExpr::CONST || std::max(1, a.channels) != 1) return false;
+    AutoBuffer<double, MAX_LOCAL_CN> buf;
+    constDoubles(e, s, buf);
+    v = buf[0];
+    return true;
+}
+
+// Does the run of instructions ENDING at `end` compute `array * scalar` into slot `t`?
+//
+// emitBinary() may wrap the multiply in casts: an integer array times a fractional scalar computes
+// in the float domain and lands back in the array's own type, so the run is
+//     [cast widen] -> mul -> [cast narrow]
+// with the multiply always present and the two casts optional. All three are contiguous and sit at
+// the tail of the program (the operand was emitted immediately before the pending add), so matching
+// backwards from `end` identifies the whole run. Fills the ORIGINAL array operand, the scalar, and
+// the index of the run's first instruction.
+static bool matchScaledChain(const TExpr& e, int end, int t,
+                             int& arrSlot, double& scale, int& startIdx)
+{
+    if (end < 0) return false;
+    int j = end, mulResult = t;
+
+    // optional trailing narrowing cast
+    if (e.prog[j].op == OP_CAST && e.prog[j].result == t)
+    {
+        mulResult = e.prog[j].arg0;
+        if (--j < 0) return false;
+    }
+
+    const TExpr::Insn& mul = e.prog[j];
+    if (mul.op != OP_MUL || mul.result != mulResult || mul.params[0] != 1.0) return false;
+
+    int arr;
+    if      (scalarConstValue(e, mul.arg1, scale)) arr = mul.arg0;
+    else if (scalarConstValue(e, mul.arg0, scale)) arr = mul.arg1;
+    else return false;                                  // array*array is not an addWeighted term
+    startIdx = j;
+
+    // optional leading widening cast feeding the multiply
+    if (j - 1 >= 0 && e.prog[j-1].op == OP_CAST && e.prog[j-1].result == arr &&
+        e.arginfo[arr].kind == TExpr::TEMP)
+    {
+        arr = e.prog[j-1].arg0;
+        startIdx = j - 1;
+    }
+
+    if (e.arginfo[arr].kind == TExpr::CONST) return false;   // scalar*scalar is folded elsewhere
+    arrSlot = arr;
+    return true;
+}
+
 // Can a flexible CONST `s` be represented exactly at depth `d`? (typed operands trivially "fit").
 static bool constFits(const TExpr& e, int s, int d)
 {
@@ -314,8 +372,9 @@ int TExpr::emitBinary(TOp op, int a, int b, int rdepth, const Scalar& params)
 {
     // addWeighted a*alpha + b*beta + gamma (params = {alpha, beta, gamma}): ONE fused kernel (two v_fma).
     // Inputs are the same type T (cast to a common type if not). The kernel outputs T/f32 (small ints,
-    // f16/bf16, f32) or f64 directly; for any other requested rdepth it computes in the work type W and a
-    // final cast narrows it.
+    // f16/bf16, f32) or f64 directly, at its own natural work precision; for any other requested rdepth
+    // it computes at that natural precision and casts the RESULT to rdepth afterward (never the inputs
+    // up before the op, that would spend an extra cast and run the op at needlessly high precision).
     if (op == OP_ADDW)
     {
         int Tt = arginfo[a].depth;
@@ -324,14 +383,17 @@ int TExpr::emitBinary(TOp op, int a, int b, int rdepth, const Scalar& params)
             Tt = promoteArith(arginfo[a].depth, arginfo[b].depth);
             a = maybeAddCast(a, Tt); b = maybeAddCast(b, Tt);
         }
+        if (Tt == CV_Bool)
+            CV_Error(Error::StsNotImplemented, "addWeighted: CV_Bool inputs are not supported, cast explicitly "
+                     "first, e.g. cv::texpr(\"uint8({0})*{1} + uint8({2})*{3}\", {a, alpha, b, beta})");
         if (rdepth == EW_DEPTH_NONE) rdepth = Tt;              // default dtype = input depth
         TKernel k = getElemwiseFunc(OP_ADDW, Tt, Tt, EW_DEPTH_NONE, rdepth);
         int outD = rdepth;
-        if (!k.fptr)                                          // no direct T->rdepth kernel: compute in W, cast
+        if (!k.fptr)                                          // no direct T->rdepth kernel: compute at T's natural work depth, cast after
         {
-            outD = (Tt==CV_32U || Tt==CV_32S || Tt==CV_64U || Tt==CV_64S || Tt==CV_64F || rdepth==CV_64F)
-                 ? CV_64F : CV_32F;
+            outD = (Tt==CV_32U || Tt==CV_32S || Tt==CV_64U || Tt==CV_64S || Tt==CV_64F) ? CV_64F : CV_32F;
             k = getElemwiseFunc(OP_ADDW, Tt, Tt, EW_DEPTH_NONE, outD);
+            CV_Assert(k.fptr && "ew: no kernel for this op/type combination");
         }
         const int out = addTemp(outD);
         addInsn(OP_ADDW, a, b, 0, out, k, Scalar(params[0], params[1], params[2]));
@@ -339,6 +401,68 @@ int TExpr::emitBinary(TOp op, int a, int b, int rdepth, const Scalar& params)
         const int out2 = addTemp(rdepth);
         addInsn(OP_CAST, out, 0, 0, out2);
         return out2;
+    }
+
+    // peephole: a*alpha + b*beta [+ gamma] -> the fused OP_ADDW kernel (two v_fma). Written out,
+    // the form costs four instructions, three temp buffers and four passes over the data; OP_ADDW
+    // does the whole thing in one pass with no temp. Like the abs(x - y) -> absdiff peephole in
+    // emitUnary() this RETIRES the instructions it folds, so - same as there - it must leave a
+    // pinned (named) slot alone: see TExpr::Arg::pinned.
+    if (op == OP_ADD)
+    {
+        const int n = (int)prog.size();
+
+        // (x*alpha) + (y*beta). Both multiplies are the last two instructions and their results the
+        // last two temps (the operands were emitted immediately before this add), so folding them is
+        // a pop of the program tail and no slot renumbering is needed.
+        int x = 0, y = 0, startA = 0, startB = 0;
+        double alpha = 0, beta = 0;
+        if (n >= 2 && a != b &&
+            arginfo[a].kind == TEMP && !arginfo[a].pinned &&
+            arginfo[b].kind == TEMP && !arginfo[b].pinned &&
+            matchScaledChain(*this, n - 1, b, y, beta, startB) &&
+            matchScaledChain(*this, startB - 1, a, x, alpha, startA) &&
+            x != a && x != b && y != a && y != b &&
+            // OP_ADDW has no CV_Bool form (it would have to pick a numeric work type); leave a bool
+            // operand to the plain expansion rather than turning it into an error.
+            arginfo[x].depth != CV_Bool && arginfo[y].depth != CV_Bool)
+        {
+            // The two runs together are exactly the tail [startA, n), so folding them is a truncation
+            // of the program; every temp they produced was created after every surviving one, so
+            // retiring them keeps the temp indices dense (0..ntemps-1) for compile()'s liveness.
+            int retired = 0, lowest = INT_MAX;
+            for (int i = startA; i < n; i++)
+            {
+                const int r = prog[i].result;
+                if (arginfo[r].kind != TEMP || arginfo[r].pinned) { retired = -1; break; }
+                lowest = std::min(lowest, arginfo[r].index);
+                retired++;
+            }
+            if (retired > 0 && lowest == ntemps - retired)
+            {
+                for (int i = startA; i < n; i++) arginfo[prog[i].result].kind = NONE;
+                prog.resize(startA);
+                ntemps -= retired;
+                return emitBinary(OP_ADDW, x, y, rdepth, Scalar(alpha, beta, 0.));
+            }
+        }
+
+        // (x*alpha + y*beta) + gamma: the ADDW is already emitted and its gamma still 0, so the
+        // trailing scalar folds into the instruction's params instead of costing another pass.
+        {
+            int acc = 0; double gamma = 0;
+            if      (scalarConstValue(*this, b, gamma)) acc = a;
+            else if (scalarConstValue(*this, a, gamma)) acc = b;
+            if (acc != 0 && n >= 1 &&
+                arginfo[acc].kind == TEMP && !arginfo[acc].pinned &&
+                arginfo[acc].index == ntemps - 1 &&
+                prog[n-1].op == OP_ADDW && prog[n-1].result == acc &&
+                (rdepth == EW_DEPTH_NONE || rdepth == arginfo[acc].depth))
+            {
+                prog[n-1].params[2] += gamma;
+                return acc;
+            }
+        }
     }
 
     const int nd0 = isFlexConst(*this, a) ? EW_DEPTH_NONE : arginfo[a].depth;
@@ -570,7 +694,7 @@ int TExpr::emitUnary(TOp op, int a, int rdepth, const Scalar& params)
         // "don't notice" the difference and hand out the useful semantics. The sub is necessarily
         // the last instruction and its result the last temp (abs is emitted right after its
         // argument) - retire both, the moveToOutput manoeuvre.
-        if (!prog.empty() && arginfo[a].kind == TEMP &&
+        if (!prog.empty() && arginfo[a].kind == TEMP && !arginfo[a].pinned &&
             prog.back().op == OP_SUB && prog.back().result == a &&
             arginfo[a].index == ntemps - 1)
         {
@@ -691,7 +815,7 @@ int TExpr::moveToOutput(int temp, int out)
         if (ins.result == temp) producer = i;
         if (ins.arg0 == temp || ins.arg1 == temp || ins.arg2 == temp) usedAsArg = true;
     }
-    if (arginfo[temp].kind == TEMP && producer >= 0 && !usedAsArg &&
+    if (arginfo[temp].kind == TEMP && producer >= 0 && !usedAsArg && !arginfo[temp].pinned &&
         arginfo[temp].depth == arginfo[out].depth)
     {
         // MOVE semantics: redirect `temp`'s single producer to write `out` directly, then leave the
@@ -746,12 +870,14 @@ void TExpr::compile()
         if (a.kind != CONST || a.depth == EW_DEPTH_NONE) continue;
         const int cn = std::max(1, a.channels), sd = a.srcdepth, dd = a.depth;
         const size_t sesz = CV_ELEM_SIZE1(sd), desz = CV_ELEM_SIZE1(dd);
-        AutoBuffer<uchar, 64> srcbytes((size_t)cn * sesz);
-        memcpy(srcbytes.data(), (const uchar*)(constbuf.data() + a.constofs), (size_t)cn * sesz);
+        // uint64_t element type is used for buffer alignment on worst case
+        AutoBuffer<uint64_t, sizeof(uint64_t)> srcbuf(divUp((size_t)cn * sesz, (unsigned)sizeof(uint64_t)));
+        uchar* srcbytes = (uchar*)srcbuf.data();
+        memcpy(srcbytes, (const uchar*)(constbuf.data() + a.constofs), (size_t)cn * sesz);
         const size_t ofs = appendConstBuf(constbuf, dd, nullptr, cn);   // reserve converted region
         uchar* dst = (uchar*)(constbuf.data() + ofs);
-        if (sd == dd) memcpy(dst, srcbytes.data(), (size_t)cn * desz);
-        else getConvertFunc(sd, dd)(srcbytes.data(), 0, nullptr, 0, dst, 0, Size(cn, 1), nullptr);
+        if (sd == dd) memcpy(dst, srcbytes, (size_t)cn * desz);
+        else getConvertFunc(sd, dd)(srcbytes, 0, nullptr, 0, dst, 0, Size(cn, 1), nullptr);
         a.constofs = ofs; a.srcdepth = dd;
         nconsts++;
     }
@@ -819,10 +945,10 @@ void TExpr::compile()
         }
     for (int b = 0; b < nbuffers; b++) bufEszPrefix[b + 1] += bufEszPrefix[b];   // -> prefix sums
 
-    // L1 fragment cap: # elements one ~16KB scratch fragment holds (exec fragments the strip so the
+    // L1 fragment cap: # elements one ~4KB scratch fragment holds (exec fragments the strip so the
     // intermediates stay hot). Pure function of the temp byte layout, hence computed here once.
     const int totalEsz = bufEszPrefix[nbuffers];
-    capElems = totalEsz > 0 ? std::max(64, (16 * 1024) / totalEsz) : INT_MAX;
+    capElems = totalEsz > 0 ? std::max(64, (4 * 1024) / totalEsz) : INT_MAX;
 }
 
 
@@ -1105,6 +1231,122 @@ static constexpr int LOCAL_HDRS = 3;
 static constexpr int LOCAL_CONSTS = 4;
 static constexpr int LOCAL_OPS = 16;
 
+#if defined(__GNUC__)
+#define CV_EW_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define CV_EW_NOINLINE __declspec(noinline)
+#else
+#define CV_EW_NOINLINE
+#endif
+
+// Outlined from TExpr::exec() so the ~4KB inline scratchBuf is not hoisted into TExpr::exec()'s
+// stack frame when execution takes the broadcastOp path instead.
+CV_EW_NOINLINE static void execFastStripWithTemps(
+    const TExpr& expr, const Mat* const* inputs, Mat* outputs, size_t total)
+{
+    const int ninsn = (int)expr.prog.size();
+    const int totalEsz = expr.bufEszPrefix[expr.nbuffers];
+    const int wf0 = std::min((int)total, expr.capElems);
+    const size_t region = alignSize((size_t)wf0, 8);
+    // Scratch for the temp buffers. AutoBuffer no longer value-inits its tail, so a fresh per-call
+    // buffer is free (we only WRITE to it); the inline 4KB covers the L1-capped size, heap backs
+    // the rare larger case. uint64_t is used for memory alignment on the worst case.
+    AutoBuffer<uint64_t, (4*1024 + 256)/sizeof(uint64_t)> scratchBuf(
+        divUp((size_t)totalEsz * region, (unsigned)sizeof(uint64_t)));
+    uchar* scratch = (uchar*)scratchBuf.data();
+    for (int x0 = 0; x0 < (int)total; x0 += wf0)
+    {
+        const int wf = std::min(wf0, (int)total - x0);
+        auto ptrOf = [&](int s) -> void* {
+            if (s <= 0) return nullptr;
+            const TExpr::Arg& ai = expr.arginfo[s];
+            size_t esz = CV_ELEM_SIZE1(ai.depth);
+            if (ai.kind == TExpr::INPUT)  return (uchar*)inputs[ai.index]->data  + (size_t)x0 * esz;
+            if (ai.kind == TExpr::OUTPUT) return (uchar*)outputs[ai.index].data + (size_t)x0 * esz;
+            if (ai.kind != TExpr::TEMP)   return nullptr;                                         // NONE: moved-from
+            const int b = expr.bufferOfTemp.empty() ? ai.index : expr.bufferOfTemp[ai.index];     // TEMP
+            return scratch + (size_t)expr.bufEszPrefix[b] * region;                               // fragment-local
+        };
+        for (int n = 0; n < ninsn; n++)
+        {
+            const TExpr::Insn& ins = expr.prog[n];
+            runInsn(ins, ptrOf(ins.arg0), 0, 1, ptrOf(ins.arg1), 0, 1,
+                    ptrOf(ins.arg2), 0, 1, ptrOf(ins.result), 0, wf, 1);
+        }
+    }
+}
+
+// Outlined from the broadcastOp body so single-op calls (nbuffers == 0) do not reserve ~4KB of
+// unused tstoreBuf stack space in the closure frame.
+CV_EW_NOINLINE static void execTileWithTemps(
+    const EwBody& bc, const TExpr::Arg* arginfo, const BroadcastOp::Tile& tile)
+{
+    using BrSlice = BroadcastOp::Slice;
+    const TExpr::Insn* insns = bc.prog;
+    const int* const smap  = bc.slotMap;
+    const signed char* const skind = bc.slotKind;
+    const int nin = bc.ninsn, nsl = bc.nslots;
+    const int w = tile.width, h = tile.height;
+
+    // Run the program over L1-sized 2D blocks so the intermediates stay in cache. ONE rule covers
+    // every tile shape: keep the strip as WIDE as fits L1 (long inner loop => good SIMD + hits the
+    // kernels' width-specific branches), then add as many rows as still fit (bw*bh <= capElems).
+    // For the dominant 1D tile (w huge, h==1) this is a column strip; for a tall-thin tile
+    // (w==channels, h huge - e.g. a masked op) it instead splits the LONG axis (height), so the
+    // temp block stays contiguous and the kernels keep full width. Each temp buffer occupies
+    // [bufEszPrefix[buf]*region, ...) bytes in tstore; region = alignSize(bw*bh, 8).
+    const int* const eszPrefix = bc.bufEszPrefix;
+    const int bw = std::min(w, bc.capElems);
+    const int bh = std::min(h, std::max(1, bc.capElems / std::max(1, bw)));
+    const size_t region = alignSize((size_t)bw * bh, 8);
+    // uint64_t elements (see the note on scratchBuf above): keeps the block-local temp store
+    // 8-byte aligned, which the 64-bit-lane kernels require on 32-bit ABIs.
+    AutoBuffer<uint64_t, (4*1024 + 256)/sizeof(uint64_t)> tstoreBuf(
+        divUp((size_t)eszPrefix[bc.nbuffers] * region, (unsigned)sizeof(uint64_t)));  // inline (<= ~4KB)
+    uchar* tstore = (uchar*)tstoreBuf.data();
+
+    AutoBuffer<BrSlice, LOCAL_OPS> args(nsl);
+    for (int y0 = 0; y0 < h; y0 += bh)
+    {
+        const int hf = std::min(bh, h - y0);
+        for (int x0 = 0; x0 < w; x0 += bw)
+        {
+            const int wf = std::min(bw, w - x0);
+            for (int s = 1; s < nsl; s++)
+            {
+                BrSlice& a = args[s];
+                const int k = skind[s];
+                if (k == TExpr::NONE) continue;
+                size_t esz = CV_ELEM_SIZE1(arginfo[s].depth);
+                if (k == TExpr::TEMP)                      // contiguous block-local buffer
+                {
+                    a.ptr = tstore + (size_t)eszPrefix[smap[s]] * region;
+                    a.stepy = (size_t)wf*esz; a.stepx = 1;
+                }
+                else                                       // array operand (incl. 0-dim consts): this
+                                                           // block of the broadcast slice
+                {
+                    const BrSlice& sl = tile.slices[smap[s]];
+                    a.ptr = (uchar*)sl.ptr +
+                        ((size_t)y0 * sl.stepy + (size_t)x0 * sl.stepx) * esz;
+                    a.stepy = sl.stepy*esz; a.stepx = sl.stepx;
+                }
+            }
+
+            for (int n = 0; n < nin; n++)
+            {
+                const TExpr::Insn& ins = insns[n];
+                const BrSlice& a0 = args[ins.arg0]; const BrSlice& a1 = args[ins.arg1];
+                const BrSlice& a2 = args[ins.arg2]; const BrSlice& rr = args[ins.result];
+                runInsn(ins, a0.ptr, a0.stepy, a0.stepx, a1.ptr, a1.stepy, a1.stepx,
+                        a2.ptr, a2.stepy, a2.stepx, (void*)rr.ptr, rr.stepy, wf, hf);
+            }
+        }
+    }
+}
+
+#undef CV_EW_NOINLINE
+
 void TExpr::exec(const Mat* const* inputs, Mat* outputs)
 {
     using BrTile = BroadcastOp::Tile;
@@ -1136,6 +1378,14 @@ void TExpr::exec(const Mat* const* inputs, Mat* outputs)
         for (int s = 1; ok && s < nslots; s++)
             if (arginfo[s].kind == OUTPUT) ok = ok && outputs[arginfo[s].index].isContinuous();
         const size_t total = ok ? r.total() * rcn : 0;
+        if (ok && total == 0)
+        {
+            const MatShape rshape = r.size;
+            for (int s = 1; s < nslots; s++)
+                if (arginfo[s].kind == OUTPUT)
+                    outputs[arginfo[s].index].create(rshape, CV_MAKETYPE(arginfo[s].depth, rcn));
+            return;
+        }
         if (ok && total <= EW_FASTPATH_MAX)
         {
             const MatShape rshape = r.size;   // spatial dims (channels separate), as a MatShape
@@ -1167,35 +1417,7 @@ void TExpr::exec(const Mat* const* inputs, Mat* outputs)
             }
 
             // Temps present: walk the strip in L1-sized fragments so the intermediates stay hot.
-            // Byte layout (bufEszPrefix) and the fragment cap (capElems) both come from compile();
-            // scratch is totalEsz*wf0 (<= ~16KB).
-            const int totalEsz = bufEszPrefix[nbuffers];
-            const int wf0 = std::min((int)total, capElems);
-            // Scratch for the temp buffers. AutoBuffer no longer value-inits its tail, so a fresh per-call
-            // buffer is free (we only WRITE to it); the inline 16KB covers the L1-capped size, heap backs
-            // the rare larger case.
-            AutoBuffer<uchar, 16*1024 + 256> scratchBuf((size_t)totalEsz * (size_t)wf0);
-            uchar* scratch = scratchBuf.data();
-            for (int x0 = 0; x0 < (int)total; x0 += wf0)
-            {
-                const int wf = std::min(wf0, (int)total - x0);
-                auto ptrOf = [&](int s) -> void* {
-                    if (s <= 0) return nullptr;
-                    const Arg& ai = arginfo[s];
-                    size_t esz = CV_ELEM_SIZE1(ai.depth);
-                    if (ai.kind == INPUT)  return (uchar*)inputs[ai.index]->data  + (size_t)x0 * esz;
-                    if (ai.kind == OUTPUT) return (uchar*)outputs[ai.index].data + (size_t)x0 * esz;
-                    if (ai.kind != TEMP)   return nullptr;                                    // NONE: moved-from
-                    const int b = bufferOfTemp.empty() ? ai.index : bufferOfTemp[ai.index];  // TEMP
-                    return scratch + (size_t)bufEszPrefix[b] * (size_t)wf0;                   // fragment-local
-                };
-                for (int n = 0; n < ninsn; n++)
-                {
-                    const Insn& ins = prog[n];
-                    runInsn(ins, ptrOf(ins.arg0), 0, 1, ptrOf(ins.arg1), 0, 1,
-                            ptrOf(ins.arg2), 0, 1, ptrOf(ins.result), 0, wf, 1);
-                }
-            }
+            execFastStripWithTemps(*this, inputs, outputs, total);
             return;
         }
     }
@@ -1293,6 +1515,11 @@ void TExpr::exec(const Mat* const* inputs, Mat* outputs)
     // ---- 4. parallel work hint: total output scalars x summed per-element op cost / budget. ----
     long long otot = (long long)rchannels;
     for (int d = 0; d < (int)spatial.size(); d++) otot *= spatial[d];
+    if (otot == 0)
+        return;
+    // One stripe per 2^16 cost units. The unit is ~1/4 cycle of the VECTORIZED kernel, but
+    // element-wise work is memory-bound, so a stripe costs several times what that model says -
+    // a coarser budget leaves a 32-core box running 2 stripes on DNN-sized tensors (1-4 MB).
     // ~4 stripes per thread is plenty of granularity for element-wise work; more only multiplies
     // the per-job dispatch overhead (notably on the macOS/GCD backend). The absolute ceiling is
     // 32 pieces, EXCEPT on machines with many (heterogeneous) cores: there anything coarser than
@@ -1301,7 +1528,7 @@ void TExpr::exec(const Mat* const* inputs, Mat* outputs)
     // getNumThreads() is clamped from below: some backends may report 0 (WINRT, plugins).
     const double T = (double)std::max(getNumThreads(), 1);
     const double nstripes = std::min(
-        (double)otot * (double)std::max<long long>(costPerElem, 1) * (1./ (double)(1 << 18)),
+        (double)otot * (double)std::max<long long>(costPerElem, 1) * (1./ (double)(1 << 16)),
         std::min(4.*T, std::max(32., 3.*T)));
 
     EwBody body;
@@ -1324,67 +1551,38 @@ void TExpr::exec(const Mat* const* inputs, Mat* outputs)
     body.nbuffers = nbuffers;
     body.capElems = capElems;
 
-    broadcastOp(arr.data(), narr, [&](const BrTile& tile)
+    broadcastOp(arr.data(), narr, [&bc=body, this](const BrTile& tile)
     {
-        EwBody& bc = body;
+        if (bc.nbuffers != 0)
+        {
+            execTileWithTemps(bc, arginfo.data(), tile);
+            return;
+        }
+
+        // No temps: one block over the whole tile, no scratch buffer on the stack, and each
+        // operand slot is re-pointed once straight at its tile slice.
         const TExpr::Insn* insns = bc.prog;            // hot fields -> locals (registers/stack)
         const int* const smap  = bc.slotMap;
         const signed char* const skind = bc.slotKind;
         const int nin = bc.ninsn, nsl = bc.nslots;
         const int w = tile.width, h = tile.height;
 
-        // Run the program over L1-sized 2D blocks so the intermediates stay in cache. ONE rule covers
-        // every tile shape: keep the strip as WIDE as fits L1 (long inner loop => good SIMD + hits the
-        // kernels' width-specific branches), then add as many rows as still fit (bw*bh <= capElems).
-        // For the dominant 1D tile (w huge, h==1) this is a column strip; for a tall-thin tile
-        // (w==channels, h huge - e.g. a masked op) it instead splits the LONG axis (height), so the
-        // temp block stays contiguous and the kernels keep full width. With NO temps capElems==INT_MAX
-        // => bw=w, bh=h: one block over the whole tile, region temp store is empty (zero bytes), and
-        // each operand slot is re-pointed once straight at its tile slice. Each temp buffer occupies
-        // [bufEszPrefix[buf]*region, ...) bytes in tstore; region = bw*bh.
-        const int* const eszPrefix = bc.bufEszPrefix;
-        const int bw = std::min(w, bc.capElems);
-        const int bh = std::min(h, std::max(1, bc.capElems / std::max(1, bw)));
-        const size_t region = alignSize((size_t)bw * bh, 8);
-        AutoBuffer<uchar, 16*1024 + 256> tstoreBuf((size_t)eszPrefix[bc.nbuffers] * region);  // inline (<= ~16KB)
-        uchar* tstore = tstoreBuf.data();
-
         AutoBuffer<BrSlice, LOCAL_OPS> args(nsl);
-        for (int y0 = 0; y0 < h; y0 += bh)
+        for (int s = 1; s < nsl; s++)
         {
-            const int hf = std::min(bh, h - y0);
-            for (int x0 = 0; x0 < w; x0 += bw)
-            {
-                const int wf = std::min(bw, w - x0);
-                for (int s = 1; s < nsl; s++)
-                {
-                    BrSlice& a = args[s];
-                    const int k = skind[s];
-                    size_t esz = CV_ELEM_SIZE1(arginfo[s].depth);
-                    if (k == TExpr::TEMP)                      // contiguous block-local buffer
-                    {
-                        a.ptr = tstore + (size_t)eszPrefix[smap[s]] * region;
-                        a.stepy = (size_t)wf*esz; a.stepx = 1;
-                    }
-                    else                                    // array operand (incl. 0-dim consts): this
-                                                            // block of the broadcast slice
-                    {
-                        const BrSlice& sl = tile.slices[smap[s]];
-                        a.ptr = (uchar*)sl.ptr +
-                            ((size_t)y0 * sl.stepy + (size_t)x0 * sl.stepx) * esz;
-                        a.stepy = sl.stepy*esz; a.stepx = sl.stepx;
-                    }
-                }
+            if (skind[s] == TExpr::NONE) continue;
+            const BrSlice& sl = tile.slices[smap[s]];
+            size_t esz = CV_ELEM_SIZE1(arginfo[s].depth);
+            args[s] = { sl.ptr, sl.stepy * esz, sl.stepx };
+        }
 
-                for (int n = 0; n < nin; n++)
-                {
-                    const TExpr::Insn& ins = insns[n];
-                    const BrSlice& a0 = args[ins.arg0]; const BrSlice& a1 = args[ins.arg1];
-                    const BrSlice& a2 = args[ins.arg2]; const BrSlice& rr = args[ins.result];
-                    runInsn(ins, a0.ptr, a0.stepy, a0.stepx, a1.ptr, a1.stepy, a1.stepx,
-                            a2.ptr, a2.stepy, a2.stepx, (void*)rr.ptr, rr.stepy, wf, hf);
-                }
-            }
+        for (int n = 0; n < nin; n++)
+        {
+            const TExpr::Insn& ins = insns[n];
+            const BrSlice& a0 = args[ins.arg0]; const BrSlice& a1 = args[ins.arg1];
+            const BrSlice& a2 = args[ins.arg2]; const BrSlice& rr = args[ins.result];
+            runInsn(ins, a0.ptr, a0.stepy, a0.stepx, a1.ptr, a1.stepy, a1.stepx,
+                    a2.ptr, a2.stepy, a2.stepx, (void*)rr.ptr, rr.stepy, w, h);
         }
     }, true, nstripes);
 }
@@ -1774,7 +1972,12 @@ struct Parser
                 if (cur.type == T_ASSIGN)
                 {
                     advance();
-                    env[name] = parseTernary();
+                    const int slot = parseTernary();
+                    // The name can be used any number of times below (including not at all), so the
+                    // value must outlive the expression that produced it: pin the slot so the
+                    // retire-the-temp optimizations skip it.
+                    e.arginfo[slot].pinned = true;
+                    env[name] = slot;
                     expect(T_SEMI, "expected ';' after assignment");
                     continue;
                 }
@@ -1805,6 +2008,8 @@ void texpr(const std::string& expr, InputArrayOfArrays _inputs, OutputArrayOfArr
     CV_Assert(_inputs.kind() == _InputArray::STD_VECTOR_MAT);
     const std::vector<Mat>& inps = *(const std::vector<Mat>*)_inputs.getObj();
     const int ninputs = (int)inps.size();
+    for (int i = 0; i < ninputs; i++)
+        CV_Assert(!inps[i].empty());
 
     // Input depths are known now, so build a fully-typed program straight away: one INPUT slot per
     // input (slot index i carries input i's depth), then parse the expression into instructions.

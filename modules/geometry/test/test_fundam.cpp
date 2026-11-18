@@ -403,6 +403,9 @@ void CV_ComputeEpilinesTest::prepare_to_validation( int /*test_case_idx*/ )
 TEST(Calib3d_ConvertHomogeneoous, accuracy) { CV_ConvertHomogeneousTest test; test.safe_run(); }
 TEST(Calib3d_ComputeEpilines, accuracy) { CV_ComputeEpilinesTest test; test.safe_run(); }
 
+// Regression test for https://github.com/opencv/opencv/issues/4330, fixed by 85149f8686. Both
+// epipoles at infinity collapses the 6th-degree polynomial correctMatches() solves; cv::solvePoly()
+// used to return garbage roots for it, giving NaN / DBL_MAX. These checks keep that closed.
 TEST(Calib3d_FindFundamentalMat, correctMatches)
 {
     double fdata[] = {0, 0, 0, 0, 0, -1, 0, 1, 0};
@@ -416,8 +419,19 @@ TEST(Calib3d_FindFundamentalMat, correctMatches)
 
     correctMatches(F, p1, p2, np1, np2);
 
-    cout << np1 << endl;
-    cout << np2 << endl;
+    ASSERT_EQ(p1.size(), np1.size());
+    ASSERT_EQ(p1.type(), np1.type());
+    ASSERT_EQ(p2.size(), np2.size());
+    ASSERT_EQ(p2.type(), np2.type());
+
+    // rejects NaN and DBL_MAX, the pre-fix output
+    EXPECT_TRUE(cv::checkRange(np1)) << "np1 = " << np1;
+    EXPECT_TRUE(cv::checkRange(np2)) << "np2 = " << np2;
+
+    // The input pair already satisfies p2^T * F * p1 == 0 exactly, so the
+    // optimal correction is zero and both points must come back unchanged.
+    EXPECT_LE(cv::norm(np1, p1, NORM_INF), 1e-9) << "np1 = " << np1;
+    EXPECT_LE(cv::norm(np2, p2, NORM_INF), 1e-9) << "np2 = " << np2;
 }
 
 TEST(Calib3d_FindFundamentalMat, Crash)
@@ -426,6 +440,26 @@ TEST(Calib3d_FindFundamentalMat, Crash)
     vector<Point2f> m2 = m1;
     vector<uchar> mask;
     findFundamentalMat(m1, m2, mask, FM_LMEDS, 1, 0.99);
+}
+
+TEST(Geometry_SampsonDistance, invalid_inputs)
+{
+    Mat pt1 = Mat(Vec2d(1.0, 2.0));
+    Mat pt2 = Mat(Vec2d(1.0, 2.0));
+    Mat F = Mat::eye(3, 3, CV_64F);
+    EXPECT_THROW(cv::sampsonDistance(pt1, pt2, F), cv::Exception);
+
+    Mat F_bad = Mat::eye(2, 2, CV_64F);
+    Mat pt3d = Mat(Vec3d(1.0, 2.0, 1.0));
+    EXPECT_THROW(cv::sampsonDistance(pt3d, pt3d, F_bad), cv::Exception);
+
+    // Multi-point 3xN and Nx3 matrices must be rejected
+    Mat pts_3x2 = Mat::ones(3, 2, CV_64F);
+    Mat pts_2x3 = Mat::ones(2, 3, CV_64F);
+    EXPECT_THROW(cv::sampsonDistance(pts_3x2, pt3d, F), cv::Exception);
+    EXPECT_THROW(cv::sampsonDistance(pt3d, pts_3x2, F), cv::Exception);
+    EXPECT_THROW(cv::sampsonDistance(pts_2x3, pt3d, F), cv::Exception);
+    EXPECT_THROW(cv::sampsonDistance(pt3d, pts_2x3, F), cv::Exception);
 }
 
 }} // namespace

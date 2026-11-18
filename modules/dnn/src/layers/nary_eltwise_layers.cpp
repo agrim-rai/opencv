@@ -4,13 +4,8 @@
 
 #include "../precomp.hpp"
 
-#include "cpu_kernels/nary_eltwise_kernels.simd.hpp"
-#include "layers/cpu_kernels/nary_eltwise_kernels.simd_declarations.hpp"
-#define CV_CPU_OPTIMIZATION_NAMESPACE_BEGIN namespace cpu_baseline {
-#define CV_CPU_OPTIMIZATION_NAMESPACE_END }
-#undef CV_CPU_DISPATCH_MODES_ALL
-
 #include "../net_impl.hpp"
+#include "../adjacency_graph.hpp"
 #include "layers_common.hpp"
 #include "../op_cuda.hpp"
 #include "../op_cann.hpp"
@@ -26,6 +21,7 @@
 
 #ifdef HAVE_CUDA
 #include "../cuda4dnn/primitives/eltwise.hpp"
+#include "../cuda4dnn/primitives/logical.hpp"
 using namespace cv::dnn::cuda4dnn;
 #endif
 
@@ -35,19 +31,26 @@ namespace dnn
 {
 
 namespace {
-static int _mod(int x, int y) {
-    int res = x % y;
+// ONNX Mod with fmod=0: the remainder takes the sign of the divisor (Python/NumPy "%").
+template<typename T>
+static inline typename std::enable_if<std::is_integral<T>::value, T>::type _mod(T x, T y) {
+    // min % -1 overflows (and traps on x86); the remainder is 0 for any x.
+    if (std::is_signed<T>::value && y == static_cast<T>(-1))
+        return T(0);
+    T res = static_cast<T>(x % y);
     if ((res < 0 && y > 0) || (res > 0 && y < 0)) {
-        res += y;
+        res = static_cast<T>(res + y);
     }
     return res;
 }
 
-// Wrapper that turns the CV_CPU_DISPATCH return-chain into a normal call.
-static inline int simd_binop_f32_dispatch(const float* a, const float* b,
-                                          float* out, int n, int op) {
-    CV_CPU_DISPATCH(simd_binop_f32_, (a, b, out, n, op),
-                    NEON, AVX2, AVX, BASELINE);
+template<typename T>
+static inline typename std::enable_if<!std::is_integral<T>::value, T>::type _mod(T x, T y) {
+    T res = static_cast<T>(std::fmod((double)x, (double)y));
+    if (res != T(0) && ((res < T(0)) != (y < T(0)))) {
+        res = static_cast<T>(res + y);
+    }
+    return res;
 }
 
 }
@@ -185,16 +188,60 @@ public:
 class NaryEltwiseLayerImpl CV_FINAL : public NaryEltwiseLayer
 {
     NaryEltwiseHelper helper;
+    bool computeInNCHW = false;
 public:
     std::string operation;
 
+    static bool unfoldOp(const Layer* self, LayerMath& r, const ConstOperand& side)
+    {
+        return static_cast<const NaryEltwiseLayerImpl*>(self)->unfoldMath(r, side);
+    }
+
+    bool unfoldMath(LayerMath& r, const ConstOperand& side) const
+    {
+        if (side.count != 1) return false;
+        if (inputs.size() != 2) return false;
+        if (op == OPERATION::SUB && !side.flowIsFirstInput) return false;
+
+        FusionEltwiseOp o;
+        switch (op) {
+        case OPERATION::ADD:
+        case OPERATION::SUM:  o = FusionEltwiseOp::ADD; break;
+        case OPERATION::SUB:  o = FusionEltwiseOp::SUB; break;
+        case OPERATION::PROD: o = FusionEltwiseOp::MUL; break;
+        case OPERATION::MAX:  o = FusionEltwiseOp::MAX; break;
+        case OPERATION::MIN:  o = FusionEltwiseOp::MIN; break;
+        default: return false;
+        }
+
+        const FusionConst& k = side.at(0);
+        if (k.isTensor()) {
+            // Only a plain sum is order-independent enough for the host to place freely.
+            if (o != FusionEltwiseOp::ADD)
+                return false;
+            r.binary(o, LayerMath::INPUT_VALUE, r.tensorOperand(k.tensorId));
+            return true;
+        }
+
+        if (o == FusionEltwiseOp::MAX && !k.isBuffer() && k.value == 0.f)
+            r.setKernel(cv::dnn::getActivationFunc(ACTIV_RELU), { 0.f });
+
+        const int operand = k.isBuffer() ? r.perChannelConstant(k.bufferId)
+                                         : r.constant(k.value);
+        r.binary(o, LayerMath::INPUT_VALUE, operand);
+        return true;
+    }
+
     NaryEltwiseLayerImpl(const LayerParams& params)
     {
+        registerFusionOpsOnce<NaryEltwiseLayerImpl>({ &NaryEltwiseLayerImpl::unfoldOp, nullptr });
         setParamsFrom(params);
         operation = toLowerCase(params.get<String>("operation", "sum"));
 
         if (operation == "equal")
             op = OPERATION::EQUAL;
+        else if (operation == "not_equal")
+            op = OPERATION::NOT_EQUAL;
         else if (operation == "greater")
             op = OPERATION::GREATER;
         else if (operation == "greaterorequal")
@@ -241,6 +288,8 @@ public:
             op = OPERATION::BITWISE_OR;
         else if (operation == "bitwise_xor")
             op = OPERATION::BITWISE_XOR;
+        else if (operation == "prelu")
+            op = OPERATION::PRELU;
         else
             CV_Error(cv::Error::StsBadArg, "Unknown operation type \"" + operation + "\"");
     }
@@ -282,11 +331,44 @@ public:
                    op == OPERATION::DIV;
 #endif
 
+#ifdef HAVE_CUDA
         if (backendId == DNN_BACKEND_CUDA) {
+            if (op == OPERATION::EQUAL || op == OPERATION::GREATER || op == OPERATION::GREATER_EQUAL ||
+                op == OPERATION::LESS || op == OPERATION::LESS_EQUAL || op == OPERATION::AND ||
+                op == OPERATION::OR || op == OPERATION::XOR || op == OPERATION::WHERE) {
+                Net::Impl* netimpl_ = getNetImpl(this);
+                if (!netimpl_)
+                    return false;
+                std::vector<int> types;
+                for (const Arg& a : inputs)
+                    types.push_back(netimpl_->argData(a).type);
+                // an intermediate arg has no type until the first forward; refuse only known mismatches
+                auto isCudaType = [](int t) { return t < 0 || isCudaNodeType(t); };
+                auto isBool = [](int t) { return t < 0 || t == CV_Bool; };
+                auto sameType = [](int a, int b) { return a < 0 || b < 0 || a == b; };
+                if (op == OPERATION::WHERE)
+                    return types.size() == 3 && isBool(types[0]) && sameType(types[1], types[2]) &&
+                           isCudaType(types[1]) && isCudaType(types[2]);
+                if (types.size() != 2 || !sameType(types[0], types[1]))
+                    return false;
+                if (op == OPERATION::AND || op == OPERATION::OR || op == OPERATION::XOR)
+                    return isBool(types[0]) && isBool(types[1]);
+                return isCudaType(types[0]) && isCudaType(types[1]);
+            }
+            if (op == OPERATION::POW) {
+                // EltwiseOp reads base and exponent as one float type
+                Net::Impl* netimpl_ = getNetImpl(this);
+                if (!netimpl_ || inputs.size() != 2)
+                    return false;
+                const int tb = netimpl_->argData(inputs[0]).type, te = netimpl_->argData(inputs[1]).type;
+                auto isFloat = [](int t) { return t < 0 || t == CV_32F || t == CV_16F; };
+                return isFloat(tb) && isFloat(te) && (tb < 0 || te < 0 || tb == te);
+            }
             return op == OPERATION::MAX  || op == OPERATION::MIN  || op == OPERATION::SUM ||
                    op == OPERATION::PROD || op == OPERATION::DIV  || op == OPERATION::ADD ||
                    op == OPERATION::SUB  || op == OPERATION::MOD || op == OPERATION::FMOD;
         }
+#endif
         return backendId == DNN_BACKEND_OPENCV;
     }
 
@@ -296,23 +378,26 @@ public:
         size_t i, ninputs = shapes.size();
         CV_Assert(ninputs > 0u);
 
-        int C0 = shapes[0].C, dims0 = shapes[0].dims, maxdims = dims0;
-        bool constC = true;
+        int dims0 = shapes[0].dims, maxdims = dims0, maxC = 0;
+        for (i = 0; i < ninputs; i++)
+            maxC = std::max(maxC, shapes[i].C);
+        // a 1-channel block input broadcasts over the channels, forward() fills its lanes
+        bool broadcastableC = true;
         bool allBlock = true;
         bool constDims = true;
         for (i = 0; i < ninputs; i++) {
             const MatShape& inpShape = shapes[i];
             int dims = inpShape.dims;
             allBlock = allBlock && inpShape.layout == DATA_LAYOUT_BLOCK;
-            constC = constC && inpShape.C == C0;
+            broadcastableC = broadcastableC && (inpShape.C == maxC || inpShape.C == 1);
             constDims = constDims && dims == dims0;
             maxdims = std::max(maxdims, dims);
         }
 
         MatShape outShape(maxdims, 1);
-        if (allBlock && constC && constDims) {
+        if (allBlock && broadcastableC && constDims) {
             outShape.layout = DATA_LAYOUT_BLOCK;
-            outShape.C = C0;
+            outShape.C = maxC;
         }
 
         for (i = 0; i < ninputs; i++)
@@ -340,8 +425,44 @@ public:
         inputs_arr.getMatVector(inputs);
         outputs_arr.getMatVector(outputs);
 
+        computeInNCHW = outputs[0].size.layout == DATA_LAYOUT_BLOCK &&
+                        needsNCHW(inputs, outputs[0]);
         helper.init(inputs, outputs);
         CV_CheckTrue(helper.prepare_for_broadcast_op(), "NaryEltwiseLayer: Preparation for broadcasting failed");
+    }
+
+    // a block input broadcast to another C or rank is computed in NCHW
+    static bool needsNCHW(const std::vector<Mat>& inputs, const Mat& out)
+    {
+        bool hasConst = false, fits = true;
+        for (const Mat& t : inputs) {
+            if (t.size.layout != DATA_LAYOUT_BLOCK) {
+                hasConst = true;
+                fits = fits && t.total() == 1;
+            } else {
+                fits = fits && t.dims == out.dims && t.size.C == out.size.C;
+            }
+        }
+        return hasConst && !fits;
+    }
+
+    void forwardInNCHW(const std::vector<Mat>& inputs, Mat& out)
+    {
+        DataLayout origLayout = getNetImpl(this)->originalLayout;
+        const int C0 = out.size[out.dims - 1];
+        std::vector<Mat> plainInputs(inputs.size()), plainOutputs(1);
+        for (size_t i = 0; i < inputs.size(); i++) {
+            if (inputs[i].size.layout == DATA_LAYOUT_BLOCK)
+                transformLayout(inputs[i], plainInputs[i], origLayout, origLayout, C0);
+            else
+                plainInputs[i] = inputs[i];
+        }
+        MatShape outShape = out.size;
+        plainOutputs[0].fit(outShape.toLayout(origLayout), out.type());
+        helper.init(plainInputs, plainOutputs);
+        CV_CheckTrue(helper.prepare_for_broadcast_op(), "NaryEltwiseLayer: Preparation for broadcasting failed");
+        forward(plainInputs, plainOutputs, noArray());
+        transformLayout(plainOutputs[0], out, DATA_LAYOUT_BLOCK, origLayout, C0);
     }
 
     bool getMemoryShapes(const std::vector<MatShape> &inputs,
@@ -349,8 +470,27 @@ public:
                          std::vector<MatShape> &outputs,
                          std::vector<MatShape> &internals) const CV_OVERRIDE
     {
+        bool anyBlock = false, allBlock = true;
+        for (const MatShape& s : inputs) {
+            anyBlock = anyBlock || s.layout == DATA_LAYOUT_BLOCK;
+            allBlock = allBlock && s.layout == DATA_LAYOUT_BLOCK;
+        }
         if (inputs.size() == 1) {
             outputs.assign(1, inputs.front());
+        } else if (anyBlock && !allBlock) {
+            // constants broadcast in NCHW, the result is in block layout
+            DataLayout origLayout = getNetImpl(this)->originalLayout;
+            std::vector<MatShape> shapes = inputs;
+            int C0 = 0;
+            for (MatShape& s : shapes) {
+                if (s.layout == DATA_LAYOUT_BLOCK) {
+                    C0 = s.back();
+                    s = s.toLayout(origLayout);
+                }
+            }
+            MatShape outShape = findCommonShape(shapes);
+            outShape.layout = origLayout;
+            outputs.assign(1, outShape.toLayout(DATA_LAYOUT_BLOCK, C0));
         } else {
             MatShape outShape = findCommonShape(inputs);
             outputs.assign(1, outShape);
@@ -438,10 +578,21 @@ public:
                 CV_CheckType(input, input == CV_32F || input == CV_64F || input == CV_8S || input == CV_8U || input == CV_16S || input == CV_16U || input == CV_32S || input == CV_32U || input == CV_64S || input == CV_64U, "");
         }
 
-        if (op == OPERATION::EQUAL || op == OPERATION::GREATER || op == OPERATION::GREATER_EQUAL || op == OPERATION::LESS || op == OPERATION::LESS_EQUAL)
+        if (op == OPERATION::EQUAL || op == OPERATION::NOT_EQUAL || op == OPERATION::GREATER || op == OPERATION::GREATER_EQUAL || op == OPERATION::LESS || op == OPERATION::LESS_EQUAL)
             outputs.assign(1, CV_Bool);
         else
             outputs.assign(requiredOutputs, inputs[0]);
+    }
+
+    // a scalar keeps its meaning in block layout; a Div numerator would divide by zero padding
+    bool isBlockConstant(size_t i) const
+    {
+        Net::Impl* netimpl_ = getNetImpl(this);
+        bool opOk = op == OPERATION::ADD || op == OPERATION::SUM || op == OPERATION::SUB ||
+                    op == OPERATION::PROD || op == OPERATION::MAX || op == OPERATION::MIN ||
+                    (op == OPERATION::DIV && i > 0);
+        return opOk && netimpl_->originalLayout == DATA_LAYOUT_NCHW &&
+               netimpl_->isConstArg(inputs[i]) && netimpl_->argTensor(inputs[i]).total() == 1;
     }
 
     int getLayouts(const std::vector<DataLayout>& actualInputs,
@@ -451,15 +602,16 @@ public:
     {
         auto* netimpl_ = getNetImpl(this);
         DataLayout defaultLayout = netimpl_->originalLayout;
-        size_t ninputs = actualInputs.size(), nblockInputs = 0;
+        size_t ninputs = actualInputs.size(), nblockInputs = 0, nconstInputs = 0;
         CV_Assert(ninputs >= 1u);
         for (size_t i = 0; i < ninputs; i++) {
             DataLayout layout = actualInputs[i];
             nblockInputs += layout == DATA_LAYOUT_BLOCK;
+            nconstInputs += layout != DATA_LAYOUT_BLOCK && isBlockConstant(i);
         }
 
         desiredInputs = actualInputs;
-        if (nblockInputs == ninputs) {
+        if (nblockInputs > 0 && nblockInputs + nconstInputs == ninputs) {
             outputs.assign(requiredOutputs, DATA_LAYOUT_BLOCK);
         } else {
             if (nblockInputs < ninputs) {
@@ -515,51 +667,14 @@ public:
             }
         }
 
-        const bool is_add = (this->op == OPERATION::SUM || this->op == OPERATION::ADD);
-        const bool is_sub = (this->op == OPERATION::SUB);
-        const bool is_mul = (this->op == OPERATION::PROD);
-        const bool is_div = (this->op == OPERATION::DIV);
-        const bool simd_f32 = std::is_same<T, float>::value && std::is_same<RESULT_T, float>::value &&
-                              (is_add || is_sub || is_mul || is_div);
-        const int simd_bin_op = is_add ? cpu_baseline::SIMD_BIN_ADD :
-                                is_sub ? cpu_baseline::SIMD_BIN_SUB :
-                                is_mul ? cpu_baseline::SIMD_BIN_MUL :
-                                is_div ? cpu_baseline::SIMD_BIN_DIV : -1;
-
-        // Fast path: fully-flat contiguous float binop -> one big parallel SIMD loop.
-        if (simd_f32 && ndims == 1 && dp1 == 1 && dp2 == 1 && dp == 1) {
-            int64_t total = (int64_t)nplanes * plane_size;
-            const float* p1 = (const float*)data1;
-            const float* p2 = (const float*)data2;
-            float* po = (float*)data;
-            const int64_t chunk = 4096;
-            int64_t nchunks = (total + chunk - 1) / chunk;
-            parallel_for_(Range(0, (int)nchunks), [&](const Range& r) {
-                for (int c = r.start; c < r.end; c++) {
-                    int64_t start = c * chunk;
-                    int64_t end = std::min(start + chunk, total);
-                    int n = (int)(end - start);
-                    simd_binop_f32_dispatch(p1 + start, p2 + start, po + start, n, simd_bin_op);
-                }
-            });
-            return;
-        }
-
         if (nplanes == 1) { // parallelize within the plane
             const T* ptr1 = (const T*)data1;
             const T* ptr2 = (const T*)data2;
             RESULT_T* ptr = (RESULT_T*)data;
             auto worker = [&](const Range &r) {
                 if (dp1 == 1 && dp2 == 1 && dp == 1) {
-                    if (simd_f32) {
-                        const float* p1 = (const float*)(const void*)&ptr1[r.start];
-                        const float* p2 = (const float*)(const void*)&ptr2[r.start];
-                        float* po = (float*)(void*)&ptr[r.start];
-                        simd_binop_f32_dispatch(p1, p2, po, r.end - r.start, simd_bin_op);
-                    } else {
-                        for (int i = r.start; i < r.end; i++)
-                            ptr[i] = op(ptr1[i], ptr2[i]);
-                    }
+                    for (int i = r.start; i < r.end; i++)
+                        ptr[i] = op(ptr1[i], ptr2[i]);
                 } else if (dp1 == 1 && dp2 == 0 && dp == 1){
                     T x2 = *ptr2;
                     for(int i = r.start; i < r.end; i++) {
@@ -599,15 +714,8 @@ public:
                     const T* ptr2 = (const T*)ptr2_;
                     RESULT_T* ptr = (RESULT_T*)ptr_;
                     if (dp1 == 1 && dp2 == 1 && dp == 1) {
-                        if (simd_f32) {
-                            simd_binop_f32_dispatch((const float*)(const void*)ptr1,
-                                                    (const float*)(const void*)ptr2,
-                                                    (float*)(void*)ptr,
-                                                    plane_size, simd_bin_op);
-                        } else {
-                            for (int i = 0; i < plane_size; i++)
-                                ptr[i] = op(ptr1[i], ptr2[i]);
-                        }
+                        for (int i = 0; i < plane_size; i++)
+                            ptr[i] = op(ptr1[i], ptr2[i]);
                     } else if (dp1 == 1 && dp2 == 0 && dp == 1){
                         T x2 = *ptr2;
                         for(int i = 0; i < plane_size; i++) {
@@ -913,6 +1021,156 @@ public:
         }
     }
 
+    static std::string naryExpr(size_t n, const char* sep, const char* open, const char* close)
+    {
+        std::string e = "{0}";
+        for (size_t i = 1; i < n; i++)
+            e = open + e + sep + "{" + std::to_string(i) + "}" + close;
+        return e;
+    }
+
+    static void runExpr(const std::string& expr, const std::vector<Mat>& inps, Mat& out)
+    {
+        std::vector<Mat> res{out};
+        cv::texpr(expr, inps, res);
+        CV_Assert(res[0].data == out.data);
+    }
+
+    // the output header may describe the buffer with another shape; the core functions would reallocate
+    static Mat broadcastHeader(const std::vector<Mat>& inps, const Mat& out, int type)
+    {
+        int dims = 1;
+        for (const Mat& m : inps)
+            dims = std::max(dims, m.dims);
+        int shape[CV_MAX_DIM];
+        for (int i = 0; i < dims; i++)
+        {
+            shape[i] = 1;
+            for (const Mat& m : inps)
+            {
+                int j = i - (dims - m.dims);
+                if (j >= 0 && m.size[j] != 1)
+                    shape[i] = m.size[j];
+            }
+        }
+        return Mat(dims, shape, type, out.data);
+    }
+
+    // Returns false to use the kernels below: integer add/sub/mul/div (the engine saturates,
+    // this layer wraps around), mod, fmod, bitshift, prelu, 2-input mean, broadcasting comparisons.
+    bool forwardCore(const std::vector<Mat>& inputs, const Mat& output) const
+    {
+        // Mat::create() would reallocate a 0-d output
+        std::vector<Mat> inps(inputs);
+        for (Mat& m : inps)
+            if (m.dims == 0)
+            {
+                int one = 1;
+                m = Mat(1, &one, m.type(), m.data);
+            }
+        const size_t n = inps.size();
+        const bool boolOut = op == OPERATION::EQUAL || op == OPERATION::GREATER || op == OPERATION::GREATER_EQUAL ||
+                             op == OPERATION::LESS || op == OPERATION::LESS_EQUAL;
+        if (output.total() == 0 || !output.isContinuous())
+            return false;
+        // comparisons give 0/255 masks, turned into 0/1 bools
+        Mat out = broadcastHeader(inps, output, boolOut ? CV_8U : output.type());
+        if (out.total() != output.total())
+            return false;
+        const int depth = inps[0].depth();
+        const bool isFloat = depth == CV_32F || depth == CV_64F;
+        const bool isInt = depth == CV_8U || depth == CV_8S || depth == CV_16U || depth == CV_16S ||
+                           depth == CV_32U || depth == CV_32S || depth == CV_64U || depth == CV_64S;
+
+        switch (op)
+        {
+        case OPERATION::ADD:
+        case OPERATION::SUM:
+            if (!isFloat) return false;
+            if (n == 2) cv::add(inps[0], inps[1], out);
+            else runExpr(naryExpr(n, "+", "", ""), inps, out);
+            break;
+        case OPERATION::SUB:
+            if (!isFloat || n != 2) return false;
+            cv::subtract(inps[0], inps[1], out);
+            break;
+        case OPERATION::PROD:
+            if (!isFloat) return false;
+            if (n == 2) cv::multiply(inps[0], inps[1], out);
+            else runExpr(naryExpr(n, "*", "", ""), inps, out);
+            break;
+        case OPERATION::DIV:
+            if (!isFloat || n != 2) return false;
+            cv::divide(inps[0], inps[1], out);
+            break;
+        case OPERATION::MAX:
+        case OPERATION::MIN:
+            if (!isFloat && !isInt) return false;
+            if (n == 2)
+            {
+                if (op == OPERATION::MAX) cv::max(inps[0], inps[1], out);
+                else cv::min(inps[0], inps[1], out);
+            }
+            else
+                runExpr(naryExpr(n, ",", op == OPERATION::MAX ? "max(" : "min(", ")"), inps, out);
+            break;
+        case OPERATION::MEAN:
+            // two inputs: the kernel below is faster
+            if (!isFloat || n < 3) return false;
+            runExpr("(" + naryExpr(n, "+", "", "") + ")/" + std::to_string(n), inps, out);
+            break;
+        case OPERATION::POW:
+            // a single exponent goes to cv::pow below
+            if (!isFloat || n != 2 || inps[1].total() == 1) return false;
+            // float pow is not precise enough
+            runExpr(depth == CV_32F ? "float(double({0})**double({1}))" : "{0}**{1}", inps, out);
+            break;
+        case OPERATION::EQUAL:
+        case OPERATION::GREATER:
+        case OPERATION::GREATER_EQUAL:
+        case OPERATION::LESS:
+        case OPERATION::LESS_EQUAL:
+        {
+            // with broadcasting, the kernel below is faster
+            if ((!isFloat && !isInt) || n != 2 || inps[0].size != inps[1].size) return false;
+            const char* cmp = op == OPERATION::EQUAL ? "==" : op == OPERATION::GREATER ? ">" :
+                              op == OPERATION::GREATER_EQUAL ? ">=" : op == OPERATION::LESS ? "<" : "<=";
+            runExpr(std::string("uint8({0} ") + cmp + " {1}) & 1", inps, out);
+            break;
+        }
+        case OPERATION::WHERE:
+        {
+            const int vdepth = inps[1].depth();
+            const bool vok = vdepth == CV_32F || vdepth == CV_64F || vdepth == CV_8U || vdepth == CV_8S ||
+                             vdepth == CV_16U || vdepth == CV_16S || vdepth == CV_32S || vdepth == CV_64S;
+            if (n != 3 || inps[0].depth() != CV_Bool || !vok || inps[2].depth() != vdepth)
+                return false;
+            runExpr("{0} ? {1} : {2}", inps, out);
+            break;
+        }
+        case OPERATION::AND:
+        case OPERATION::OR:
+        case OPERATION::XOR:
+            if (depth != CV_Bool || n != 2) return false;
+            if (op == OPERATION::AND) cv::bitwise_and(inps[0], inps[1], out);
+            else if (op == OPERATION::OR) cv::bitwise_or(inps[0], inps[1], out);
+            else cv::bitwise_xor(inps[0], inps[1], out);
+            break;
+        case OPERATION::BITWISE_AND:
+        case OPERATION::BITWISE_OR:
+        case OPERATION::BITWISE_XOR:
+            if (!isInt || n != 2) return false;
+            if (op == OPERATION::BITWISE_AND) cv::bitwise_and(inps[0], inps[1], out);
+            else if (op == OPERATION::BITWISE_OR) cv::bitwise_or(inps[0], inps[1], out);
+            else cv::bitwise_xor(inps[0], inps[1], out);
+            break;
+        default:
+            return false;
+        }
+        CV_Assert(out.data == output.data);
+        return true;
+    }
+
     void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE
     {
         CV_TRACE_FUNCTION();
@@ -928,8 +1186,16 @@ public:
         inputs_arr.getMatVector(inputs);
         outputs_arr.getMatVector(outputs);
 
+        if (outputs[0].total() == 0)
+            return;
+
         if (inputs.size() == 1) {
             inputs[0].copyTo(outputs[0]);
+            return;
+        }
+
+        if (computeInNCHW && outputs[0].size.layout == DATA_LAYOUT_BLOCK) {
+            forwardInNCHW(inputs, outputs[0]);
             return;
         }
 
@@ -970,6 +1236,29 @@ public:
             CV_CheckTrue(helper.prepare_for_broadcast_op(), "NaryEltwiseLayer: Preparation for broadcasting failed");
         }
 
+        // a 1-channel block tensor keeps its value in lane 0 only, so copy it into every lane before broadcasting
+        const MatShape outShape0 = out0.shape();
+        bool filledLanes = false;
+        if (outShape0.layout == DATA_LAYOUT_BLOCK && outShape0.C > 1) {
+            for (Mat& inp : used_inputs) {
+                const MatShape s = inp.shape();
+                if (s.layout != DATA_LAYOUT_BLOCK || s.C != 1)
+                    continue;
+                std::vector<Range> lane0(s.dims, Range::all());
+                lane0[s.dims - 1] = Range(0, 1);
+                std::vector<int> reps(s.dims, 1);
+                reps[s.dims - 1] = s[s.dims - 1];
+                Mat full;
+                cv::repeat(inp(lane0), reps, full);
+                inp = full;
+                filledLanes = true;
+            }
+        }
+        if (filledLanes) {
+            helper.init(used_inputs, outputs);
+            CV_CheckTrue(helper.prepare_for_broadcast_op(), "NaryEltwiseLayer: Preparation for broadcasting failed");
+        }
+
         if (op == OPERATION::POW) {
             CV_Assert(used_inputs.size() == 2);
             const int out_type = outputs[0].type();
@@ -983,6 +1272,9 @@ public:
             }
         }
 
+        if (forwardCore(used_inputs, outputs[0]))
+            return;
+
         int type_for_dispatch = (op == OPERATION::WHERE || op == OPERATION::POW) ? outputs.front().type() : used_inputs.front().type();
         typeDispatch(type_for_dispatch, used_inputs.size(), used_inputs, outputs);
     }
@@ -995,6 +1287,11 @@ public:
                 case OPERATION::EQUAL: {
                     auto equal = [](const T &a, const T &b) { return a == b; };
                     binary_forward<T, bool>(equal, std::forward<Args>(args)...);
+                    break;
+                }
+                case OPERATION::NOT_EQUAL: {
+                    auto not_equal = [](const T &a, const T &b) { return a != b; };
+                    binary_forward<T, bool>(not_equal, std::forward<Args>(args)...);
                     break;
                 }
                 case OPERATION::GREATER: {
@@ -1043,7 +1340,7 @@ public:
                     break;
                 }
                 case OPERATION::MOD: {
-                    auto mod = [] (const T &a, const T &b) { return static_cast<T>(_mod(int(a), int(b))); };
+                    auto mod = [] (const T &a, const T &b) { return _mod<T>(a, b); };
                     binary_forward<T, T>(mod, std::forward<Args>(args)...);
                     break;
                 }
@@ -1086,6 +1383,11 @@ public:
                 case OPERATION::BITWISE_XOR: {
                     auto bxor = [](const T &a, const T &b) { return (T)(a ^ b); };
                     binary_forward<T, T>(bxor, std::forward<Args>(args)...);
+                    break;
+                }
+                case OPERATION::PRELU: {
+                    auto prelu = [](const T &a, const T &b) { return a < T{0} ? (T)(a * b) : a; };
+                    binary_forward<T, T>(prelu, std::forward<Args>(args)...);
                     break;
                 }
                 default: CV_Error(Error::StsBadArg, "Unsupported operation");
@@ -1132,6 +1434,11 @@ public:
                     binary_forward<T, bool>(equal, std::forward<Args>(args)...);
                     break;
                 }
+                case OPERATION::NOT_EQUAL: {
+                    auto not_equal = [](const T &a, const T &b) { return a != b; };
+                    binary_forward<T, bool>(not_equal, std::forward<Args>(args)...);
+                    break;
+                }
                 case OPERATION::GREATER: {
                     auto greater = [](const T &a, const T &b) { return a > b; };
                     binary_forward<T, bool>(greater, std::forward<Args>(args)...);
@@ -1173,7 +1480,7 @@ public:
                     break;
                 }
                 case OPERATION::MOD: {
-                    auto mod = [] (const T &a, const T &b) { return static_cast<T>(_mod(int(a), int(b))); };
+                    auto mod = [] (const T &a, const T &b) { return _mod<T>(a, b); };
                     binary_forward<T, T>(mod, std::forward<Args>(args)...);
                     break;
                 }
@@ -1201,6 +1508,11 @@ public:
                 case OPERATION::DIV: {
                     auto div = [](const T &a, const T &b) { return a / b; };
                     binary_forward<T, T>(div, std::forward<Args>(args)...);
+                    break;
+                }
+                case OPERATION::PRELU: {
+                    auto prelu = [](const T &a, const T &b) { return a < T{0} ? (T)(a * b) : a; };
+                    binary_forward<T, T>(prelu, std::forward<Args>(args)...);
                     break;
                 }
                 default: CV_Error(Error::StsBadArg, "Unsupported operation");
@@ -1320,11 +1632,37 @@ public:
 #ifdef HAVE_CUDA
     Ptr<BackendNode> initCUDA(
         void *context_,
-        const std::vector<Ptr<BackendWrapper>>& inputs,
-        const std::vector<Ptr<BackendWrapper>>& outputs
+        InputArrayOfArrays inputs_,
+        InputArrayOfArrays outputs
     ) override
     {
         auto context = reinterpret_cast<csl::CSLContext*>(context_);
+        std::vector<UMat> inputs;
+        inputs_.getUMatVector(inputs);
+
+        if (op == OPERATION::WHERE) {
+            if (inputs[1].depth() == CV_Bool)
+                return make_cuda_node_bool<cuda4dnn::WhereOp>(std::move(context->stream));
+            return make_cuda_node_with_type<cuda4dnn::WhereOp>(preferableTarget, inputs[1].type(), std::move(context->stream));
+        }
+        if (op == OPERATION::AND || op == OPERATION::OR || op == OPERATION::XOR) {
+            const cuda4dnn::LogicalOpType logicalOp = op == OPERATION::AND ? cuda4dnn::LogicalOpType::AND :
+                                                      op == OPERATION::OR  ? cuda4dnn::LogicalOpType::OR :
+                                                                             cuda4dnn::LogicalOpType::XOR;
+            return make_cuda_node_bool<cuda4dnn::LogicalOp>(std::move(context->stream), logicalOp);
+        }
+        if (op == OPERATION::EQUAL || op == OPERATION::GREATER || op == OPERATION::GREATER_EQUAL ||
+            op == OPERATION::LESS || op == OPERATION::LESS_EQUAL) {
+            const cuda4dnn::CompareOpType compareOp =
+                op == OPERATION::EQUAL         ? cuda4dnn::CompareOpType::EQUAL :
+                op == OPERATION::GREATER       ? cuda4dnn::CompareOpType::GREATER :
+                op == OPERATION::GREATER_EQUAL ? cuda4dnn::CompareOpType::GREATER_EQUAL :
+                op == OPERATION::LESS          ? cuda4dnn::CompareOpType::LESS :
+                                                 cuda4dnn::CompareOpType::LESS_EQUAL;
+            if (inputs[0].depth() == CV_Bool)
+                return make_cuda_node_bool<cuda4dnn::CompareOp>(std::move(context->stream), compareOp);
+            return make_cuda_node_with_type<cuda4dnn::CompareOp>(preferableTarget, inputs[0].type(), std::move(context->stream), compareOp);
+        }
 
         cuda4dnn::EltwiseOpType op_ = cuda4dnn::EltwiseOpType::SUM;
         switch (op) {
@@ -1361,7 +1699,7 @@ public:
             default: return Ptr<BackendNode>(); // return empty cuda_node if the EltwiseOpType is unsupported type.
         };
 
-        return make_cuda_node_with_type<cuda4dnn::EltwiseOp>(preferableTarget, inputs[0]->getHostMatDepth(), std::move(context->stream), op_, std::vector<float>());
+        return make_cuda_node_with_type<cuda4dnn::EltwiseOp>(preferableTarget, CV_MAT_DEPTH(inputs[0].type()), std::move(context->stream), op_, std::vector<float>());
     }
 #endif
 

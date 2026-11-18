@@ -78,6 +78,12 @@ static const char* oclop2str[] = { "OP_ADD", "OP_SUB", "OP_RSUB", "OP_ABSDIFF",
     "OP_MUL", "OP_MUL_SCALE", "OP_DIV_SCALE", "OP_RECIP_SCALE",
     "OP_ADDW", "OP_AND", "OP_OR", "OP_XOR", "OP_NOT", "OP_MIN", "OP_MAX", "OP_RDIV_SCALE", 0 };
 
+// depths with no OpenCL type name (ocl::typeToStr() asserts on them)
+static inline bool noOclType(int depth)
+{
+    return depth == CV_16BF || depth == CV_Bool || depth == CV_8F_E4M3FN || depth == CV_8F_E4M3FNUZ;
+}
+
 static bool ocl_binary_op(InputArray _src1, InputArray _src2, OutputArray _dst,
                           InputArray _mask, bool bitwise, int oclop, bool haveScalar )
 {
@@ -89,7 +95,8 @@ static bool ocl_binary_op(InputArray _src1, InputArray _src2, OutputArray _dst,
     const ocl::Device d = ocl::Device::getDefault();
     bool doubleSupport = d.doubleFPConfig() > 0;
     if( oclop < 0 || ((haveMask || haveScalar) && cn > 4) ||
-            (!doubleSupport && srcdepth == CV_64F && !bitwise))
+            (!doubleSupport && srcdepth == CV_64F && !bitwise) ||
+            (noOclType(srcdepth) && !bitwise))
         return false;
 
     char opts[1024];
@@ -223,7 +230,8 @@ void cv::bitwise_not(InputArray a, OutputArray c, InputArray mask)
 {
     CV_INSTRUMENT_REGION();
 
-    CV_OCL_RUN((a.isUMat() || c.isUMat()) && a.dims() <= 2,
+    // CV_Bool has no OpenCL type and needs a logical NOT, so it always uses the CPU kernel
+    CV_OCL_RUN((a.isUMat() || c.isUMat()) && a.dims() <= 2 && a.depth() != CV_Bool,
                bitwise_op_ocl(a, a, c, mask, OCL_OP_NOT))
     unary_op(ew::OP_NOT, a, c, mask, -1);
 }
@@ -336,6 +344,9 @@ static bool ocl_arithm_op(InputArray _src1, InputArray _src2, OutputArray _dst,
     wtype = CV_MAKETYPE(wdepth, cn);
     int type2 = haveScalar ? wtype : _src2.type(), depth2 = CV_MAT_DEPTH(type2);
     if (!doubleSupport && (depth2 == CV_64F || depth1 == CV_64F))
+        return false;
+
+    if (noOclType(depth1) || noOclType(depth2) || noOclType(ddepth) || noOclType(wdepth))
         return false;
 
     int kercn = haveMask || haveScalar ? cn : ocl::predictOptimalVectorWidth(_src1, _src2, _dst);
@@ -623,9 +634,11 @@ enum { ARITHM_SMALL_DIRECT = 100000 };
 static void arithm_op(ew::TOp op, InputArray src1, InputArray src2, OutputArray dst,
                       InputArray mask, int dtype, int oclop, bool muldiv, const Scalar& params)
 {
-    CV_Assert(src1.empty() == src2.empty());
-    if (src1.empty() && src2.empty())          // empty inputs -> empty result
+    if (src1.empty() || src2.empty())          // empty inputs -> empty result
     {
+        CV_Assert((src1.empty() && src2.empty()) ||
+                  (src1.empty() && isScalarArg(src2, src1.channels())) ||
+                  (src2.empty() && isScalarArg(src1, src2.channels())));
         dst.release();
         if (dtype >= 0)
             dst.create(0, 0, dtype);
@@ -636,7 +649,8 @@ static void arithm_op(ew::TOp op, InputArray src1, InputArray src2, OutputArray 
     // broadcast, cn>4 masked, ...) - then the CPU engine below handles it (mapping the UMat via getMat).
     // oclop < 0 is a sentinel: the caller (e.g. cv::compare) already ran its own OpenCL path, so this
     // helper only runs the CPU engine (a UMat operand is mapped via getMat).
-    if (oclop >= 0 && (src1.isUMat() || src2.isUMat() || dst.isUMat()))
+    if (oclop >= 0 && cv::ocl::isOpenCLActivated() &&
+        (src1.isUMat() || src2.isUMat() || dst.isUMat()))
     {
         double abg[3] = { params[0], params[1], params[2] }, scale = params[0];
         void* usrdata = (op == ew::OP_ADDW) ? (void*)abg : (muldiv ? (void*)&scale : nullptr);
@@ -646,7 +660,7 @@ static void arithm_op(ew::TOp op, InputArray src1, InputArray src2, OutputArray 
 
     const bool haveMask = !mask.empty();
     const int cn1 = src1.channels(), cn2 = src2.channels();
-    bool s1 = isScalarArg(src1, cn2), s2 = isScalarArg(src2, cn1);
+    bool s1 = isScalarArg(src1, src2), s2 = isScalarArg(src2, src1);
     if (s1 && s2)
         s1 = s2 = false;    // two scalars: treat both as tiny array operands (element-wise + broadcast),
                             // matching arithm_op (Scalar+Scalar -> 4x1, number+number -> 1x1, ...)
@@ -1002,6 +1016,10 @@ static bool ocl_compare(InputArray _src1, InputArray _src2, OutputArray _dst, in
             type2 = _src2.type(), depth2 = CV_MAT_DEPTH(type2);
 
     if (!doubleSupport && depth1 == CV_64F)
+        return false;
+
+    // the integer scalar path below works in int; let the CPU handle the wider 5.x integer depths
+    if (haveScalar && (depth1 == CV_32U || depth1 == CV_64U || depth1 == CV_64S))
         return false;
 
     if (!haveScalar && (!_src1.sameSize(_src2) || type1 != type2))
@@ -1459,10 +1477,13 @@ struct InRange_SIMD<double>
 #endif
 
 template <typename T>
-static void inRange_(const T* src1, size_t step1, const T* src2, size_t step2,
-         const T* src3, size_t step3, uchar* dst, size_t step,
+static void inRange_(const void* _src1, size_t step1, const void* _src2, size_t step2,
+         const void* _src3, size_t step3, uchar* dst, size_t step,
          Size size)
 {
+    const T* src1 = (const T*)_src1;
+    const T* src2 = (const T*)_src2;
+    const T* src3 = (const T*)_src3;
     step1 /= sizeof(src1[0]);
     step2 /= sizeof(src2[0]);
     step3 /= sizeof(src3[0]);
@@ -1489,79 +1510,6 @@ static void inRange_(const T* src1, size_t step1, const T* src2, size_t step2,
     }
 }
 
-
-static void inRange8u(const uchar* src1, size_t step1, const uchar* src2, size_t step2,
-                      const uchar* src3, size_t step3, uchar* dst, size_t step, Size size)
-{
-    inRange_(src1, step1, src2, step2, src3, step3, dst, step, size);
-}
-
-static void inRange8s(const schar* src1, size_t step1, const schar* src2, size_t step2,
-                      const schar* src3, size_t step3, uchar* dst, size_t step, Size size)
-{
-    inRange_(src1, step1, src2, step2, src3, step3, dst, step, size);
-}
-
-static void inRange16u(const ushort* src1, size_t step1, const ushort* src2, size_t step2,
-                       const ushort* src3, size_t step3, uchar* dst, size_t step, Size size)
-{
-    inRange_(src1, step1, src2, step2, src3, step3, dst, step, size);
-}
-
-static void inRange16s(const short* src1, size_t step1, const short* src2, size_t step2,
-                       const short* src3, size_t step3, uchar* dst, size_t step, Size size)
-{
-    inRange_(src1, step1, src2, step2, src3, step3, dst, step, size);
-}
-
-static void inRange32u(const unsigned* src1, size_t step1, const unsigned* src2, size_t step2,
-                       const unsigned* src3, size_t step3, uchar* dst, size_t step, Size size)
-{
-    inRange_(src1, step1, src2, step2, src3, step3, dst, step, size);
-}
-
-static void inRange32s(const int* src1, size_t step1, const int* src2, size_t step2,
-                       const int* src3, size_t step3, uchar* dst, size_t step, Size size)
-{
-    inRange_(src1, step1, src2, step2, src3, step3, dst, step, size);
-}
-
-static void inRange64u(const uint64* src1, size_t step1, const uint64* src2, size_t step2,
-                       const uint64* src3, size_t step3, uchar* dst, size_t step, Size size)
-{
-    inRange_(src1, step1, src2, step2, src3, step3, dst, step, size);
-}
-
-static void inRange64s(const int64* src1, size_t step1, const int64* src2, size_t step2,
-                       const int64* src3, size_t step3, uchar* dst, size_t step, Size size)
-{
-    inRange_(src1, step1, src2, step2, src3, step3, dst, step, size);
-}
-
-static void inRange32f(const float* src1, size_t step1, const float* src2, size_t step2,
-                       const float* src3, size_t step3, uchar* dst, size_t step, Size size)
-{
-    inRange_(src1, step1, src2, step2, src3, step3, dst, step, size);
-}
-
-static void inRange64f(const double* src1, size_t step1, const double* src2, size_t step2,
-                       const double* src3, size_t step3, uchar* dst, size_t step, Size size)
-{
-    inRange_(src1, step1, src2, step2, src3, step3, dst, step, size);
-}
-
-static void inRange16f(const hfloat* src1, size_t step1, const hfloat* src2, size_t step2,
-                       const hfloat* src3, size_t step3, uchar* dst, size_t step, Size size)
-{
-    inRange_(src1, step1, src2, step2, src3, step3, dst, step, size);
-}
-
-static void inRange16bf(const bfloat* src1, size_t step1, const bfloat* src2, size_t step2,
-                        const bfloat* src3, size_t step3, uchar* dst, size_t step, Size size)
-{
-    inRange_(src1, step1, src2, step2, src3, step3, dst, step, size);
-}
-
 static void inRangeReduce(const uchar* src, uchar* dst, size_t len, int cn)
 {
     int k = cn % 4 ? cn % 4 : 4;
@@ -1586,26 +1534,26 @@ static void inRangeReduce(const uchar* src, uchar* dst, size_t len, int cn)
     }
 }
 
-typedef void (*InRangeFunc)( const uchar* src1, size_t step1, const uchar* src2, size_t step2,
-                             const uchar* src3, size_t step3, uchar* dst, size_t step, Size sz );
+typedef void (*InRangeFunc)( const void* src1, size_t step1, const void* src2, size_t step2,
+                             const void* src3, size_t step3, uchar* dst, size_t step, Size sz );
 
 static InRangeFunc getInRangeFunc(int depth)
 {
     static InRangeFunc inRangeTab[CV_DEPTH_MAX] =
     {
-        (InRangeFunc)GET_OPTIMIZED(inRange8u),
-        (InRangeFunc)GET_OPTIMIZED(inRange8s),
-        (InRangeFunc)GET_OPTIMIZED(inRange16u),
-        (InRangeFunc)GET_OPTIMIZED(inRange16s),
-        (InRangeFunc)GET_OPTIMIZED(inRange32s),
-        (InRangeFunc)GET_OPTIMIZED(inRange32f),
-        (InRangeFunc)GET_OPTIMIZED(inRange64f),
-        (InRangeFunc)inRange16f,
-        (InRangeFunc)inRange16bf,
+        inRange_<uchar>,
+        inRange_<schar>,
+        inRange_<ushort>,
+        inRange_<short>,
+        inRange_<int>,
+        inRange_<float>,
+        inRange_<double>,
+        inRange_<hfloat>,
+        inRange_<bfloat>,
         0,
-        (InRangeFunc)GET_OPTIMIZED(inRange64u),
-        (InRangeFunc)GET_OPTIMIZED(inRange64s),
-        (InRangeFunc)GET_OPTIMIZED(inRange32u),
+        inRange_<uint64_t>,
+        inRange_<int64_t>,
+        inRange_<unsigned>,
         0,
     };
 
@@ -1738,6 +1686,9 @@ void cv::inRange(InputArray _src, InputArray _lowerb,
     CV_INSTRUMENT_REGION();
 
     CV_Assert(! _src.empty());
+    if (!getInRangeFunc(_src.depth()))
+        CV_Error( cv::Error::StsNotImplemented,
+                 "inRange: CV_Bool and CV_8F inputs are not supported, convert the input to another type first");
 
     CV_OCL_RUN(_src.dims() <= 2 && _lowerb.dims() <= 2 &&
                _upperb.dims() <= 2 && OCL_PERFORMANCE_CHECK(_dst.isUMat()),

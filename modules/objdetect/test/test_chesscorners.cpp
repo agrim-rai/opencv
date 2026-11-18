@@ -149,7 +149,7 @@ void CV_ChessboardDetectorTest::run( int /*start_from */)
     {
         case CHESSBOARD_SB:
             checkByGeneratorHighAccuracy();      // not supported by CHESSBOARD
-            /* fallthrough */
+            [[fallthrough]];
         case CHESSBOARD_PLAIN:
             checkByGenerator();
             if (ts->get_err_code() != cvtest::TS::OK)
@@ -452,11 +452,9 @@ bool CV_ChessboardDetectorTest::checkByGenerator()
     randu(bg, Scalar::all(0), Scalar::all(255));
     GaussianBlur(bg, bg, Size(5, 5), 0.0);
 
-    Mat_<float> camMat(3, 3);
-    camMat << 300.f, 0.f, bg.cols/2.f, 0, 300.f, bg.rows/2.f, 0.f, 0.f, 1.f;
+    Mat_<float> camMat({3, 3}, {300.f, 0.f, bg.cols/2.f, 0, 300.f, bg.rows/2.f, 0.f, 0.f, 1.f});
 
-    Mat_<float> distCoeffs(1, 5);
-    distCoeffs << 1.2f, 0.2f, 0.f, 0.f, 0.f;
+    Mat_<float> distCoeffs({1, 5}, {1.2f, 0.2f, 0.f, 0.f, 0.f});
 
     const Size sizes[] = { Size(6, 6), Size(8, 6), Size(11, 12),  Size(5, 4) };
     const size_t sizes_num = sizeof(sizes)/sizeof(sizes[0]);
@@ -527,8 +525,7 @@ bool CV_ChessboardDetectorTest::checkByGenerator()
 
         Point2f c = std::accumulate(cg.begin(), cg.end(), Point2f(), std::plus<Point2f>()) * (1.f/cg.size());
 
-        Mat_<double> aff(2, 3);
-        aff << 1.0, 0.0, -(double)c.x, 0.0, 1.0, 0.0;
+        Mat_<double> aff({2, 3}, {1.0, 0.0, -(double)c.x, 0.0, 1.0, 0.0});
         Mat sh;
         warpAffine(cb, sh, aff, cb.size());
 
@@ -603,7 +600,7 @@ bool CV_ChessboardDetectorTest::checkByGeneratorHighAccuracy()
     for(auto &&pt : pts1_all)
     {
         // calc camera ray
-        cv::Vec3f ray(float((pt.x-center.x)*fxi),float((pt.y-center.y)*fyi),1.0F);
+        cv::Vec3f ray(float((pt.x-center.x)*fxi),float((pt.y-(double)center.y)*fyi),1.0F);
         ray /= cv::norm(ray);
 
         // intersect ray with virtual plane
@@ -629,7 +626,7 @@ bool CV_ChessboardDetectorTest::checkByGeneratorHighAccuracy()
         // project 3d points to new camera
         Vec3f rvec(0.0F,0.05F,float(float(i)/180.0*CV_PI));
         Vec3f tvec(0,0,0);
-        cv::Mat k = (cv::Mat_<double>(3,3) << fx/2,0,center.x*2, 0,fy/2,center.y, 0,0,1);
+        cv::Mat k = cv::Mat_<double>({3, 3}, {fx/2,0,(double)center.x*2, 0,fy/2,(double)center.y, 0,0,1});
         cv::projectPoints(pts3d,rvec,tvec,k,cv::Mat(),pts2_all);
 
         // get perspective transform using four correspondences and wrap original image
@@ -955,6 +952,53 @@ TEST(Calib3d_CornerOrdering, issue_26830) {
     ASSERT_TRUE(cv::findChessboardCornersSB(image, Size(4, 4), cornersMinimumSizeSmallerThanPatternSize, CALIB_CB_MARKER | CALIB_CB_LARGER));
 
     ASSERT_EQ(cornersMinimumSizeMatchesPatternSize, cornersMinimumSizeSmallerThanPatternSize);
+}
+
+// findChessboardCorners() falls back to checkChessboard() under CALIB_CB_FAST_CHECK
+// (calibinit.cpp), so a false negative here costs a detection.
+//
+// checkChessboard() is deliberately not required to agree with findChessboardCorners():
+// it is a permissive pre-filter, and the two legitimately differ on
+// chessboard-artificial2.png, where checkChessboard() is the one that gets it right.
+TEST(Calib3d_CheckChessboard, accuracy)
+{
+    const string folder = string(cvtest::TS::ptr()->get_data_path()) + "cameracalibration/";
+    const string listname = folder + "chessboard_timing_list.dat";
+
+    FileStorage fs(listname, FileStorage::READ);
+    ASSERT_TRUE(fs.isOpened()) << "Could not read " << listname;
+
+    FileNode boards = fs["boards"];
+    ASSERT_TRUE(boards.isSeq()) << listname << " does not contain a 'boards' sequence";
+    ASSERT_EQ(size_t(0), boards.size() % 4) << listname << " is malformed";
+
+    const int count = (int)boards.size() / 4;
+    ASSERT_GT(count, 0) << listname << " lists no images";
+
+    FileNodeIterator it = boards.begin();
+    for (int i = 0; i < count; i++)
+    {
+        string imgname;
+        int isChessboard = 0;
+        Size patternSize;
+        read(*it++, imgname, "dummy.txt");
+        read(*it++, isChessboard, 0);
+        read(*it++, patternSize.width, -1);
+        read(*it++, patternSize.height, -1);
+
+        SCOPED_TRACE(cv::format("image %d/%d: %s", i + 1, count, imgname.c_str()));
+
+        Mat img = imread(folder + imgname);
+        ASSERT_FALSE(img.empty()) << "Could not read " << folder << imgname;
+        ASSERT_GT(patternSize.width, 0);
+        ASSERT_GT(patternSize.height, 0);
+
+        Mat gray;
+        cvtColor(img, gray, COLOR_BGR2GRAY);
+
+        // EXPECT, not ASSERT: report every image rather than stopping at the first.
+        EXPECT_EQ(isChessboard != 0, checkChessboard(gray, patternSize));
+    }
 }
 
 }} // namespace

@@ -13,6 +13,15 @@ typedef void (*MinMaxIdxFunc)(const uchar* data, const uchar* mask,
 
 CV_CPU_OPTIMIZATION_NAMESPACE_BEGIN
 
+template<typename T, typename WT, void (*fn)(const T*, const uchar*, WT*, WT*, size_t*, size_t*, int, size_t)>
+static void minMaxIdxWrap(const uchar* data, const uchar* mask,
+                          void* minval, void* maxval,
+                          size_t* minidx, size_t* maxidx,
+                          int len, size_t startidx)
+{
+    fn((const T*)data, mask, (WT*)minval, (WT*)maxval, minidx, maxidx, len, startidx);
+}
+
 MinMaxIdxFunc getMinMaxIdxFunc(int depth);
 
 #ifndef CV_CPU_OPTIMIZATION_DECLARATIONS_ONLY
@@ -365,23 +374,42 @@ DEFINE_MINMAXIDX_FUNC_NOSIMD(minMaxIdx64u, uint64, uint64)
 DEFINE_MINMAXIDX_FUNC_NOSIMD(minMaxIdx64s, int64, int64)
 DEFINE_MINMAXIDX_FUNC_NOSIMD(minMaxIdx32u, unsigned, int64)
 
+// fp8 values are sign-magnitude, like float: CV_TOGGLE_FP8 maps them to int8 values in the
+// same order, so the vectorized s8 kernel can find the extrema. The values it returns are
+// toggled; minMaxIdx() toggles them back and decodes them.
+static void minMaxIdx8f(const uchar* src, const uchar* mask, int* minVal, int* maxVal,
+                        size_t* minIdx, size_t* maxIdx, int len, size_t startIdx)
+{
+    const int BLOCK_SIZE = 1024;
+    schar buf[BLOCK_SIZE];
+    for (int i = 0; i < len; i += BLOCK_SIZE)
+    {
+        const int n = std::min(len - i, BLOCK_SIZE);
+        for (int j = 0; j < n; j++)
+            buf[j] = (schar)CV_TOGGLE_FP8(src[i + j]);
+        minMaxIdx8s(buf, mask ? mask + i : nullptr, minVal, maxVal, minIdx, maxIdx, n, startIdx + i);
+    }
+}
+
 MinMaxIdxFunc getMinMaxIdxFunc(int depth)
 {
     static MinMaxIdxFunc minMaxIdxTab[CV_DEPTH_MAX] =
     {
-        (MinMaxIdxFunc)GET_OPTIMIZED(minMaxIdx8u),
-        (MinMaxIdxFunc)GET_OPTIMIZED(minMaxIdx8s),
-        (MinMaxIdxFunc)GET_OPTIMIZED(minMaxIdx16u),
-        (MinMaxIdxFunc)GET_OPTIMIZED(minMaxIdx16s),
-        (MinMaxIdxFunc)GET_OPTIMIZED(minMaxIdx32s),
-        (MinMaxIdxFunc)GET_OPTIMIZED(minMaxIdx32f),
-        (MinMaxIdxFunc)GET_OPTIMIZED(minMaxIdx64f),
-        (MinMaxIdxFunc)GET_OPTIMIZED(minMaxIdx16f),
-        (MinMaxIdxFunc)GET_OPTIMIZED(minMaxIdx16bf),
-        (MinMaxIdxFunc)GET_OPTIMIZED(minMaxIdx8u),
-        (MinMaxIdxFunc)GET_OPTIMIZED(minMaxIdx64u),
-        (MinMaxIdxFunc)GET_OPTIMIZED(minMaxIdx64s),
-        (MinMaxIdxFunc)GET_OPTIMIZED(minMaxIdx32u),
+        minMaxIdxWrap<uchar, int, minMaxIdx8u>,
+        minMaxIdxWrap<schar, int, minMaxIdx8s>,
+        minMaxIdxWrap<ushort, int, minMaxIdx16u>,
+        minMaxIdxWrap<short, int, minMaxIdx16s>,
+        minMaxIdxWrap<int, int, minMaxIdx32s>,
+        minMaxIdxWrap<float, float, minMaxIdx32f>,
+        minMaxIdxWrap<double, double, minMaxIdx64f>,
+        minMaxIdxWrap<hfloat, float, minMaxIdx16f>,
+        minMaxIdxWrap<bfloat, float, minMaxIdx16bf>,
+        minMaxIdxWrap<uchar, int, minMaxIdx8u>,
+        minMaxIdxWrap<uint64, uint64, minMaxIdx64u>,
+        minMaxIdxWrap<int64, int64, minMaxIdx64s>,
+        minMaxIdxWrap<unsigned, int64, minMaxIdx32u>,
+        minMaxIdxWrap<uchar, int, minMaxIdx8f>,
+        minMaxIdxWrap<uchar, int, minMaxIdx8f>,
         0
     };
 

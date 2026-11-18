@@ -43,6 +43,10 @@
 #include "opencv2/ts/ts_gtest.h"
 #include "test_precomp.hpp"
 
+#include <chrono>
+#include <future>
+#include <thread>
+
 namespace opencv_test { namespace {
 
 class CV_ImgWarpBaseTest : public cvtest::ArrayTest
@@ -862,6 +866,62 @@ TEST(Resize, nearest_regression_15075)
     EXPECT_EQ(C, cvtest::norm(dst, NORM_L1)) << src.size;
 }
 
+// Horizontal upscaling of 8UC1 (fx > 1) exercises the carotene NEON path
+// (downsample_bilinear_8uc1, wr < 1) on ARM. The leftmost output column used
+// to extrapolate because the negative sample coordinate produced an
+// out-of-range interpolation weight. Compare against a double-precision
+// bilinear reference; the first column must match like any other.
+// Uses sizes where sw*fx is integral so only the horizontal-upscale path is
+// under test (no dsize-rounding effects). On non-ARM builds this simply
+// verifies the scalar path stays correct.
+TEST(Resize, horizontal_upscale_left_edge_regression)
+{
+    RNG& rng = theRNG();
+    const struct { int sw, sh; double fx, fy; } cases[] = {
+        { 100, 100, 1.5, 0.5 },
+        { 200, 100, 1.5, 0.5 },
+        {  64,  64, 1.5, 1.0 },
+        { 128,  96, 2.0, 0.5 },
+    };
+
+    for (const auto& c : cases)
+    {
+        SCOPED_TRACE(cv::format("%dx%d fx=%.1f fy=%.1f", c.sw, c.sh, c.fx, c.fy));
+        Mat src(c.sh, c.sw, CV_8UC1);
+        rng.fill(src, RNG::UNIFORM, 0, 256);
+
+        Mat dst;
+        cv::resize(src, dst, Size(), c.fx, c.fy, INTER_LINEAR);
+
+        const double rx = (double)dst.cols / c.sw, ry = (double)dst.rows / c.sh;
+        double maxdiff = 0;
+        for (int dy = 0; dy < dst.rows; dy++)
+        {
+            double sy = (dy + 0.5) / ry - 0.5;
+            int y0 = cvFloor(sy); double v = sy - y0;
+            if (y0 < 0) { y0 = 0; v = 0; }
+            if (y0 >= c.sh) { y0 = c.sh - 1; v = 0; }
+            int y1 = std::min(y0 + 1, c.sh - 1);
+            for (int dx = 0; dx < dst.cols; dx++)
+            {
+                double sx = (dx + 0.5) / rx - 0.5;
+                int x0 = cvFloor(sx); double u = sx - x0;
+                if (x0 < 0) { x0 = 0; u = 0; }
+                if (x0 >= c.sw) { x0 = c.sw - 1; u = 0; }
+                int x1 = std::min(x0 + 1, c.sw - 1);
+                double ref = (1 - u) * (1 - v) * src.at<uchar>(y0, x0)
+                           + u * (1 - v) * src.at<uchar>(y0, x1)
+                           + (1 - u) * v * src.at<uchar>(y1, x0)
+                           + u * v * src.at<uchar>(y1, x1);
+                maxdiff = std::max(maxdiff, std::abs(ref - dst.at<uchar>(dy, dx)));
+            }
+        }
+        // Allow small fixed-point rounding differences; the pre-fix carotene
+        // bug produced first-column errors of ~100+.
+        EXPECT_LE(maxdiff, 3.0);
+    }
+}
+
 TEST(Imgproc_Warp, multichannel)
 {
     static const int inter_types[] = {INTER_NEAREST, INTER_AREA, INTER_CUBIC,
@@ -1067,6 +1127,66 @@ TEST(Imgproc_Remap, issue_23562)
     }
 }
 
+typedef testing::TestWithParam<tuple<int, int> > Imgproc_RemapManyChannels;
+
+TEST_P(Imgproc_RemapManyChannels, linear)
+{
+    RNG& rng = theRNG();
+    const int channels = get<0>(GetParam());
+    const int border = get<1>(GetParam());
+    Mat storage(29, 41, CV_MAKETYPE(CV_32F, channels));
+    rng.fill(storage, RNG::UNIFORM, -1.f, 1.f);
+    Mat src = storage(Rect(2, 3, 35, 23));
+    Mat mapx(19, 37, CV_32F), mapy(mapx.size(), CV_32F), fixed, fractions;
+    rng.fill(mapx, RNG::UNIFORM, -2.f, 37.f);
+    rng.fill(mapy, RNG::UNIFORM, -2.f, 25.f);
+    convertMaps(mapx, mapy, fixed, fractions, CV_16SC2);
+    Mat outputStorage(23, 43, src.type());
+    outputStorage.reshape(1).setTo(0.17);
+    Mat actual = outputStorage(Rect(3, 2, mapx.cols, mapx.rows));
+    const Scalar fill(0.13, 0.29, -0.41, 0.53);
+    remap(src, actual, fixed, fractions, INTER_LINEAR, border, fill);
+    for (int channel = 0; channel < channels; ++channel)
+    {
+        Mat plane, expected(mapx.size(), CV_32F, Scalar(0.17)), result;
+        extractChannel(src, plane, channel);
+        remap(plane, expected, fixed, fractions, INTER_LINEAR, border, Scalar(fill[channel & 3]));
+        extractChannel(actual, result, channel);
+        EXPECT_LE(cvtest::norm(expected, result, NORM_INF), 2e-6) << "channel=" << channel;
+    }
+}
+
+INSTANTIATE_TEST_CASE_P(ImgProc, Imgproc_RemapManyChannels, testing::Combine(
+    testing::Values(5, 7, 9, 20, 31, 33, CV_CN_MAX),
+    testing::Values((int)BORDER_CONSTANT, (int)BORDER_REPLICATE, (int)BORDER_REFLECT,
+                    (int)BORDER_REFLECT_101, (int)BORDER_WRAP, (int)BORDER_TRANSPARENT)));
+
+TEST(Imgproc_Remap, lanczos4_unsupported_depth)
+{
+    Mat_<float> mapx({2, 2}, {0, 1, 0, 1});
+    Mat_<float> mapy({2, 2}, {0, 0, 1, 1});
+    for (int depth : {CV_16BF, CV_Bool, CV_64U, CV_64S, CV_32U, CV_8F_E4M3FN, CV_8F_E4M3FNUZ})
+    {
+        Mat src(2, 2, CV_MAKETYPE(depth, 1), Scalar::all(0)), dst;
+        EXPECT_THROW(remap(src, dst, mapx, mapy, INTER_LANCZOS4), cv::Exception) << "depth=" << depth;
+        EXPECT_THROW(remap(src, dst, mapx, mapy, INTER_LANCZOS4 | WARP_RELATIVE_MAP), cv::Exception) << "depth=" << depth;
+    }
+}
+
+// https://github.com/opencv/opencv/issues/29589
+TEST(Imgproc_Warp, reject_nd_input)
+{
+    const int sz[] = {4, 3, 5, 3};
+    Mat src(4, sz, CV_8UC1, Scalar::all(0)), dst;
+    Mat_<float> mapx(3, 5, 0.f), mapy(3, 5, 0.f);
+    Mat affine = Mat::eye(2, 3, CV_32F), perspective = Mat::eye(3, 3, CV_32F);
+
+    EXPECT_THROW(remap(src, dst, mapx, mapy, INTER_NEAREST), cv::Exception);
+    EXPECT_THROW(remap(src, dst, mapx, mapy, INTER_LINEAR), cv::Exception);
+    EXPECT_THROW(warpAffine(src, dst, affine, Size(5, 3), INTER_NEAREST), cv::Exception);
+    EXPECT_THROW(warpPerspective(src, dst, perspective, Size(5, 3), INTER_NEAREST), cv::Exception);
+}
+
 TEST(Imgproc_Resize, issue_26497)
 {
     std::vector<float> vec = {0.f, 1.f, 2.f, 3.f};
@@ -1121,6 +1241,30 @@ static void rotation2affine(float scale, float angle, float cx, float cy, float*
     float ca = cosf(angle), sa = sinf(angle);
     M[0] = scale*ca; M[1] = scale*sa; M[2] = scale*(-cx*ca - cy*sa) + cx;
     M[3] = -scale*sa; M[4] = scale*ca; M[5] = scale*(cx*sa - cy*ca) + cy;
+}
+
+TEST(Imgproc_Warping, Bicubic64F) {
+    // 1. Values exceeding INT_MAX: triggers UBSan float-cast-overflow if buftype is int
+    {
+        cv::Mat src(10, 10, CV_64FC1, cv::Scalar(1e100));
+        cv::Mat dst;
+        cv::Matx23f M(1.f, 0.f, 0.f, 0.f, 1.f, 0.f);
+        EXPECT_NO_THROW(cv::warpAffine(src, dst, M, cv::Size(20, 20),
+                                       cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0.0)));
+        ASSERT_EQ(dst.type(), CV_64FC1);
+        EXPECT_DOUBLE_EQ(dst.at<double>(5, 5), 1e100);
+    }
+    // 2. Fractional double values: ensures boundary pixels are not truncated to int
+    {
+        cv::Mat src(10, 10, CV_64FC1, cv::Scalar(1.5));
+        cv::Mat dst;
+        cv::Matx23f M(1.f, 0.f, 0.f, 0.f, 1.f, 0.f);
+        cv::warpAffine(src, dst, M, cv::Size(20, 20),
+                       cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(1.5));
+        ASSERT_EQ(dst.type(), CV_64FC1);
+        // Boundary pixels (x=9, y=9) previously truncated (int)1.5 -> 1.0; now they preserve 1.5:
+        EXPECT_DOUBLE_EQ(dst.at<double>(9, 9), 1.5);
+    }
 }
 
 TEST(Imgproc_Warping, DISABLED_playground)
@@ -1198,6 +1342,123 @@ TEST(Imgproc_Warping, DISABLED_playground)
             break;
     }
 }
+
+TEST(Imgproc_Warping, infinite_loop)
+{
+    std::promise<void> promise;
+    auto future = promise.get_future();
+
+    std::thread worker([&promise]() {
+        cv::Mat src(1, 10, CV_8UC1, cv::Scalar(128));
+        cv::Mat dst;
+        cv::Matx23f M(1.f, 0.f, 0.f, 0.f, 1.f, 0.f);
+
+        cv::warpAffine(src, dst, M, cv::Size(10, 10), cv::INTER_CUBIC,
+                       cv::BORDER_REFLECT_101);
+        promise.set_value();
+    });
+
+    auto status = future.wait_for(std::chrono::seconds(1));
+    if (status == std::future_status::ready) {
+        worker.join();
+    } else {
+        worker.detach();
+    }
+
+    EXPECT_EQ(status, std::future_status::ready)
+        << "cv::warpAffine hung in an infinite loop!";
+}
+
+TEST(Imgproc_Warping, interpolate_loop)
+{
+    // 1000x1000 destination image with out-of-bounds coordinates:
+    cv::Mat src(2, 2, CV_8UC1, cv::Scalar(42));
+    cv::Mat dst;
+    // A perspective or affine transform mapping pixels to large coordinates:
+    cv::Matx23d M(1, 0, 1e7, 0, 1, 1e7);
+    cv::warpAffine(src, dst, M, cv::Size(50, 50), cv::INTER_NEAREST, cv::BORDER_REFLECT_101);
+}
+
+TEST(Imgproc_Warping, convertMaps_remap_warpPolar_validation)
+{
+    Mat emptySrc, dst;
+    Mat map1(10, 10, CV_32FC1, Scalar(0)), map2(10, 10, CV_32FC1, Scalar(0));
+    EXPECT_THROW(cv::remap(emptySrc, dst, map1, map2, INTER_LINEAR), cv::Exception);
+
+    Mat mismatchedMap2(5, 5, CV_32FC1, Scalar(0));
+    Mat dstm1, dstm2;
+    EXPECT_THROW(cv::convertMaps(map1, mismatchedMap2, dstm1, dstm2, CV_16SC2), cv::Exception);
+
+    EXPECT_THROW(cv::warpPolar(emptySrc, dst, Size(50, 50), Point2f(25, 25), 25, WARP_POLAR_LINEAR), cv::Exception);
+    Mat src(10, 10, CV_8U, Scalar(0));
+    EXPECT_THROW(cv::warpPolar(src, dst, Size(50, 50), Point2f(25, 25), 0, WARP_POLAR_LINEAR), cv::Exception);
+    EXPECT_THROW(cv::warpPolar(src, dst, Size(50, 50), Point2f(25, 25), -5, WARP_POLAR_LINEAR), cv::Exception);
+
+    // getRectSubPix: empty image returns empty patch; non-positive patchSize throws
+    EXPECT_NO_THROW(cv::getRectSubPix(emptySrc, Size(3, 3), Point2f(1.f, 1.f), dst));
+    EXPECT_TRUE(dst.empty());
+    EXPECT_THROW(cv::getRectSubPix(src, Size(0, 3), Point2f(1.f, 1.f), dst), cv::Exception);
+    EXPECT_THROW(cv::getRectSubPix(src, Size(3, 0), Point2f(1.f, 1.f), dst), cv::Exception);
+    EXPECT_THROW(cv::getRectSubPix(src, Size(-1, 3), Point2f(1.f, 1.f), dst), cv::Exception);
+    EXPECT_THROW(cv::getRectSubPix(src, Size(3, -1), Point2f(1.f, 1.f), dst), cv::Exception);
+}
+
+TEST(Imgproc_ConvertMaps, regression_22763)
+{
+    Mat base(16, 16, CV_32FC2, Scalar(0.0f, 0.0f));
+    Mat src1 = base(Rect(1, 2, 3, 4));
+    Mat src2, dst1, dst2;
+
+    ASSERT_FALSE(src1.isContinuous());
+    ASSERT_TRUE(src2.empty());
+
+    convertMaps(src1, src2, dst1, dst2, CV_16SC2, false);
+
+    EXPECT_EQ(src1.size(), dst1.size());
+    EXPECT_EQ(CV_16SC2, dst1.type());
+    EXPECT_EQ(src1.size(), dst2.size());
+    EXPECT_EQ(CV_16UC1, dst2.type());
+}
+
+// https://github.com/opencv/opencv/issues/30301
+typedef testing::TestWithParam<testing::tuple<int, int> > Imgproc_GetRectSubPix_Border;
+
+TEST_P(Imgproc_GetRectSubPix_Border, regression_30301)
+{
+    const int depth = get<0>(GetParam()), ddepth = get<1>(GetParam());
+
+    // The images are ROIs of a buffer filled with 250, so reads outside of them show up in the result
+    const Rect rampRoi(8, 8, 4, 4), columnRoi(2, 2, 1, 4);
+    Mat buf8u(20, 20, CV_8UC1, Scalar(250)), buf;
+    for (int r = 0; r < 4; r++)
+    {
+        for (int c = 0; c < 4; c++)
+            buf8u(rampRoi).at<uchar>(r, c) = (uchar)(r * 40 + c * 8);
+        buf8u(columnRoi).at<uchar>(r, 0) = (uchar)(10 + r * 10);
+    }
+    buf8u.convertTo(buf, depth);
+
+    const struct { Rect roi; Size size; Point2f center; std::vector<float> expected; } cases[] = {
+        // the window crosses the top and the right edges
+        { rampRoi, Size(3, 3), Point2f(3.f, 0.f), { 16, 24, 24, 16, 24, 24, 56, 64, 64 } },
+        { columnRoi, Size(3, 3), Point2f(0.f, 0.f), { 10, 10, 10, 10, 10, 10, 20, 20, 20 } },
+        // the window is to the left of the image
+        { rampRoi, Size(1, 1), Point2f(-2.75f, 3.f), { 120 } },
+    };
+    for (const auto& tc : cases)
+    {
+        SCOPED_TRACE(cv::format("image=%dx%d center=(%g, %g)", tc.roi.width, tc.roi.height, tc.center.x, tc.center.y));
+        Mat patch, patch32f;
+        getRectSubPix(buf(tc.roi), tc.size, tc.center, patch, ddepth);
+        patch.convertTo(patch32f, CV_32F);
+        Mat expected = Mat(tc.expected).reshape(1, tc.size.height);
+        EXPECT_LE(cvtest::norm(patch32f, expected, NORM_INF), 1e-3) << patch32f;
+    }
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Imgproc_GetRectSubPix_Border, testing::Values(
+    testing::make_tuple(CV_8U, CV_8U), testing::make_tuple(CV_8U, CV_32F), testing::make_tuple(CV_32F, CV_32F)));
+
 
 }} // namespace
 /* End of file. */

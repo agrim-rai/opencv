@@ -220,10 +220,7 @@ int main(int argc, char** argv)
         }
     }
     //![read_net]
-    EngineType engine = ENGINE_AUTO;
-    if ((parser.get<String>("backend") != "default") || (parser.get<String>("target") != "cpu")){
-        engine = ENGINE_CLASSIC;
-    }
+    EngineType engine = ENGINE_OPENCV;
     Net net = readNet(modelPath, configPath, "", engine);
     int backend = getBackendID(parser.get<String>("backend"));
     net.setPreferableBackend(backend);
@@ -442,7 +439,7 @@ void yoloPostProcessing(
 
     if (postprocessing == "yolov8")
     {
-        transposeND(outs_copy[0], {0, 2, 1}, outs_copy[0]);
+        cv::transpose(outs_copy[0], {0, 2, 1}, outs_copy[0]);
     }
 
     if (postprocessing == "yolonas")

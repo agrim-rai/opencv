@@ -5,6 +5,10 @@
 #include "../precomp.hpp"
 #include "layers_common.hpp"
 #include "../net_impl.hpp"
+#include "../op_cuda.hpp"
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/primitives/concat.hpp"
+#endif
 
 namespace cv
 {
@@ -18,78 +22,6 @@ namespace dnn
     Opset's 1 to 13 are covered.
 */
 
-// out must be pre-allocated
-static void concat(const std::vector<Mat>& inps, Mat& out, int axis)
-{
-    CV_Assert(out.isContinuous());
-
-    MatShape outShape = out.shape();
-    int ndims = outShape.dims, nslices = 1;
-    size_t esz = out.elemSize();
-    size_t sliceSize = esz;
-    size_t totalSize = 0;
-    size_t outStep = 0;
-    int ninputs = (int)inps.size();
-    for (int i = ndims-1; i > axis; i--)
-        sliceSize *= outShape[i];
-    outStep = sliceSize*outShape[axis];
-    for (int i = 0; i < axis; i++)
-        nslices *= outShape[i];
-    for (int i = 0; i < ninputs; i++) {
-        CV_Assert(inps[i].isContinuous());
-        totalSize += inps[i].total()*esz;
-    }
-
-    // Precompute per-input destination offset and per-slice size.
-    std::vector<size_t> dstOffset(ninputs);
-    std::vector<size_t> sliceSize_k_vec(ninputs);
-    {
-        size_t acc = 0;
-        for (int k = 0; k < ninputs; k++) {
-            int sz_a = inps[k].size[axis];
-            dstOffset[k] = acc;
-            sliceSize_k_vec[k] = sliceSize * sz_a;
-            acc += sliceSize_k_vec[k];
-        }
-    }
-    const size_t CHUNK = 64 * 1024;
-
-    // Precompute per-input chunk counts and a prefix sum for fast index decode.
-    std::vector<int> chunkOff(ninputs + 1, 0);
-    for (int k = 0; k < ninputs; k++)
-        chunkOff[k + 1] = chunkOff[k] + (int)((sliceSize_k_vec[k] + CHUNK - 1) / CHUNK);
-    int chunksPerSlice = chunkOff[ninputs];
-    int totalChunks = chunksPerSlice * nslices;
-
-    if (totalSize > CHUNK && totalChunks > 0) {
-        parallel_for_(Range(0, totalChunks), [&](const Range& r) {
-            for (int c = r.start; c < r.end; c++) {
-                int s = c / chunksPerSlice;
-                int local = c % chunksPerSlice;
-                int k = 0;
-                while (local >= chunkOff[k + 1]) k++;
-                int chunkInK = local - chunkOff[k];
-                size_t byteStart = (size_t)chunkInK * CHUNK;
-                size_t byteEnd = std::min(byteStart + CHUNK, sliceSize_k_vec[k]);
-
-                const uchar* inptr_k = inps[k].data;
-                uchar* outptr = out.data + dstOffset[k];
-                memcpy(outptr + (size_t)s * outStep + byteStart,
-                       inptr_k + (size_t)s * sliceSize_k_vec[k] + byteStart,
-                       byteEnd - byteStart);
-            }
-        });
-    } else {
-        for (int k = 0; k < ninputs; k++) {
-            const uchar* inptr_k = inps[k].data;
-            uchar* outptr = out.data + dstOffset[k];
-            size_t sliceSize_k = sliceSize_k_vec[k];
-            for (int s = 0; s < nslices; s++)
-                memcpy(outptr + (size_t)s * outStep, inptr_k + (size_t)s * sliceSize_k, sliceSize_k);
-        }
-    }
-}
-
 class Concat2LayerImpl CV_FINAL : public Concat2Layer
 {
 public:
@@ -101,8 +33,33 @@ public:
 
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
+#ifdef HAVE_CUDA
+        if (backendId == DNN_BACKEND_CUDA) {
+            Net::Impl* netimpl_ = getNetImpl(this);
+            if (!netimpl_ || inputs.empty())
+                return false;
+            // getTypes() requires one type for all inputs; an intermediate arg has no type until the first forward
+            const int t = netimpl_->argData(inputs[0]).type;
+            return t < 0 || isCudaNodeType(t);
+        }
+#endif
         return backendId == DNN_BACKEND_OPENCV;
     }
+
+#ifdef HAVE_CUDA
+    Ptr<BackendNode> initCUDA(void* context_,
+                              InputArrayOfArrays,
+                              InputArrayOfArrays outputs_arr) CV_OVERRIDE
+    {
+        auto context = reinterpret_cast<cuda4dnn::csl::CSLContext*>(context_);
+        // the output carries the real rank and type; an empty input may be left unallocated
+        const std::size_t axis_ = (std::size_t)normalize_axis(axis, outputs_arr.shape(0).dims);
+        if (outputs_arr.depth(0) == CV_Bool)
+            return make_cuda_node_bool<cuda4dnn::ConcatOp>(std::move(context->stream), axis_, false);
+        return make_cuda_node_with_type<cuda4dnn::ConcatOp>(preferableTarget, outputs_arr.type(0),
+                                                            std::move(context->stream), axis_, false);
+    }
+#endif
 
     MatShape getOutShape(const std::vector<MatShape>& inpShapes) const
     {
@@ -247,6 +204,9 @@ public:
 
     void runOp(const std::vector<Mat>& inps, Mat& out, int axis_)
     {
+        // An empty output (e.g. a zero batch) has nothing to copy; cv::concat would also drop its layout.
+        if (out.total() == 0)
+            return;
         // Byte-level BLOCK concat needs every input's C to be a multiple of
         // C0; misaligned inputs (YOLOX 80+4+1) route through NCHW.
         if (axis_ == 1 && out.size.layout == DATA_LAYOUT_BLOCK) {
@@ -263,7 +223,7 @@ public:
                 return;
             }
         }
-        concat(inps, out, axis_);
+        cv::concat(inps, axis_, out);
     }
 
     // Fallback for axis=1 BLOCK concat when inputs aren't C0-aligned.
@@ -288,7 +248,7 @@ public:
         Mat nchwOut;
         nchwOut.fit(nchwShape, out.type());
 
-        concat(nchwInps, nchwOut, /*axis=*/1);
+        cv::concat(nchwInps, 1, nchwOut);
         transformLayout(nchwOut, out, DATA_LAYOUT_BLOCK, origLayout, C0);
     }
 };

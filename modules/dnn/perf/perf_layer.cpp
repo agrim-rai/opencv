@@ -474,6 +474,12 @@ PERF_TEST_P_(Layer_LayerNorm, LayerNorm)
     test_layer({N, H ,W});
 }
 
+// Transformer-sized sequence: the small shape above is dominated by threading overhead.
+PERF_TEST_P_(Layer_LayerNorm, LayerNorm_Large)
+{
+    test_layer({1, 512, 768});
+}
+
 struct Layer_LayerNormExpanded : public TestBaseWithParam<tuple<Backend, Target> >
 {
     void test_layer(const std::vector<int>& x_shape)
@@ -726,7 +732,8 @@ PERF_TEST_P_(Layer_InstanceNorm, InstanceNorm)
 }
 
 struct Layer_Attention : public TestBaseWithParam<tuple<Backend, Target>> {
-    void test_layer(const std::vector<int> x_shape, const std::vector<int> qkv_hidden_sizes, const int num_heads) {
+    void test_layer(const std::vector<int> x_shape, const std::vector<int> qkv_hidden_sizes, const int num_heads,
+                    bool const_weights = false) {
         int backendId = get<0>(GetParam());
         int targetId = get<1>(GetParam());
 
@@ -751,18 +758,25 @@ struct Layer_Attention : public TestBaseWithParam<tuple<Backend, Target>> {
         lp.set("qkv_hidden_sizes", DictValue::arrayInt(qkv_hidden_sizes.data(), qkv_hidden_sizes.size()));
 
         Net net;
-        int id = net.addLayerToPrev(lp.name, lp.type, lp);
-        net.connect(0, 0, id, 0);
-        net.connect(0, 1, id, 1);
-        net.connect(0, 2, id, 2);
-
-        {
+        if (const_weights) {
+            // Weights as blobs: packed once, then every forward() takes the prepacked path.
+            lp.blobs.push_back(weight);
+            lp.blobs.push_back(bias);
+            net.addLayerToPrev(lp.name, lp.type, lp);
+            net.setInput(x);
+        } else {
+            int id = net.addLayerToPrev(lp.name, lp.type, lp);
+            net.connect(0, 0, id, 0);
+            net.connect(0, 1, id, 1);
+            net.connect(0, 2, id, 2);
             std::vector<std::string> input_names{"x", "weight", "bias"};
             net.setInputsNames(input_names);
             net.setInput(x, input_names[0]);
             net.setInput(weight, input_names[1]);
             net.setInput(bias, input_names[2]);
+        }
 
+        {
             net.setPreferableBackend(backendId);
             net.setPreferableTarget(targetId);
             Mat out = net.forward();
@@ -780,6 +794,149 @@ struct Layer_Attention : public TestBaseWithParam<tuple<Backend, Target>> {
 PERF_TEST_P_(Layer_Attention, VisionTransformer) {
     test_layer({1, 197, 768}, {768, 768, 768}, 12);
 }
+
+PERF_TEST_P_(Layer_Attention, BERT_ConstWeights) {
+    test_layer({1, 128, 768}, {768, 768, 768}, 12, /*const_weights=*/true);
+}
+
+PERF_TEST_P_(Layer_Attention, LongSequence_257) {
+    test_layer({1, 257, 192}, {192, 192, 192}, 12, /*const_weights=*/true);
+}
+
+PERF_TEST_P_(Layer_Attention, LongSequence_1024) {
+    test_layer({1, 1024, 192}, {192, 192, 192}, 12, /*const_weights=*/true);
+}
+
+PERF_TEST_P_(Layer_Attention, LongSequence_4096) {
+    test_layer({1, 4096, 192}, {192, 192, 192}, 12, /*const_weights=*/true);
+}
+
+// GroupQueryAttention runs on AttentionOnnxAi; these flags are what the ONNX importer sets.
+struct Layer_GroupQueryAttention : public TestBaseWithParam<tuple<Backend, Target>> {
+    void test_layer(int B, int S, int Sp, int num_heads, int kv_num_heads, int D) {
+        int backendId = get<0>(GetParam());
+        int targetId = get<1>(GetParam());
+
+        int Skv = Sp + S;
+
+        Mat query(std::vector<int>{B, S, num_heads * D}, CV_32F);
+        Mat key(std::vector<int>{B, S, kv_num_heads * D}, CV_32F);
+        Mat value(std::vector<int>{B, S, kv_num_heads * D}, CV_32F);
+        Mat pastKey(std::vector<int>{B, kv_num_heads, Sp, D}, CV_32F);
+        Mat pastValue(std::vector<int>{B, kv_num_heads, Sp, D}, CV_32F);
+        Mat seqlensK(std::vector<int>{B}, CV_32S, Scalar(Skv - 1));
+
+        randu(query, 0.f, 1.f);
+        randu(key, 0.f, 1.f);
+        randu(value, 0.f, 1.f);
+        randu(pastKey, 0.f, 1.f);
+        randu(pastValue, 0.f, 1.f);
+
+        LayerParams lp;
+        lp.type = "AttentionOnnxAi";
+        lp.name = "testLayer";
+        lp.set("q_num_heads", num_heads);
+        lp.set("kv_num_heads", kv_num_heads);
+        lp.set("is_causal", true);
+        lp.set("has_attn_mask", 0);
+        lp.set("has_past", 1);
+        lp.set("has_seqlens_k", 1);
+        lp.set("has_rotary_cache", 0);
+
+        Net net;
+        int id = net.addLayerToPrev(lp.name, lp.type, lp);
+        for (int i = 0; i < 6; ++i)
+            net.connect(0, i, id, i);
+
+        std::vector<std::string> input_names{
+            "query", "key", "value", "past_key", "past_value", "seqlens_k"};
+        net.setInputsNames(input_names);
+        net.setInput(query, input_names[0]);
+        net.setInput(key, input_names[1]);
+        net.setInput(value, input_names[2]);
+        net.setInput(pastKey, input_names[3]);
+        net.setInput(pastValue, input_names[4]);
+        net.setInput(seqlensK, input_names[5]);
+
+        net.setPreferableBackend(backendId);
+        net.setPreferableTarget(targetId);
+        Mat out = net.forward();
+
+        TEST_CYCLE()
+        {
+            Mat res = net.forward();
+        }
+
+        SANITY_CHECK_NOTHING();
+    }
+};
+
+PERF_TEST_P_(Layer_GroupQueryAttention, MHA_ShortCache) {
+    test_layer(/*B*/1, /*S*/512, /*Sp*/1, /*num_heads*/32, /*kv_num_heads*/32, /*D*/128);
+}
+
+PERF_TEST_P_(Layer_GroupQueryAttention, Grouped_WithCache) {
+    test_layer(/*B*/1, /*S*/1, /*Sp*/2048, /*num_heads*/32, /*kv_num_heads*/8, /*D*/128);
+}
+
+struct Layer_AttentionOnnxAi : public TestBaseWithParam<int>
+{
+    void decode_step(const std::string& layout, int nq, int nkv)
+    {
+        int past = GetParam();
+        bool is3d = layout == "3d";
+
+        std::string model = "dnn/onnx/models/test_attention_kv_cache_" + layout + ".onnx";
+        Net net = readNetFromONNX(findDataFile(model, true), ENGINE_OPENCV);
+
+        auto qkv = [&](int n, int t) {
+            return is3d ? std::vector<int>{1, t, n * D} : std::vector<int>{1, n, t, D};
+        };
+
+        Mat qp(qkv(nq, past), CV_32F), kp(qkv(nkv, past), CV_32F), vp(qkv(nkv, past), CV_32F);
+        Mat qd(qkv(nq, 1), CV_32F), kd(qkv(nkv, 1), CV_32F), vd(qkv(nkv, 1), CV_32F);
+        for (Mat* m : {&qp, &kp, &vp, &qd, &kd, &vd})
+            randu(*m, -1.f, 1.f);
+
+        std::vector<int> mp_sz{1, nq, past, past}, md_sz{1, nq, 1, past + 1};
+        Mat mp(mp_sz, CV_32S, Scalar(1)), md(md_sz, CV_32S, Scalar(1));
+
+        net.enableKVCache();
+
+        while (next())
+        {
+            // Reset, reserve and prefill stay outside the timer, so the measurement is one
+            // decode step against `past` cached tokens with the page pool already allocated.
+            net.resetKVCache();
+            net.reserveKVCache(past + 1);
+            net.setInput(qp, "Q");
+            net.setInput(kp, "K");
+            net.setInput(vp, "V");
+            net.setInput(mp, "Mask");
+            net.forward();
+
+            net.setInput(qd, "Q");
+            net.setInput(kd, "K");
+            net.setInput(vd, "V");
+            net.setInput(md, "Mask");
+
+            startTimer();
+            net.forward();
+            stopTimer();
+        }
+
+        SANITY_CHECK_NOTHING();
+    }
+
+    const int D = 256;
+};
+
+// 3D takes its head counts from the model attributes (q_num_heads=8, kv_num_heads=4);
+// 4D takes them from the [batch, heads, seq, head_dim] layout, so both ratios are drivable.
+PERF_TEST_P_(Layer_AttentionOnnxAi, decode_gqa_3d) { decode_step("3d", 8, 4); }
+PERF_TEST_P_(Layer_AttentionOnnxAi, decode_gqa_4d) { decode_step("4d", 8, 2); }
+PERF_TEST_P_(Layer_AttentionOnnxAi, decode_mha_4d) { decode_step("4d", 8, 8); }
+
 
 struct Layer_GroupNorm : public TestBaseWithParam<tuple<Backend, Target> >
 {
@@ -840,6 +997,109 @@ PERF_TEST_P_(Layer_GroupNorm, GroupNorm)
     test_layer({N, C, H, W}, num_groups);
 }
 
+struct Layer_MVN : public TestBaseWithParam<tuple<Backend, Target> >
+{
+    void test_layer(const std::vector<int>& x_shape, bool across_channels, bool normalize_variance)
+    {
+        int backendId = get<0>(GetParam());
+        int targetId = get<1>(GetParam());
+
+        Mat x(x_shape, CV_32FC1);
+        randu(x, 0.f, 1.f);
+
+        Net net;
+        LayerParams lp;
+        lp.type = "MVN";
+        lp.name = "testLayer";
+        lp.set("across_channels", across_channels);
+        lp.set("normalize_variance", normalize_variance);
+
+        int id = net.addLayerToPrev(lp.name, lp.type, lp);
+        net.connect(0, 0, id, 0);
+
+        // warmup
+        {
+            std::vector<String> inpNames{"x"};
+            net.setInputsNames(inpNames);
+            net.setInput(x, inpNames[0]);
+
+            net.setPreferableBackend(backendId);
+            net.setPreferableTarget(targetId);
+            Mat out = net.forward();
+        }
+
+        TEST_CYCLE()
+        {
+            Mat res = net.forward();
+        }
+
+        SANITY_CHECK_NOTHING();
+    }
+
+    int N = 2;
+    int C = 64;
+    int H = 180;
+    int W = 240;
+};
+
+PERF_TEST_P_(Layer_MVN, MVN)
+{
+    test_layer({N, C, H, W}, false, true);
+}
+
+struct Layer_RMSNorm : public TestBaseWithParam<tuple<Backend, Target> >
+{
+    void test_layer(const std::vector<int>& x_shape)
+    {
+        int backendId = get<0>(GetParam());
+        int targetId = get<1>(GetParam());
+
+        Mat x(x_shape, CV_32FC1);
+        Mat scale(std::vector<int>{x_shape.back()}, CV_32FC1);
+
+        randu(x, 0.f, 1.f);
+        randu(scale, 0.f, 1.f);
+
+        Net net;
+        LayerParams lp;
+        lp.type = "RMSNormalization";
+        lp.name = "testLayer";
+        lp.set("axis", -1);
+
+        int id = net.addLayerToPrev(lp.name, lp.type, lp);
+        net.connect(0, 0, id, 0);
+        net.connect(0, 1, id, 1);
+
+        // warmup
+        {
+            std::vector<String> inpNames{"x", "scale"};
+            net.setInputsNames(inpNames);
+            net.setInput(x, inpNames[0]);
+            net.setInput(scale, inpNames[1]);
+
+            net.setPreferableBackend(backendId);
+            net.setPreferableTarget(targetId);
+            Mat out = net.forward();
+        }
+
+        TEST_CYCLE()
+        {
+            Mat res = net.forward();
+        }
+
+        SANITY_CHECK_NOTHING();
+    }
+
+    int N = 1;
+    int H = 50;
+    int W = 768;
+};
+
+PERF_TEST_P_(Layer_RMSNorm, RMSNorm)
+{
+    test_layer({N, H, W});
+}
+
 
 INSTANTIATE_TEST_CASE_P(/**/, Layer_Slice, dnnBackendsAndTargets(false, false));
 INSTANTIATE_TEST_CASE_P(/**/, Layer_NaryEltwise, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
@@ -854,7 +1114,11 @@ INSTANTIATE_TEST_CASE_P(/**/, Layer_LayerNormExpanded, testing::Values(std::make
 INSTANTIATE_TEST_CASE_P(/**/, Layer_GatherElements, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
 INSTANTIATE_TEST_CASE_P(/**/, Layer_InstanceNorm, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
 INSTANTIATE_TEST_CASE_P(/**/, Layer_Attention, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
+INSTANTIATE_TEST_CASE_P(/**/, Layer_GroupQueryAttention, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
+INSTANTIATE_TEST_CASE_P(/**/, Layer_AttentionOnnxAi, testing::Values(1, 64, 512));
 INSTANTIATE_TEST_CASE_P(/**/, Layer_GroupNorm, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
+INSTANTIATE_TEST_CASE_P(/**/, Layer_MVN, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
+INSTANTIATE_TEST_CASE_P(/**/, Layer_RMSNorm, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
 
 typedef TestBaseWithParam<tuple<Vec4i, int, bool, tuple<Backend, Target> > > Layer_FullyConnected;
 PERF_TEST_P_(Layer_FullyConnected, fc)
@@ -1041,6 +1305,59 @@ INSTANTIATE_TEST_CASE_P(/**/, Layer_Elementwise,
                                               /* withWebnn= */           false,
                                               /* withCann= */            false));
 
+struct Layer_Sign : public TestBaseWithParam<tuple<Backend, Target> >
+{
+    void test_layer(int matType, const std::vector<int>& input_shape)
+    {
+        int backendId = get<0>(GetParam());
+        int targetId = get<1>(GetParam());
+
+        if (backendId == DNN_BACKEND_CUDA && matType != CV_32F)
+            throw SkipTestException("The CUDA SignOp only supports floating point tensors.");
+
+        // OpenVINO narrows custom-layer outputs from int64 to int32; test_int.cpp skips
+        // the same CV_64S/NGRAPH pairing.
+        if (backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH && matType == CV_64S)
+            throw SkipTestException("OpenVINO narrows int64 to int32 for custom layers.");
+
+        Mat input(input_shape, matType);
+        randu(input, -100, 100);
+
+        LayerParams lp;
+        lp.type = "Sign";
+        lp.name = "PerfLayer/Sign";
+
+        Net net;
+        net.addLayerToPrev(lp.name, lp.type, lp);
+
+        {
+            net.setInput(input);
+            net.setPreferableBackend(backendId);
+            net.setPreferableTarget(targetId);
+            net.forward();
+        }
+
+        TEST_CYCLE()
+        {
+            net.forward();
+        }
+
+        SANITY_CHECK_NOTHING();
+    }
+};
+
+PERF_TEST_P_(Layer_Sign, Float) {
+    test_layer(CV_32F, {2, 32, 416, 416});
+}
+PERF_TEST_P_(Layer_Sign, Int32) {
+    test_layer(CV_32S, {2, 32, 416, 416});
+}
+PERF_TEST_P_(Layer_Sign, Int64) {
+    test_layer(CV_64S, {2, 32, 416, 416});
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Layer_Sign, dnnBackendsAndTargets());
+
 struct Layer_TopK : public TestBaseWithParam<tuple<Backend, Target>> {
     void test_layer(const std::vector<int> &input_shape, const int K, const int axis) {
         int backend_id = get<0>(GetParam());
@@ -1157,5 +1474,40 @@ PERF_TEST_P_(Layer_Activation, Acosh)    { test_activation("Acosh",     1.f,   2
 PERF_TEST_P_(Layer_Activation, Atanh)    { test_activation("Atanh",    -0.95f, 0.95f); }
 
 INSTANTIATE_TEST_CASE_P(/**/, Layer_Activation, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
+
+struct Layer_DynamicInt8 : public TestBaseWithParam<tuple<Backend, Target> >
+{
+    void test_model(const std::string& name, const std::vector<int>& inp_shape)
+    {
+        std::string model = findDataFile("dnn/onnx/models/" + name + ".onnx", true);
+        Net net = readNetFromONNX(model, ENGINE_OPENCV);
+        net.setPreferableBackend(get<0>(GetParam()));
+        net.setPreferableTarget(get<1>(GetParam()));
+
+        Mat inp(inp_shape, CV_32F);
+        randu(inp, -1.f, 1.f);
+        net.setInput(inp);
+        net.forward();
+
+        TEST_CYCLE()
+        {
+            net.forward();
+        }
+
+        SANITY_CHECK_NOTHING();
+    }
+};
+
+PERF_TEST_P_(Layer_DynamicInt8, ConvInteger)
+{
+    test_model("convinteger_dynamic_block", {1, 3, 256, 256});
+}
+
+PERF_TEST_P_(Layer_DynamicInt8, MatMulInteger)
+{
+    test_model("matmulinteger_dynamic_block", {1, 256, 256});
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Layer_DynamicInt8, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
 
 } // namespace

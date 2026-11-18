@@ -136,19 +136,7 @@ public:
             outputShapeVec.push_back((int)inner);
         }
         else {
-            CV_Assert(endAxis >= startAxis && endAxis <= numAxes);
-
-            size_t flattenedDimensionSize = total(inputs[0], startAxis, endAxis + 1);
-
-            for (int i = 0; i < startAxis; i++)
-            {
-                outputShapeVec.push_back(inputs[0][i]);
-            }
-            outputShapeVec.push_back(flattenedDimensionSize);
-            for (size_t i = endAxis + 1; i < numAxes; i++)
-            {
-                outputShapeVec.push_back(inputs[0][i]);
-            }
+            outputShapeVec = inputs[0].flatten(startAxis, endAxis);
         }
 
         outputs.resize(inputs.size(), outputShapeVec);
@@ -281,15 +269,18 @@ public:
 #ifdef HAVE_CUDA
     Ptr<BackendNode> initCUDA(
         void *context_,
-        const std::vector<Ptr<BackendWrapper>>& inputs,
-        const std::vector<Ptr<BackendWrapper>>& outputs
+        InputArrayOfArrays inputs_,
+        InputArrayOfArrays outputs
     ) override
     {
         auto context = reinterpret_cast<csl::CSLContext*>(context_);
-        if (inputs[0]->getHostMatDepth() == CV_Bool)
+        std::vector<UMat> inputs;
+        inputs_.getUMatVector(inputs);
+        int depth = CV_MAT_DEPTH(inputs[0].type());
+        if (depth == CV_Bool)
             return make_cuda_node_bool<cuda4dnn::ReshapeOp>(std::move(context->stream));
         else
-            return make_cuda_node_with_type<cuda4dnn::ReshapeOp>(preferableTarget, inputs[0]->getHostMatDepth(), std::move(context->stream));
+            return make_cuda_node_with_type<cuda4dnn::ReshapeOp>(preferableTarget, depth, std::move(context->stream));
     }
 #endif
 

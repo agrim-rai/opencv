@@ -38,7 +38,7 @@ struct ModelFusionTransposeMatMul
 
     bool fuseGraph(Ptr<Graph>& graph)
     {
-        const vector<Ptr<Layer>>& prog = graph->prog();
+        const vector<Ptr<LayerInfo>>& prog = graph->prog();
         size_t nops = prog.size();
         bool modified = false;
 
@@ -51,12 +51,9 @@ struct ModelFusionTransposeMatMul
             }
         }
 
+        // Graph outputs count as uses, so a producer that is one never reaches zero.
         vector<int> usecounts;
         netimpl->useCounts(usecounts);
-
-        std::set<int> externalArgs;
-        for (Arg out : graph->outputs())
-            externalArgs.insert(out.idx);
 
         std::map<int, int> producer;
         for (size_t i = 0; i < nops; i++) {
@@ -68,11 +65,13 @@ struct ModelFusionTransposeMatMul
         vector<bool> dropped(nops, false);
 
         for (size_t i = 0; i < nops; i++) {
-            const Ptr<Layer>& layer = prog[i];
+            const Ptr<LayerInfo>& layer = prog[i];
             if (!layer || dropped[i]) continue;
 
             MatMulLayer* mm = dynamic_cast<MatMulLayer*>(layer.get());
             if (!mm) continue;
+            // MatMulInt8Layer does not read trans_a/trans_b
+            if (dynamic_cast<MatMulInt8Layer*>(layer.get())) continue;
 
             if (layer->inputs.size() != 2) continue;
 
@@ -83,27 +82,28 @@ struct ModelFusionTransposeMatMul
                 int prod_idx = it->second;
                 if (prod_idx < 0 || dropped[prod_idx]) continue;
 
-                const Ptr<Layer>& pl = prog[prod_idx];
+                const Ptr<LayerInfo>& pl = prog[prod_idx];
                 TransposeLayer* tr = dynamic_cast<TransposeLayer*>(pl.get());
                 if (!tr || pl->outputs.size() != 1) continue;
                 if (!isLastTwoSwap(tr->perm)) continue;
 
-                bool single_consumer = usecounts[in.idx] == 1
-                                    && externalArgs.count(in.idx) == 0;
-                if (!single_consumer) continue;
-
                 if (slot == 0) mm->trans_a = !mm->trans_a;
                 else           mm->trans_b = !mm->trans_b;
 
-                layer->inputs[slot] = pl->inputs[0];
-                dropped[prod_idx] = true;
-                usecounts[in.idx] = 0;
+                // A shared Transpose stays until its last consumer has folded it.
+                Arg src = pl->inputs[0];
+                layer->inputs[slot] = src;
+                usecounts[src.idx]++;
+                if (--usecounts[in.idx] == 0) {
+                    dropped[prod_idx] = true;
+                    usecounts[src.idx]--;
+                }
                 modified = true;
             }
         }
 
         if (modified) {
-            vector<Ptr<Layer>> newprog;
+            vector<Ptr<LayerInfo>> newprog;
             newprog.reserve(nops);
             for (size_t i = 0; i < nops; i++) {
                 if (!dropped[i] && prog[i])

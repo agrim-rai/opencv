@@ -4,6 +4,9 @@
 
 #include <numeric>
 #include "precomp.hpp"
+#if CV_AVX512_SKX
+#define CV__SIMD_FORCE_WIDTH 256
+#endif
 #include "warp_common.hpp"
 #include "opencv2/core/hal/intrin.hpp"
 
@@ -336,15 +339,22 @@ static inline int borderInterpolate_fast( int p, int len, int borderType )
         p = p < 0 ? 0 : len - 1;
     else if( borderType == BORDER_REFLECT || borderType == BORDER_REFLECT_101 )
     {
-        int delta = borderType == BORDER_REFLECT_101;
-        do
-        {
-            if( p < 0 )
-                p = -p - 1 + delta;
-            else
-                p = len - 1 - (p - len) - delta;
-        }
-        while( (unsigned)p >= (unsigned)len );
+        const int delta = borderType == BORDER_REFLECT_101;
+        if( len == 1 )
+            return 0;
+
+        // Fast path: single reflection without division for small deviations.
+        if( -len + delta <= p && p < 2 * len - delta )
+            return p < 0 ? -p - 1 + delta : 2 * len - 1 - delta - p;
+        // Bounded fallback: O(1) modulo for large |p|
+        const int64 period = 2LL * (len - delta);
+        int64 p64 = p;
+        p64 %= period;
+        if( p64 < 0 )
+            p64 += period;
+        if( p64 >= len )
+            p64 = period - p64 - 1 + delta;
+        p = (int)p64;
     }
     else if( borderType == BORDER_WRAP )
     {
@@ -7055,6 +7065,7 @@ bicubicCoeffs(float xs0, float ys0,
 }
 
 template<typename _Tp, typename _Fp>
+CV_DISABLE_UBSAN
 static void bicubicFetchPixels(const _Tp* src, size_t srcstep, Size size, int cn,
                                const int32_t* tl_x, const int32_t* tl_y,
                                int32_t* goodx, int row, _Fp* pixbuf, int len,
@@ -7170,67 +7181,67 @@ static void bicubicFetchPixels(const _Tp* src, size_t srcstep, Size size, int cn
 #undef BICUBIC_PROCESS_INLIERS_C1_SCALAR
 #define BICUBIC_PROCESS_INLIERS_C1_SCALAR(row) \
     srcrow = (const chtype*)((const uint8_t*)src + row*srcstep + tl_ofs); \
-    V0 = float(srcrow[0]); \
-    V1 = float(srcrow[1]); \
-    V2 = float(srcrow[2]); \
-    V3 = float(srcrow[3]); \
+    V0 = acctype(srcrow[0]); \
+    V1 = acctype(srcrow[1]); \
+    V2 = acctype(srcrow[2]); \
+    V3 = acctype(srcrow[3]); \
     BICUBIC_UPDATE_ACC(acc_r, V0, V1, V2, V3, wy##row)
 
 #undef BICUBIC_PROCESS_INLIERS_C2_SCALAR
 #define BICUBIC_PROCESS_INLIERS_C2_SCALAR(row) \
     srcrow = (const chtype*)((const uint8_t*)src + row*srcstep + tl_ofs); \
-    V0 = float(srcrow[0]); \
-    V1 = float(srcrow[2]); \
-    V2 = float(srcrow[4]); \
-    V3 = float(srcrow[6]); \
+    V0 = acctype(srcrow[0]); \
+    V1 = acctype(srcrow[2]); \
+    V2 = acctype(srcrow[4]); \
+    V3 = acctype(srcrow[6]); \
     BICUBIC_UPDATE_ACC(acc_r, V0, V1, V2, V3, wy##row); \
-    V0 = float(srcrow[1]); \
-    V1 = float(srcrow[3]); \
-    V2 = float(srcrow[5]); \
-    V3 = float(srcrow[7]); \
+    V0 = acctype(srcrow[1]); \
+    V1 = acctype(srcrow[3]); \
+    V2 = acctype(srcrow[5]); \
+    V3 = acctype(srcrow[7]); \
     BICUBIC_UPDATE_ACC(acc_g, V0, V1, V2, V3, wy##row)
 
 #undef BICUBIC_PROCESS_INLIERS_C3_SCALAR
 #define BICUBIC_PROCESS_INLIERS_C3_SCALAR(row) \
     srcrow = (const chtype*)((const uint8_t*)src + row*srcstep + tl_ofs); \
-    V0 = float(srcrow[0]); \
-    V1 = float(srcrow[3]); \
-    V2 = float(srcrow[6]); \
-    V3 = float(srcrow[9]); \
+    V0 = acctype(srcrow[0]); \
+    V1 = acctype(srcrow[3]); \
+    V2 = acctype(srcrow[6]); \
+    V3 = acctype(srcrow[9]); \
     BICUBIC_UPDATE_ACC(acc_r, V0, V1, V2, V3, wy##row); \
-    V0 = float(srcrow[1]); \
-    V1 = float(srcrow[4]); \
-    V2 = float(srcrow[7]); \
-    V3 = float(srcrow[10]); \
+    V0 = acctype(srcrow[1]); \
+    V1 = acctype(srcrow[4]); \
+    V2 = acctype(srcrow[7]); \
+    V3 = acctype(srcrow[10]); \
     BICUBIC_UPDATE_ACC(acc_g, V0, V1, V2, V3, wy##row); \
-    V0 = float(srcrow[2]); \
-    V1 = float(srcrow[5]); \
-    V2 = float(srcrow[8]); \
-    V3 = float(srcrow[11]); \
+    V0 = acctype(srcrow[2]); \
+    V1 = acctype(srcrow[5]); \
+    V2 = acctype(srcrow[8]); \
+    V3 = acctype(srcrow[11]); \
     BICUBIC_UPDATE_ACC(acc_b, V0, V1, V2, V3, wy##row)
 
 #undef BICUBIC_PROCESS_INLIERS_C4_SCALAR
 #define BICUBIC_PROCESS_INLIERS_C4_SCALAR(row) \
     srcrow = (const chtype*)((const uint8_t*)src + row*srcstep + tl_ofs); \
-    V0 = float(srcrow[0]); \
-    V1 = float(srcrow[4]); \
-    V2 = float(srcrow[8]); \
-    V3 = float(srcrow[12]); \
+    V0 = acctype(srcrow[0]); \
+    V1 = acctype(srcrow[4]); \
+    V2 = acctype(srcrow[8]); \
+    V3 = acctype(srcrow[12]); \
     BICUBIC_UPDATE_ACC(acc_r, V0, V1, V2, V3, wy##row); \
-    V0 = float(srcrow[1]); \
-    V1 = float(srcrow[5]); \
-    V2 = float(srcrow[9]); \
-    V3 = float(srcrow[13]); \
+    V0 = acctype(srcrow[1]); \
+    V1 = acctype(srcrow[5]); \
+    V2 = acctype(srcrow[9]); \
+    V3 = acctype(srcrow[13]); \
     BICUBIC_UPDATE_ACC(acc_g, V0, V1, V2, V3, wy##row); \
-    V0 = float(srcrow[2]); \
-    V1 = float(srcrow[6]); \
-    V2 = float(srcrow[10]); \
-    V3 = float(srcrow[14]); \
+    V0 = acctype(srcrow[2]); \
+    V1 = acctype(srcrow[6]); \
+    V2 = acctype(srcrow[10]); \
+    V3 = acctype(srcrow[14]); \
     BICUBIC_UPDATE_ACC(acc_b, V0, V1, V2, V3, wy##row); \
-    V0 = float(srcrow[3]); \
-    V1 = float(srcrow[7]); \
-    V2 = float(srcrow[11]); \
-    V3 = float(srcrow[15]); \
+    V0 = acctype(srcrow[3]); \
+    V1 = acctype(srcrow[7]); \
+    V2 = acctype(srcrow[11]); \
+    V3 = acctype(srcrow[15]); \
     BICUBIC_UPDATE_ACC(acc_a, V0, V1, V2, V3, wy##row)
 
 template<typename chtype, int NCHANNELS>
@@ -7242,7 +7253,8 @@ static void bicubicRef(const float* srcx, const float* srcy, int len,
     float A = params ? *params : defaultA;
 
     constexpr int BPP = int(NCHANNELS*sizeof(dst[0]));
-    using buftype = std::conditional_t<std::is_same_v<chtype, float>, float, int>;
+    using buftype = std::conditional_t<std::is_floating_point_v<chtype>, chtype, int>;
+    using acctype = std::conditional_t<std::is_same_v<chtype, double>, double, float>;
     using pixtype = std::conditional_t<NCHANNELS == 1, chtype, Vec<chtype, NCHANNELS>>;
 
     pixtype bval = borderVal ? *(pixtype*)borderVal : pixtype();
@@ -7250,7 +7262,7 @@ static void bicubicRef(const float* srcx, const float* srcy, int len,
     for (int i = 0; i < len; i++, dst += NCHANNELS) {
         buftype pixbuf[NCHANNELS][4];
         int tl_x, tl_y, tl_ofs, goodx[4];
-        float V0, V1, V2, V3;
+        acctype V0, V1, V2, V3;
         float wx0, wx1, wx2, wx3, wy0, wy1, wy2, wy3;
         float xs = srcx[i], ys = srcy[i];
 
@@ -7260,14 +7272,14 @@ static void bicubicRef(const float* srcx, const float* srcy, int len,
         if (code > 0) {
             const chtype* srcrow;
             if constexpr (NCHANNELS == 1) {
-                float acc_r = 0.f;
+                acctype acc_r = 0;
                 BICUBIC_PROCESS_INLIERS_C1_SCALAR(0);
                 BICUBIC_PROCESS_INLIERS_C1_SCALAR(1);
                 BICUBIC_PROCESS_INLIERS_C1_SCALAR(2);
                 BICUBIC_PROCESS_INLIERS_C1_SCALAR(3);
                 dst[0] = saturate_cast<chtype>(acc_r);
             } else if constexpr (NCHANNELS == 2) {
-                float acc_r = 0.f, acc_g = 0.f;
+                acctype acc_r = 0, acc_g = 0;
                 BICUBIC_PROCESS_INLIERS_C2_SCALAR(0);
                 BICUBIC_PROCESS_INLIERS_C2_SCALAR(1);
                 BICUBIC_PROCESS_INLIERS_C2_SCALAR(2);
@@ -7275,7 +7287,7 @@ static void bicubicRef(const float* srcx, const float* srcy, int len,
                 dst[0] = saturate_cast<chtype>(acc_r);
                 dst[1] = saturate_cast<chtype>(acc_g);
             } else if constexpr (NCHANNELS == 3) {
-                float acc_r = 0.f, acc_g = 0.f, acc_b = 0.f;
+                acctype acc_r = 0, acc_g = 0, acc_b = 0;
                 BICUBIC_PROCESS_INLIERS_C3_SCALAR(0);
                 BICUBIC_PROCESS_INLIERS_C3_SCALAR(1);
                 BICUBIC_PROCESS_INLIERS_C3_SCALAR(2);
@@ -7284,7 +7296,7 @@ static void bicubicRef(const float* srcx, const float* srcy, int len,
                 dst[1] = saturate_cast<chtype>(acc_g);
                 dst[2] = saturate_cast<chtype>(acc_b);
             } else if constexpr (NCHANNELS == 4) {
-                float acc_r = 0.f, acc_g = 0.f, acc_b = 0.f, acc_a = 0.f;
+                acctype acc_r = 0, acc_g = 0, acc_b = 0, acc_a = 0;
                 BICUBIC_PROCESS_INLIERS_C4_SCALAR(0);
                 BICUBIC_PROCESS_INLIERS_C4_SCALAR(1);
                 BICUBIC_PROCESS_INLIERS_C4_SCALAR(2);
@@ -7300,7 +7312,7 @@ static void bicubicRef(const float* srcx, const float* srcy, int len,
             }
             continue;
         } else {
-            float acc[NCHANNELS] = {};
+            acctype acc[NCHANNELS] = {};
             float wys[] = {wy0, wy1, wy2, wy3};
             const chtype* defVal = borderType == BORDER_TRANSPARENT ? dst : borderVal;
             for (int row = 0; row < 4; row++) {
@@ -7308,10 +7320,10 @@ static void bicubicRef(const float* srcx, const float* srcy, int len,
                                    goodx, row, &pixbuf[0][0], 1, borderType, defVal);
                 float wy = wys[row];
                 for (int c = 0; c < NCHANNELS; c++) {
-                    V0 = float(pixbuf[c][0]);
-                    V1 = float(pixbuf[c][1]);
-                    V2 = float(pixbuf[c][2]);
-                    V3 = float(pixbuf[c][3]);
+                    V0 = acctype(pixbuf[c][0]);
+                    V1 = acctype(pixbuf[c][1]);
+                    V2 = acctype(pixbuf[c][2]);
+                    V3 = acctype(pixbuf[c][3]);
                     BICUBIC_UPDATE_ACC(acc[c], V0, V1, V2, V3, wy);
                 }
             }
@@ -8615,67 +8627,73 @@ bicubic64fC4(const float* srcx, const float* srcy, int len,
 
 }
 
+template<typename T, void (*fn)(const float*, const float*, int, const void*, size_t, Size, T*, const float*, int, T*)>
+static void bicubicWarpWrap(const float* x, const float* y, int len, const void* src, size_t srcstep, Size srcsize, void* dst, const float* coeffs, int flags, const void* fillval)
+{
+    fn(x, y, len, src, srcstep, srcsize, (T*)dst, coeffs, flags, (T*)fillval);
+}
+
 ImgWarpFunc getBicubicWarpFunc_(int type)
 {
     if (type == CV_8UC1) {
-        return (ImgWarpFunc)bicubic8uC1;
+        return bicubicWarpWrap<uint8_t, bicubic8uC1>;
     }
     if (type == CV_8UC2) {
-        return (ImgWarpFunc)bicubic8uC2;
+        return bicubicWarpWrap<uint8_t, bicubic8uC2>;
     }
     if (type == CV_8UC3) {
-        return (ImgWarpFunc)bicubic8uC3;
+        return bicubicWarpWrap<uint8_t, bicubic8uC3>;
     }
     if (type == CV_8UC4) {
-        return (ImgWarpFunc)bicubic8uC4;
+        return bicubicWarpWrap<uint8_t, bicubic8uC4>;
     }
     if (type == CV_16UC1) {
-        return (ImgWarpFunc)bicubic16uC1;
+        return bicubicWarpWrap<uint16_t, bicubic16uC1>;
     }
     if (type == CV_16UC2) {
-        return (ImgWarpFunc)bicubic16uC2;
+        return bicubicWarpWrap<uint16_t, bicubic16uC2>;
     }
     if (type == CV_16UC3) {
-        return (ImgWarpFunc)bicubic16uC3;
+        return bicubicWarpWrap<uint16_t, bicubic16uC3>;
     }
     if (type == CV_16UC4) {
-        return (ImgWarpFunc)bicubic16uC4;
+        return bicubicWarpWrap<uint16_t, bicubic16uC4>;
     }
     if (type == CV_16SC1) {
-        return (ImgWarpFunc)bicubic16sC1;
+        return bicubicWarpWrap<int16_t, bicubic16sC1>;
     }
     if (type == CV_16SC2) {
-        return (ImgWarpFunc)bicubic16sC2;
+        return bicubicWarpWrap<int16_t, bicubic16sC2>;
     }
     if (type == CV_16SC3) {
-        return (ImgWarpFunc)bicubic16sC3;
+        return bicubicWarpWrap<int16_t, bicubic16sC3>;
     }
     if (type == CV_16SC4) {
-        return (ImgWarpFunc)bicubic16sC4;
+        return bicubicWarpWrap<int16_t, bicubic16sC4>;
     }
     if (type == CV_32FC1) {
-        return (ImgWarpFunc)bicubic32fC1;
+        return bicubicWarpWrap<float, bicubic32fC1>;
     }
     if (type == CV_32FC2) {
-        return (ImgWarpFunc)bicubic32fC2;
+        return bicubicWarpWrap<float, bicubic32fC2>;
     }
     if (type == CV_32FC3) {
-        return (ImgWarpFunc)bicubic32fC3;
+        return bicubicWarpWrap<float, bicubic32fC3>;
     }
     if (type == CV_32FC4) {
-        return (ImgWarpFunc)bicubic32fC4;
+        return bicubicWarpWrap<float, bicubic32fC4>;
     }
     if (type == CV_64FC1) {
-        return (ImgWarpFunc)bicubic64fC1;
+        return bicubicWarpWrap<double, bicubic64fC1>;
     }
     if (type == CV_64FC2) {
-        return (ImgWarpFunc)bicubic64fC2;
+        return bicubicWarpWrap<double, bicubic64fC2>;
     }
     if (type == CV_64FC3) {
-        return (ImgWarpFunc)bicubic64fC3;
+        return bicubicWarpWrap<double, bicubic64fC3>;
     }
     if (type == CV_64FC4) {
-        return (ImgWarpFunc)bicubic64fC4;
+        return bicubicWarpWrap<double, bicubic64fC4>;
     }
     return (ImgWarpFunc)nullptr;
 }

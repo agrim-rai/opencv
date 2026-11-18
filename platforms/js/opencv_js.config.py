@@ -147,9 +147,9 @@ objdetect = {'': ['getPredefinedDictionary', 'extendDictionary',
              'QRCodeDetectorAruco_Params': ['Params'],
              'QRCodeDetectorAruco': ['QRCodeDetectorAruco', 'decode', 'detect', 'detectAndDecode', 'detectMulti', 'decodeMulti', 'detectAndDecodeMulti', 'setDetectorParameters', 'setArucoParameters'],
              'barcode_BarcodeDetector': ['BarcodeDetector', 'decode', 'detect', 'detectAndDecode', 'detectMulti', 'decodeMulti', 'detectAndDecodeMulti', 'decodeWithType', 'detectAndDecodeWithType'],
-             'mcc_CheckerDetector': ['process', 'getBestColorChecker', 'getListColorChecker', 'create', 'draw', 'getRefColors', 'setDetectionParams', 'getDetectionParams', 'setColorChartType', 'getColorChartType', 'setUseDnnModel', 'getUseDnnModel'],
-             'mcc_DetectorParameters': ['DetectorParametersMCC'],
-             'mcc_Checker': ['setTarget', 'setBox', 'setChartsRGB', 'setChartsYCbCr', 'setCost', 'setCenter', 'getTarget', 'getBox', 'getColorCharts', 'getChartsRGB', 'getChartsYCbCr', 'getCost', 'getCenter'],
+             'mcc_CCheckerDetector': ['process', 'processWithROI', 'getBestColorChecker', 'create', 'getRefColors', 'setDetectionParams', 'setColorChartType', 'getColorChartType', 'setUseDnnModel', 'getUseDnnModel'],
+             'mcc_DetectorParametersMCC': ['DetectorParametersMCC'],
+             'mcc_CChecker': ['create', 'setTarget', 'setBox', 'setChartsRGB', 'setChartsYCbCr', 'setCost', 'setCenter', 'getTarget', 'getBox', 'getColorCharts', 'getChartsRGB', 'getChartsYCbCr', 'getCost', 'getCenter'],
              'FaceDetectorYN': ['setInputSize', 'getInputSize', 'setScoreThreshold', 'getScoreThreshold', 'setNMSThreshold', 'getNMSThreshold',
                                 'setTopK', 'getTopK', 'detect', 'create'],
 }
@@ -171,8 +171,7 @@ video = {
 }
 
 dnn = {'dnn_Net': ['setInput', 'forward', 'setPreferableBackend','getUnconnectedOutLayersNames'],
-       '': ['readNetFromTensorflow',
-            'readNetFromONNX', 'readNetFromTFLite', 'readNet', 'blobFromImage']}
+       '': ['readNetFromONNX', 'readNetFromTFLite', 'readNet', 'blobFromImage']}
 
 features = {'Feature2D': ['detect', 'compute', 'detectAndCompute', 'descriptorSize', 'descriptorType', 'defaultNorm', 'empty', 'getDefaultName'],
               'ORB': ['create', 'setMaxFeatures', 'setScaleFactor', 'setNLevels', 'setEdgeThreshold', 'setFastThreshold', 'setFirstLevel', 'setWTA_K', 'setScoreType', 'setPatchSize', 'getFastThreshold', 'getDefaultName'],

@@ -5,7 +5,10 @@
 #include "../precomp.hpp"
 #include "layers_common.hpp"
 #include "../net_impl.hpp"
-//#include "../op_cuda.hpp"
+#include "../op_cuda.hpp"
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/primitives/reshape.hpp"
+#endif
 //#include "../op_inf_engine.hpp"
 //#include "../ie_ngraph.hpp"
 //#include "../op_webnn.hpp"
@@ -45,42 +48,37 @@ public:
 
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
+#ifdef HAVE_CUDA
+        if (backendId == DNN_BACKEND_CUDA) {
+            Net::Impl* netimpl_ = getNetImpl(this);
+            if (!netimpl_ || inputs.empty())
+                return false;
+            // an intermediate arg has no type until the first forward; refuse only a known unsupported one
+            const int t = netimpl_->argData(inputs[0]).type;
+            return t < 0 || isCudaNodeType(t);
+        }
+#endif
         return backendId == DNN_BACKEND_OPENCV;
     }
+
+#ifdef HAVE_CUDA
+    Ptr<BackendNode> initCUDA(void* context_,
+                              InputArrayOfArrays inputs_arr,
+                              InputArrayOfArrays) CV_OVERRIDE
+    {
+        auto context = reinterpret_cast<cuda4dnn::csl::CSLContext*>(context_);
+        if (inputs_arr.depth(0) == CV_Bool)
+            return make_cuda_node_bool<cuda4dnn::ReshapeOp>(std::move(context->stream));
+        return make_cuda_node_with_type<cuda4dnn::ReshapeOp>(preferableTarget, inputs_arr.type(0),
+                                                             std::move(context->stream));
+    }
+#endif
 
     virtual bool alwaysSupportInplace() const CV_OVERRIDE { return true; }
 
     MatShape getOutShape(const MatShape& inpShape, const std::vector<int>& axes_) const
     {
-        bool squeezeMask[MatShape::MAX_DIMS];
-
-        if (axes_.empty()) {
-            // remove all 1's
-            for (int i = 0; i < inpShape.dims; i++)
-                squeezeMask[i] = inpShape[i] == 1;
-        } else {
-            for (int i = 0; i < inpShape.dims; i++)
-                squeezeMask[i] = false;
-            for (int a: axes_) {
-                int a_ = normalize_axis(a, inpShape.dims);
-                if (squeezeMask[a_]) {
-                    CV_Error_(Error::StsBadArg, ("duplicate squeezed axis #%d", a));
-                }
-                if (inpShape[a_] != 1) {
-                    CV_Error_(Error::StsBadArg, ("squeezed axis #%d (== %d) != 1", a, inpShape[a_]));
-                }
-                squeezeMask[a_] = true;
-            }
-        }
-
-        MatShape outShape(inpShape.dims);
-        int j = 0;
-        for (int i = 0; i < inpShape.dims; i++) {
-            if (!squeezeMask[i])
-                outShape[j++] = inpShape[i];
-        }
-        outShape.dims = j;
-        return outShape;
+        return inpShape.squeeze(axes_);
     }
 
     bool isDataShuffling() const CV_OVERRIDE { return true; }

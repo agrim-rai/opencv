@@ -73,23 +73,22 @@ static inline void v_store_as(hfloat* ptr, const v_float32& a)
 static inline void v_store_as(bfloat* ptr, const v_float32& a)
 { v_pack_store(ptr, a); }
 
+// v_round(f32) narrows to v_int32, truncating the 64-bit range (u64/s64). Scalar for now (matches
+// the scalar tail and f64->{u64,s64} stores); a proper f32->s64/u64 intrinsic can replace it later.
 static inline void v_store_as(int64_t* ptr, const v_float32& a)
 {
-    v_int32 ia = v_round(a);
-    v_int64 ia_0, ia_1;
-    v_expand(ia, ia_0, ia_1);
-    v_store(ptr, ia_0);
-    v_store(ptr + VTraits<v_uint64>::vlanes(), ia_1);
+    const int n = VTraits<v_float32>::vlanes();
+    float buf[VTraits<v_float32>::max_nlanes];
+    v_store(buf, a);
+    for (int i = 0; i < n; i++) ptr[i] = saturate_cast<int64_t>(buf[i]);
 }
 
 static inline void v_store_as(uint64_t* ptr, const v_float32& a)
 {
-    v_int32 ia = v_round(a);
-    v_uint64 ia_0, ia_1;
-    ia = v_max(ia, vx_setzero_s32());
-    v_expand(v_reinterpret_as_u32(ia), ia_0, ia_1);
-    v_store(ptr, ia_0);
-    v_store(ptr + VTraits<v_uint64>::vlanes(), ia_1);
+    const int n = VTraits<v_float32>::vlanes();
+    float buf[VTraits<v_float32>::max_nlanes];
+    v_store(buf, a);
+    for (int i = 0; i < n; i++) ptr[i] = saturate_cast<uint64_t>(buf[i]);
 }
 
 static inline void vx_load_pair_as(const uchar* ptr, v_uint16& a, v_uint16& b)
@@ -195,6 +194,9 @@ static inline void vx_load_pair_as(const int* ptr, v_float32& a, v_float32& b)
     b = v_cvt_f32(ib);
 }
 
+// v_pack()/v_pack_u() saturate at every width, 64->32 included, so a 64-bit source needs no
+// clamping here any more - see the HAL headers for the per-backend implementations.
+
 static inline void vx_load_pair_as(const int64_t* ptr, v_int32& a, v_int32& b)
 {
     const int int64_nlanes = VTraits<v_uint64>::vlanes();
@@ -204,10 +206,11 @@ static inline void vx_load_pair_as(const int64_t* ptr, v_int32& a, v_int32& b)
 
 static inline void vx_load_pair_as(const int64_t* ptr, v_uint64& a, v_uint64& b)
 {
-    v_int64 z = vx_setzero_s64();
+    // clamp the negatives to zero through the sign bit: v_gt on 64-bit lanes is sign(b - a) at the
+    // SSE and NEON baselines, which overflows for an operand at the bottom of the range
     v_int64 ia = vx_load(ptr), ib = vx_load(ptr + VTraits<v_uint64>::vlanes());
-    ia = v_and(ia, v_gt(ia, z));
-    ib = v_and(ib, v_gt(ib, z));
+    ia = v_and(ia, v_not(v_shr<63>(ia)));
+    ib = v_and(ib, v_not(v_shr<63>(ib)));
     a = v_reinterpret_as_u64(ia);
     b = v_reinterpret_as_u64(ib);
 }
@@ -215,15 +218,8 @@ static inline void vx_load_pair_as(const int64_t* ptr, v_uint64& a, v_uint64& b)
 static inline void vx_load_pair_as(const int64_t* ptr, v_uint32& a, v_uint32& b)
 {
     const int nlanes = VTraits<v_uint64>::vlanes();
-    v_int64 z = vx_setzero_s64();
-    v_int64 ia0 = vx_load(ptr), ia1 = vx_load(ptr + nlanes);
-    v_int64 ib0 = vx_load(ptr + nlanes*2), ib1 = vx_load(ptr + nlanes*3);
-    ia0 = v_and(ia0, v_gt(ia0, z));
-    ia1 = v_and(ia1, v_gt(ia1, z));
-    ib0 = v_and(ib0, v_gt(ib0, z));
-    ib1 = v_and(ib1, v_gt(ib1, z));
-    a = v_pack(v_reinterpret_as_u64(ia0), v_reinterpret_as_u64(ia1));
-    b = v_pack(v_reinterpret_as_u64(ib0), v_reinterpret_as_u64(ib1));
+    a = v_pack_u(vx_load(ptr), vx_load(ptr + nlanes));
+    b = v_pack_u(vx_load(ptr + nlanes*2), vx_load(ptr + nlanes*3));
 }
 
 static inline void vx_load_pair_as(const uint64_t* ptr, v_float32& a, v_float32& b)
@@ -297,11 +293,14 @@ static inline void vx_load_pair_as(const uint64_t* ptr, v_uint32& a, v_uint32& b
 
 static inline void vx_load_pair_as(const uint64_t* ptr, v_int32& a, v_int32& b)
 {
+    // There is no uint64 -> int32 narrow in the HAL, so narrow as unsigned first - v_pack() clamps
+    // anything above UINT32_MAX to UINT32_MAX - and bring that down to INT32_MAX with the same
+    // 32-bit v_min() the uint32 -> int32 direction below uses.
     const int int64_nlanes = VTraits<v_uint64>::vlanes();
-    v_uint32 ua = v_pack(vx_load(ptr), vx_load(ptr + int64_nlanes));
-    v_uint32 ub = v_pack(vx_load(ptr + int64_nlanes*2), vx_load(ptr + int64_nlanes*3));
-    a = v_reinterpret_as_s32(ua);
-    b = v_reinterpret_as_s32(ub);
+    const v_uint32 hi = vx_setall_u32((unsigned)INT_MAX);
+    a = v_reinterpret_as_s32(v_min(v_pack(vx_load(ptr), vx_load(ptr + int64_nlanes)), hi));
+    b = v_reinterpret_as_s32(v_min(v_pack(vx_load(ptr + int64_nlanes*2),
+                                          vx_load(ptr + int64_nlanes*3)), hi));
 }
 
 static inline void vx_load_pair_as(const float* ptr, v_float32& a, v_float32& b)
@@ -327,8 +326,13 @@ static inline void vx_load_pair_as(const unsigned* ptr, v_uint32& a, v_uint32& b
 
 static inline void vx_load_pair_as(const unsigned* ptr, v_int32& a, v_int32& b)
 {
-    a = v_reinterpret_as_s32(vx_load(ptr));
-    b = v_reinterpret_as_s32(vx_load(ptr + VTraits<v_uint32>::vlanes()));
+    // Reinterpreting alone would turn everything above INT32_MAX negative, and the saturating
+    // narrow that follows would then clamp it to the WRONG end of the destination's range
+    // (4294967295 -> -1 -> -128 for schar, rather than 127). Clamp first, like the int -> unsigned
+    // direction above does for negatives.
+    const v_uint32 hi = vx_setall_u32((unsigned)INT_MAX);
+    a = v_reinterpret_as_s32(v_min(vx_load(ptr), hi));
+    b = v_reinterpret_as_s32(v_min(vx_load(ptr + VTraits<v_uint32>::vlanes()), hi));
 }
 
 static inline void vx_load_pair_as(const unsigned* ptr, v_float32& a, v_float32& b)
@@ -475,12 +479,110 @@ static inline void v_store_pair_as(uint64_t* ptr, const v_uint64& a, const v_uin
     v_store(ptr + VTraits<v_uint64>::vlanes(), b);
 }
 
+// float32 -> FP8 encode, shared by both scale paths. Fallback: no portable per-lane variable shift.
+
+// fallback test plus the pieces encodeFp8Finish needs, to skip costly math when unused
+template<int bias> static inline void
+fp8Prepare(const v_float32& vf, v_uint32& full, v_uint32& sbit, v_int32& newexpRaw, v_int32& fallbackMask)
+{
+    v_uint32 u = v_reinterpret_as_u32(vf);
+    v_uint32 e = v_and(v_shr<23>(u), vx_setall_u32(0xFFu));
+    v_uint32 m = v_and(u, vx_setall_u32(0x7FFFFFu));
+    sbit = v_and(v_shr<24>(u), vx_setall_u32(0x80u));
+    full = v_or(m, vx_setall_u32(1u << 23));
+    newexpRaw = v_sub(v_reinterpret_as_s32(e), vx_setall_s32(127 - bias));
+    v_int32 isNan = v_reinterpret_as_s32(v_eq(e, vx_setall_u32(0xFFu)));
+    fallbackMask = v_or(isNan, v_le(newexpRaw, vx_setall_s32(0)));
+}
+
+// Valid only when fp8Prepare's fallbackMask is false; must stay bit-identical to encodeE4M3.
+template<int bias, bool fnuz> static inline v_int32
+encodeFp8Finish(v_uint32 full, v_uint32 sbit, v_int32 newexpRaw)
+{
+    v_uint32 one     = vx_setall_u32(1u);
+    v_uint32 half    = vx_setall_u32(1u << 19);
+    v_uint32 q       = v_shr<20>(full);
+    v_uint32 rem     = v_and(full, vx_setall_u32((1u << 20) - 1));
+    v_uint32 tie     = v_and(v_eq(rem, half), v_ne(v_and(q, one), vx_setzero_u32()));
+    v_uint32 inc     = v_and(v_or(v_gt(rem, half), tie), one);
+    v_uint32 rounded = v_add(q, inc);
+
+    v_uint32 carry = v_ne(v_and(rounded, vx_setall_u32(16u)), vx_setall_u32(0u));
+    rounded = v_select(carry, v_shr<1>(rounded), rounded);
+    v_int32 newexp = v_add(newexpRaw, v_and(v_reinterpret_as_s32(carry), vx_setall_s32(1)));
+
+    v_uint32 mant = v_and(rounded, vx_setall_u32(7u));
+
+    v_int32 gt15 = v_gt(newexp, vx_setall_s32(15));
+    v_int32 overflow;
+    if constexpr (fnuz)
+        overflow = gt15;
+    else
+        overflow = v_or(gt15, v_and(v_eq(newexp, vx_setall_s32(15)),
+                                     v_eq(v_reinterpret_as_s32(mant), vx_setall_s32(7))));
+
+    v_uint32 maxFin = v_or(sbit, vx_setall_u32(fnuz ? 0x7Fu : 0x7Eu));
+
+    v_uint32 normal = v_or(v_or(sbit, v_shl<3>(v_reinterpret_as_u32(newexp))), mant);
+    v_uint32 result = v_select(v_reinterpret_as_u32(overflow), maxFin, normal);
+    return v_reinterpret_as_s32(result);
+}
+
+// encodes vf0..vf3 to FP8 bytes; scalarSrc must hold the same values, contiguous, for fallback
+template<int bias, bool fnuz> static inline void
+encodeFp8Vec4(const v_float32& vf0, const v_float32& vf1, const v_float32& vf2, const v_float32& vf3,
+              const float* scalarSrc, int vecsz, uchar* dst)
+{
+    v_uint32 full0, full1, full2, full3, sbit0, sbit1, sbit2, sbit3;
+    v_int32 newexpRaw0, newexpRaw1, newexpRaw2, newexpRaw3;
+    v_int32 pre0, pre1, pre2, pre3;
+    fp8Prepare<bias>(vf0, full0, sbit0, newexpRaw0, pre0);
+    fp8Prepare<bias>(vf1, full1, sbit1, newexpRaw1, pre1);
+    fp8Prepare<bias>(vf2, full2, sbit2, newexpRaw2, pre2);
+    fp8Prepare<bias>(vf3, full3, sbit3, newexpRaw3, pre3);
+
+    if (v_check_all(v_and(v_and(pre0, pre1), v_and(pre2, pre3))))
+    {
+        // whole group is subnormal/zero/NaN — skip the costlier fast-path math
+        for (int k = 0; k < vecsz; k++)
+            dst[k] = fp8_detail::encodeE4M3(scalarSrc[k], bias, fnuz);
+        return;
+    }
+
+    v_int32 byte0 = encodeFp8Finish<bias, fnuz>(full0, sbit0, newexpRaw0);
+    v_int32 byte1 = encodeFp8Finish<bias, fnuz>(full1, sbit1, newexpRaw1);
+    v_int32 byte2 = encodeFp8Finish<bias, fnuz>(full2, sbit2, newexpRaw2);
+    v_int32 byte3 = encodeFp8Finish<bias, fnuz>(full3, sbit3, newexpRaw3);
+    v_store(dst, v_pack_u(v_pack(byte0, byte1), v_pack(byte2, byte3)));
+
+    v_int32 one = vx_setall_s32(1);
+    uchar fallback[VTraits<v_uint8>::max_nlanes];
+    v_store(fallback, v_pack_u(v_pack(v_and(pre0, one), v_and(pre1, one)),
+                                v_pack(v_and(pre2, one), v_and(pre3, one))));
+    for (int k = 0; k < vecsz; k++)
+        if (fallback[k])
+            dst[k] = fp8_detail::encodeE4M3(scalarSrc[k], bias, fnuz);
+}
+
 #if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F)
+
+// v_cvt_f64() converts SIGNED 64-bit lanes, so it cannot be used on a uint64 directly. Split into
+// two halves below 2^32 instead: each converts exactly, scaling the high half by 2^32 is exact, and
+// the single add at the end is the only rounding - so the result matches (double)x.
+//
+// Converting the bit pattern as signed and adding 2^64 back would be simpler, but it rounds twice:
+// for 2^63 + 1025 it gives 2^63 where (double)x is 2^63 + 2048.
+static inline v_float64 v_cvt_f64_u64(const v_uint64& x)
+{
+    const v_int64 hi = v_reinterpret_as_s64(v_shr<32>(x));
+    const v_int64 lo = v_reinterpret_as_s64(v_and(x, vx_setall_u64(0xFFFFFFFFull)));
+    return v_add(v_mul(v_cvt_f64(hi), vx_setall_f64(4294967296.0)), v_cvt_f64(lo));
+}
 
 static inline void vx_load_as(const uint64_t* ptr, v_float32& a)
 {
-    v_float64 a_0 = v_cvt_f64(v_reinterpret_as_s64(vx_load(ptr)));
-    v_float64 a_1 = v_cvt_f64(v_reinterpret_as_s64(vx_load(ptr + VTraits<v_uint64>::vlanes())));
+    v_float64 a_0 = v_cvt_f64_u64(vx_load(ptr));
+    v_float64 a_1 = v_cvt_f64_u64(vx_load(ptr + VTraits<v_uint64>::vlanes()));
     a = v_cvt_f32(a_0, a_1);
 }
 
@@ -534,8 +636,8 @@ static inline void vx_load_pair_as(const double* ptr, v_int32& a, v_int32& b)
 static inline void vx_load_pair_as(const uint64_t* ptr, v_float64& a, v_float64& b)
 {
     const int int64_nlanes = VTraits<v_uint64>::vlanes();
-    a = v_cvt_f64(v_reinterpret_as_s64(vx_load(ptr)));
-    b = v_cvt_f64(v_reinterpret_as_s64(vx_load(ptr + int64_nlanes)));
+    a = v_cvt_f64_u64(vx_load(ptr));
+    b = v_cvt_f64_u64(vx_load(ptr + int64_nlanes));
 }
 
 static inline void vx_load_pair_as(const double* ptr, v_float32& a, v_float32& b)

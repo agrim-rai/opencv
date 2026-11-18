@@ -183,8 +183,9 @@ TEST_P(Resize_Bitexact, Nearest8U_vsNonExact)
     EXPECT_EQ(CountDiff(mat_gray), 0) << "gray, type: " << depth;
 }
 
-// Now INTER_NEAREST's convention and INTER_NEAREST_EXACT's one are different.
-INSTANTIATE_TEST_CASE_P(DISABLED_Imgproc, Resize_Bitexact,
+// At an integer upscale INTER_NEAREST and INTER_NEAREST_EXACT both map dst i to src i/k, so they
+// agree here. They diverge on downscale and fractional factors, where EXACT follows Pillow.
+INSTANTIATE_TEST_CASE_P(Imgproc, Resize_Bitexact,
     testing::Values(CV_8U, CV_16U, CV_32F, CV_64F)
 );
 
@@ -193,41 +194,45 @@ TEST(Resize_Bitexact, Nearest8U)
     Mat src[6], dst[6];
 
     // 2x decimation
-    src[0] = (Mat_<uint8_t>(1, 6) << 0, 1, 2, 3, 4, 5);
-    dst[0] = (Mat_<uint8_t>(1, 3) << 1, 3, 5);
+    src[0] = Mat_<uint8_t>({1, 6}, {0, 1, 2, 3, 4, 5});
+    dst[0] = Mat_<uint8_t>({1, 3}, {1, 3, 5});
 
     // decimation odd to 1
-    src[1] = (Mat_<uint8_t>(1, 5) << 0, 1, 2, 3, 4);
-    dst[1] = (Mat_<uint8_t>(1, 1) << 2);
+    src[1] = Mat_<uint8_t>({1, 5}, {0, 1, 2, 3, 4});
+    dst[1] = Mat_<uint8_t>({1, 1}, {2});
 
     // decimation n*2-1 to n
-    src[2] = (Mat_<uint8_t>(1, 5) << 0, 1, 2, 3, 4);
-    dst[2] = (Mat_<uint8_t>(1, 3) << 0, 2, 4);
+    src[2] = Mat_<uint8_t>({1, 5}, {0, 1, 2, 3, 4});
+    dst[2] = Mat_<uint8_t>({1, 3}, {0, 2, 4});
 
     // decimation n*2+1 to n
-    src[3] = (Mat_<uint8_t>(1, 5) << 0, 1, 2, 3, 4);
-    dst[3] = (Mat_<uint8_t>(1, 2) << 1, 3);
+    src[3] = Mat_<uint8_t>({1, 5}, {0, 1, 2, 3, 4});
+    dst[3] = Mat_<uint8_t>({1, 2}, {1, 3});
 
     // zoom
-    src[4] = (Mat_<uint8_t>(3, 5) <<
-        0, 1, 2, 3, 4,
-        5, 6, 7, 8, 9,
-        10, 11, 12, 13, 14);
-    dst[4] = (Mat_<uint8_t>(5, 7) <<
-        0, 1, 1, 2, 3, 3, 4,
-        0, 1, 1, 2, 3, 3, 4,
-        5, 6, 6, 7, 8, 8, 9,
-        10, 11, 11, 12, 13, 13, 14,
-        10, 11, 11, 12, 13, 13, 14);
+    src[4] = Mat_<uint8_t>({3, 5}, {
+            0, 1, 2, 3, 4,
+            5, 6, 7, 8, 9,
+            10, 11, 12, 13, 14
+    });
+    dst[4] = Mat_<uint8_t>({5, 7}, {
+            0, 1, 1, 2, 3, 3, 4,
+            0, 1, 1, 2, 3, 3, 4,
+            5, 6, 6, 7, 8, 8, 9,
+            10, 11, 11, 12, 13, 13, 14,
+            10, 11, 11, 12, 13, 13, 14
+    });
 
-    src[5] = (Mat_<uint8_t>(2, 3) <<
-        0, 1, 2,
-        3, 4, 5);
-    dst[5] = (Mat_<uint8_t>(4, 6) <<
-        0, 0, 1, 1, 2, 2,
-        0, 0, 1, 1, 2, 2,
-        3, 3, 4, 4, 5, 5,
-        3, 3, 4, 4, 5, 5);
+    src[5] = Mat_<uint8_t>({2, 3}, {
+            0, 1, 2,
+            3, 4, 5
+    });
+    dst[5] = Mat_<uint8_t>({4, 6}, {
+            0, 0, 1, 1, 2, 2,
+            0, 0, 1, 1, 2, 2,
+            3, 3, 4, 4, 5, 5,
+            3, 3, 4, 4, 5, 5
+    });
 
     for (int i = 0; i < 6; i++)
     {

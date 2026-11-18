@@ -108,10 +108,10 @@ TEST_F(QuatTest, basicfuns)
     EXPECT_MAT_NEAR(q1RotMat, R, 1e-6);
     Vec3d z_axis{0,0,1};
     Quatd q_unit1 = Quatd::createFromAngleAxis(angle, z_axis);
-    Mat pointsA = (Mat_<double>(2, 3) << 1,0,0,1,0,1);
+    Mat pointsA = Mat_<double>({2, 3}, {1,0,0,1,0,1});
     pointsA = pointsA.t();
     Mat new_point = q_unit1.toRotMat3x3() * pointsA;
-    Mat afterRo = (Mat_<double>(3, 2) << -1,-1,0,0,0,1);
+    Mat afterRo = Mat_<double>({3, 2}, {-1,-1,0,0,0,1});
     EXPECT_MAT_NEAR(afterRo, new_point, 1e-6);
     EXPECT_ANY_THROW(qNull.toRotVec());
     Vec3d rodVec{CV_PI/sqrt(3), CV_PI/sqrt(3), CV_PI/sqrt(3)};
@@ -164,6 +164,59 @@ TEST_F(QuatTest, basicfuns)
     EXPECT_EQ(cos(acos(q1)), q1);
     EXPECT_EQ(atan(tan(q3)), q3);
     EXPECT_EQ(tan(atan(q1)), q1);
+}
+
+template <typename T>
+void testSmallVectorTrigonometric()
+{
+    const T realParts[] = {T(-10), T(-3), T(0), T(3), T(10)};
+    const T vectorScales[] =
+        {T(0), T(1e-30), T(1e-12), T(1e-8), T(1e-7), T(9.9e-7), T(1.01e-6)};
+    const double eps = std::max(1e-12, 32.0 * std::numeric_limits<T>::epsilon());
+    for (size_t i = 0; i < sizeof(realParts) / sizeof(realParts[0]); ++i)
+    {
+        const T w = realParts[i];
+        const T derivatives[] = {std::cos(w), -std::sin(w), std::cosh(w), std::sinh(w)};
+        for (size_t j = 0; j < sizeof(vectorScales) / sizeof(vectorScales[0]); ++j)
+        {
+            const T scale = vectorScales[j];
+            const Vec<T, 3> v(scale / 3, -2 * scale / 3, 2 * scale / 3);
+            const Quat<T> q(w, v[0], v[1], v[2]);
+            const Quat<T> results[] = {cv::sin(q), cv::cos(q), cv::sinh(q), cv::cosh(q)};
+            for (int f = 0; f < 4; ++f)
+            {
+                SCOPED_TRACE(::testing::Message() << "real=" << w << " scale=" << scale
+                             << " function=" << f);
+                const double tolerance = eps * std::max(1.0, std::abs(double(derivatives[f])));
+                // The vector coefficient tends to the real function's derivative.
+                EXPECT_NEAR(results[f].x, v[0] * derivatives[f],
+                            tolerance * std::abs(double(v[0])));
+                EXPECT_NEAR(results[f].y, v[1] * derivatives[f],
+                            tolerance * std::abs(double(v[1])));
+                EXPECT_NEAR(results[f].z, v[2] * derivatives[f],
+                            tolerance * std::abs(double(v[2])));
+            }
+        }
+    }
+    const Quat<T> realOnly(T(1000), T(0), T(0), T(0));
+    const Quat<T> largeResults[] = {cv::sinh(realOnly), cv::cosh(realOnly)};
+    for (int f = 0; f < 2; ++f)
+    {
+        EXPECT_EQ(largeResults[f].w, std::numeric_limits<T>::infinity());
+        EXPECT_EQ(largeResults[f].x, T(0));
+        EXPECT_EQ(largeResults[f].y, T(0));
+        EXPECT_EQ(largeResults[f].z, T(0));
+    }
+}
+
+TEST(Core_Quat, smallVectorTrigonometric32f)
+{
+    testSmallVectorTrigonometric<float>();
+}
+
+TEST(Core_Quat, smallVectorTrigonometric64f)
+{
+    testSmallVectorTrigonometric<double>();
 }
 
 TEST_F(QuatTest, test_operator)
@@ -451,9 +504,9 @@ TEST_F(DualQuatTest, basic_ops)
     EXPECT_EQ(dqTrans.log().exp(), dqTrans);
     EXPECT_MAT_NEAR(q1norm.toMat(QUAT_ASSUME_UNIT), dq1.toMat(), 1e-6);
     Matx44d R1 = dq2.toMat();
-    Mat point = (Mat_<double>(4, 1) << 3, 0, 0, 1);
+    Mat point = Mat_<double>({4, 1}, {3, 0, 0, 1});
     Mat new_point = R1 * point;
-    Mat after = (Mat_<double>(4, 1) << 0, 3, 5 ,1);
+    Mat after = Mat_<double>({4, 1}, {0, 3, 5 ,1});
     EXPECT_MAT_NEAR(new_point,  after, 1e-6);
     Vec<double, 8> vec = dq1.toVec();
     EXPECT_EQ(DualQuatd(vec), dq1);

@@ -42,6 +42,9 @@ Net::Impl::~Impl()
     if (context)
         context->reset();
 #endif
+#ifdef HAVE_CUDA
+    cudaGraphReset();
+#endif
 }
 
 
@@ -65,6 +68,7 @@ Net::Impl::Impl()
     preferableTarget = DNN_TARGET_CPU;
     hasDynamicShapes = false;
     useWinograd = true;
+    useTF32 = true;
 
     ////////////// extra initialization for the new engine /////////////////
 
@@ -140,6 +144,7 @@ void Net::Impl::clear()
     __tensors__ = std::vector<Mat>();
     bufidxs = std::vector<int>();
     buffers = std::vector<Mat>();
+    pinnedArgs = std::vector<Arg>();
 
     mainGraph = Ptr<Graph>();
 
@@ -153,7 +158,10 @@ void Net::Impl::clear()
     bufidxs.push_back(-1);
 
     prepared = false;
-    finalizeLayers = true;
+    finalized = false;
+    pinnedInputShapes.clear();
+    fusedSnapshotValid = false;
+    fusedSnapshot.clear();
 }
 
 
@@ -274,11 +282,11 @@ Ptr<Layer> Net::Impl::getLayer(int layerId) const
         CV_Assert(0 <= layerId && layerId < totalLayers);
         int graph_ofs = 0;
         for (const Ptr<Graph>& graph : allgraphs) {
-            const std::vector<Ptr<Layer> >& prog = graph->prog();
+            const std::vector<Ptr<LayerInfo> >& prog = graph->prog();
             int nops = (int)prog.size();
             CV_Assert(layerId >= graph_ofs);
             if (layerId < graph_ofs + nops)
-                return prog[layerId - graph_ofs];
+                return prog[layerId - graph_ofs].dynamicCast<Layer>();
             graph_ofs += nops;
         }
         CV_Error_(Error::StsObjectNotFound, ("layer #%d is not found", layerId));
@@ -885,12 +893,6 @@ void Net::Impl::forwardLayer(LayerData& ld)
                 CV_Assert(!cudaNode.empty());
 
                 cudaNode->forward(ld.inputBlobsWrappers, ld.outputBlobsWrappers, cudaInfo->workspace);
-
-                for (auto id : ld.cudaD2HBackgroundTransfers)
-                {
-                    auto wrapper = ld.outputBlobsWrappers[id].dynamicCast<CUDABackendWrapper>();
-                    wrapper->copyToHostInBackground();
-                }
 #endif
             }
             else if (preferableBackend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
@@ -1195,8 +1197,10 @@ void Net::Impl::forward(std::vector<std::vector<Mat>>& outputBlobs,
         CV_Error(Error::StsBadArg, "in Net::forward(), outBlobNames cannot be empty");
     FPDenormalsIgnoreHintScope fp_denormals_ignore_scope;
 
-    if (mainGraph)
-        CV_Error(Error::StsNotImplemented, "The new dnn engine doesn't support inference until a specified layer. If you want to run the whole model, please don't set the outputName argument in the forward() call. If you want to run the model until a specified layer, please use the old dnn engine");
+    if (mainGraph) {
+        forwardWithMultipleOutputsPerLayer(outputBlobs, outBlobNames);
+        return;
+    }
 
     std::vector<LayerPin> pins;
     for (int i = 0; i < outBlobNames.size(); i++)
@@ -1408,6 +1412,9 @@ void Net::Impl::getLayerShapes(const ShapesVec& netInputShapes,
         LayerShapes& shapes)
 {
     if (mainGraph) {
+        // Fusion emits block-layout layers; their TransformLayout conversions are
+        // only inserted by finalize(), so shape inference must run post-finalize.
+        finalize();
         std::vector<MatShape> shapeCache;
         std::vector<int> typeCache;
         CV_Assert(layerId == 0);
@@ -1553,6 +1560,19 @@ void Net::Impl::setInputsNames(const std::vector<String>& inputBlobNames)
 
 void Net::Impl::setInputShape(const String& inputName, const MatShape& shape)
 {
+    if (mainGraph) {
+        const std::vector<Arg>& inputs = mainGraph->inputs();
+        for (size_t i = 0; i < inputs.size(); i++) {
+            if (args.at(inputs[i].idx).name == inputName) {
+                CV_Check(inputName, !finalized, "setInputShape() must be called before the first forward()");
+                pinnedInputShapes.resize(inputs.size());
+                pinnedInputShapes[i] = shape;
+                prepared = false;
+                return;
+            }
+        }
+        CV_Error_(Error::StsObjectNotFound, ("unknown input '%s'", inputName.c_str()));
+    }
     CV_Assert(netInputLayer);
     netInputLayer->setInputShape(inputName, shape);
 }
@@ -1561,6 +1581,11 @@ void Net::Impl::setInputShape(const String& inputName, const MatShape& shape)
 void Net::Impl::setInput(InputArray blob, const String& name, double scalefactor, const Scalar& mean)
 {
     FPDenormalsIgnoreHintScope fp_denormals_ignore_scope;
+
+    // A refused model leaves an empty net; without this the lookup below reports a
+    // missing blob, which blames the caller's input name for an import failure.
+    if (!importFailure.empty())
+        CV_Error(Error::StsError, importFailure);
 
     if (mainGraph) {
         CV_Assert(scalefactor == 1);
@@ -1631,21 +1656,26 @@ void Net::Impl::setInput(InputArray blob, const String& name, double scalefactor
 
 Mat Net::Impl::getParam(int layer, int numParam) const
 {
-    LayerData& ld = getLayerData(layer);
-    std::vector<Mat>& layerBlobs = getLayerInstance(ld)->blobs;
+    std::vector<Mat>& layerBlobs = getLayer(layer)->blobs;
     CV_Assert(numParam < (int)layerBlobs.size());
     return layerBlobs[numParam];
 }
 
+// Bump only the epoch: the executor holding the packed weights may be another object.
+static void markLayerWeightsChanged(const Ptr<LayerInfo>& layer)
+{
+    layer->weightEpoch++;
+}
+
 void Net::Impl::setParam(int layer, int numParam, const Mat& blob)
 {
-    LayerData& ld = getLayerData(layer);
-
     // FIXIT we should not modify "execution" instance
-    std::vector<Mat>& layerBlobs = getLayerInstance(ld)->blobs;
+    std::vector<Mat>& layerBlobs = getLayer(layer)->blobs;
     CV_Assert(numParam < (int)layerBlobs.size());
     // we don't make strong checks, use this function carefully
     layerBlobs[numParam] = blob;
+    if (mainGraph)
+        markLayerWeightsChanged(getLayer(layer));
 }
 
 void Net::Impl::setParam(const std::string& outputTensorName, int numParam, const Mat& blob)
@@ -1657,12 +1687,19 @@ void Net::Impl::setParam(const std::string& outputTensorName, int numParam, cons
             if (excl != std::string::npos)
                 it = argnames.find(outputTensorName.substr(excl + 1));
         }
-        if (it == argnames.end())
+        if (it == argnames.end()) {
+            // Not a tensor name; try it as a layer name.
+            int lid = getLayerId(outputTensorName);
+            if (lid >= 0) {
+                setParam(lid, numParam, blob);
+                return;
+            }
             CV_Error_(Error::StsObjectNotFound,
                       ("DNN: tensor '%s' not found in the graph", outputTensorName.c_str()));
+        }
 
         int targetIdx = (int)it->second;
-        const std::vector<Ptr<Layer>>& prog = mainGraph->prog();
+        const std::vector<Ptr<LayerInfo>>& prog = mainGraph->prog();
         for (const auto& layer : prog) {
             bool produces = false;
             for (const Arg& out : layer->outputs)
@@ -1672,21 +1709,21 @@ void Net::Impl::setParam(const std::string& outputTensorName, int numParam, cons
 
             if (numParam < (int)layer->blobs.size()) {
                 layer->blobs[numParam] = blob;
-                finalizeLayers = true;
+                markLayerWeightsChanged(layer);
                 return;
             }
 
             Conv2Layer* conv = dynamic_cast<Conv2Layer*>(layer.get());
             if (conv && numParam == 0) {
                 conv->setWeights(blob, Mat(), defaultC0, accuracy);
-                finalizeLayers = true;
+                markLayerWeightsChanged(layer);
                 return;
             }
 
             ConvTranspose2Layer* deconv = dynamic_cast<ConvTranspose2Layer*>(layer.get());
             if (deconv && numParam == 0) {
                 deconv->setWeights(blob, Mat(), defaultC0, accuracy);
-                finalizeLayers = true;
+                markLayerWeightsChanged(layer);
                 return;
             }
 
@@ -2368,8 +2405,8 @@ std::vector<String> Net::Impl::getLayerNames() const
     if (mainGraph) {
         res.reserve(totalLayers);
         for (const Ptr<Graph>& graph: allgraphs) {
-            const std::vector<Ptr<Layer> >& prog = graph->prog();
-            for (const Ptr<Layer>& layer: prog)
+            const std::vector<Ptr<LayerInfo> >& prog = graph->prog();
+            for (const Ptr<LayerInfo>& layer: prog)
                 res.push_back(layer->name);
         }
     } else {
@@ -2399,7 +2436,7 @@ std::vector<int> Net::Impl::getUnconnectedOutLayers() const
 
         int graph_ofs = 0;
         for (const auto& graph : allgraphs) {
-            const std::vector<Ptr<Layer>>& prog = graph->prog();
+            const std::vector<Ptr<LayerInfo>>& prog = graph->prog();
             for (int i = 0; i < (int)prog.size(); i++) {
                 for (const auto& layerOut : prog[i]->outputs) {
                     if (outArgIdxs.count(layerOut.idx)) {
@@ -2484,9 +2521,9 @@ int64 Net::Impl::getFLOPSGraph(const Ptr<Graph>& graph,
         return 0;
 
     int64 flops = 0;
-    const std::vector<Ptr<Layer>>& prog = graph->prog();
+    const std::vector<Ptr<LayerInfo>>& prog = graph->prog();
 
-    for (const Ptr<Layer>& layer : prog) {
+    for (const Ptr<LayerInfo>& layer : prog) {
         if (!layer)
             continue;
 
@@ -2534,6 +2571,7 @@ int64 Net::Impl::getFLOPS(const std::vector<MatShape>& netInputShapes,
                           const std::vector<MatType>& netInputTypes) /*const*/
 {
     if (mainGraph) {
+        finalize();
         // The new graph engine executes in FP32 on CPU regardless of the requested
         // target, so FP16 input types (e.g. coming from an OpenCL FP16 target) would be
         // rejected by Layer::getTypes(). Normalize them to FP32 for shape/FLOPS inference.
@@ -2567,6 +2605,7 @@ int64 Net::Impl::getFLOPS(
         const std::vector<MatType>& netInputTypes) /*const*/
 {
     if (mainGraph) {
+        finalize();
         std::vector<MatType> inputTypes = filterFP16InputTypes(netInputTypes);
         LayerShapes shapes;
         std::vector<MatShape> shapeCache;
@@ -2578,7 +2617,7 @@ int64 Net::Impl::getFLOPS(
         for (const Ptr<Graph>& graph : allgraphs) {
             int progSize = (int)graph->prog().size();
             if (localIdx < progSize) {
-                const Ptr<Layer>& layer = graph->prog()[localIdx];
+                const Ptr<LayerInfo>& layer = graph->prog()[localIdx];
                 if (!layer)
                     return 0;
 
@@ -2677,8 +2716,8 @@ void Net::Impl::collectLayerInfo(std::vector<String>& names, std::vector<String>
         names.reserve(totalLayers);
         types.reserve(totalLayers);
         for (const Ptr<Graph>& graph : allgraphs) {
-            const std::vector<Ptr<Layer>>& prog = graph->prog();
-            for (const Ptr<Layer>& layer : prog) {
+            const std::vector<Ptr<LayerInfo>>& prog = graph->prog();
+            for (const Ptr<LayerInfo>& layer : prog) {
                 names.push_back(layer ? layer->name : "null");
                 types.push_back(layer ? layer->type : "null");
             }
@@ -2744,7 +2783,7 @@ void Net::Impl::collectOrtProfileData() const
     }
 
     // Read the JSON entirely into memory, then parse it from the string.
-    std::ifstream in(profile_path.get());
+    std::ifstream in(toOrtPath(profile_path.get()).c_str());
     if (!in.is_open()) {
         CV_LOG_WARNING(NULL, "DNN/ORT: failed to open profile JSON " << profile_path.get());
         return;
@@ -2984,6 +3023,20 @@ void Net::Impl::enableWinograd(bool useWinograd_)
     }
 }
 
+void Net::Impl::enableTF32(bool useTF32_)
+{
+    if (useTF32 != useTF32_)
+    {
+        useTF32 = useTF32_;
+#ifdef HAVE_CUDA
+        cudaInfo.reset();  // the cuBLAS/cuDNN handles carry the math mode
+#endif
+        if (mainGraph)
+            finalized = false;  // re-select per-op executors on next finalize()
+        else
+            clear();
+    }
+}
 
 // TODO drop?
 void Net::Impl::getLayerTypes(std::vector<String>& layersTypes) const
@@ -2992,8 +3045,8 @@ void Net::Impl::getLayerTypes(std::vector<String>& layersTypes) const
     if (mainGraph) {
         std::set<std::string> layersTypesSet;
         for (const Ptr<Graph>& g: allgraphs) {
-            const std::vector<Ptr<Layer> >& prog = g->prog();
-            for (const Ptr<Layer>& layer: prog) {
+            const std::vector<Ptr<LayerInfo> >& prog = g->prog();
+            for (const Ptr<LayerInfo>& layer: prog) {
                 if (!layer)
                     continue;
                 layersTypesSet.insert(layer->type);
@@ -3025,8 +3078,8 @@ int Net::Impl::getLayersCount(const String& layerType) const
     if (mainGraph) {
         int count = 0;
         for (const Ptr<Graph>& g: allgraphs) {
-            const std::vector<Ptr<Layer> >& prog = g->prog();
-            for (const Ptr<Layer>& layer: prog) {
+            const std::vector<Ptr<LayerInfo> >& prog = g->prog();
+            for (const Ptr<LayerInfo>& layer: prog) {
                 if (!layer)
                     continue;
                 if (layer->type == layerType)

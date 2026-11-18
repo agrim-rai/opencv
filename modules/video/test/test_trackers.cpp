@@ -152,6 +152,54 @@ TEST(NanoTrack, accuracy_NanoTrack_V2)
     checkTrackingAccuracy(tracker, 0.69);
 }
 
+// Targets smaller than 10 px must not be inflated to 10x10: the reported box and the
+// internal target size should follow the object (e.g. far-away objects, low-resolution input).
+TEST(NanoTrack, small_target_size)
+{
+    std::string backbonePath = cvtest::findDataFile("dnn/onnx/models/nanotrack_backbone_sim_v2.onnx", false);
+    std::string neckheadPath = cvtest::findDataFile("dnn/onnx/models/nanotrack_head_sim_v2.onnx", false);
+
+    cv::TrackerNano::Params params;
+    params.backbone = backbonePath;
+    params.neckhead = neckheadPath;
+    cv::Ptr<Tracker> tracker = TrackerNano::create(params);
+
+    // Textured static background with a 6x6 object (white with a dark core) moving 2 px right and 1 px down per frame.
+    Mat noise(240, 320, CV_8UC1);
+    RNG& rng = theRNG();
+    rng.fill(noise, RNG::UNIFORM, 0, 256);
+    GaussianBlur(noise, noise, Size(0, 0), 3);
+    normalize(noise, noise, 60, 160, NORM_MINMAX);
+    Mat background;
+    cvtColor(noise, background, COLOR_GRAY2BGR);
+
+    const int sz = 6;
+    auto makeFrame = [&](int x, int y) {
+        Mat frame = background.clone();
+        frame(Rect(x, y, sz, sz)).setTo(Scalar::all(255));
+        frame(Rect(x + sz / 3, y + sz / 3, sz - 2 * (sz / 3), sz - 2 * (sz / 3))).setTo(Scalar::all(0));
+        return frame;
+    };
+
+    int x = 100, y = 110;
+    tracker->init(makeFrame(x, y), Rect(x, y, sz, sz));
+    for (int i = 0; i < 10; i++)
+    {
+        x += 2; y += 1;
+        Rect roi;
+        ASSERT_TRUE(tracker->update(makeFrame(x, y), roi));
+        // the size must follow the object (it was inflated to 10x10 before)
+        EXPECT_LE(roi.width, sz + 2) << cv::format("frame %d", i);
+        EXPECT_LE(roi.height, sz + 2) << cv::format("frame %d", i);
+        EXPECT_GE(roi.width, sz - 2) << cv::format("frame %d", i);
+        EXPECT_GE(roi.height, sz - 2) << cv::format("frame %d", i);
+        // and the object must still be tracked (the box is rounded to integers, so allow ~2 px)
+        const double dx = (roi.x + roi.width * 0.5) - (x + sz * 0.5);
+        const double dy = (roi.y + roi.height * 0.5) - (y + sz * 0.5);
+        EXPECT_LE(std::sqrt(dx * dx + dy * dy), 2.5) << cv::format("frame %d", i);
+    }
+}
+
 TEST(vittrack, accuracy_vittrack)
 {
     std::string model = cvtest::findDataFile("dnn/onnx/models/vitTracker.onnx");
@@ -159,6 +207,46 @@ TEST(vittrack, accuracy_vittrack)
     params.net = model;
     cv::Ptr<Tracker> tracker = TrackerVit::create(params);
     checkTrackingAccuracy(tracker, 0.64);
+}
+
+TEST(vittrack, bbox_inside_image)
+{
+    std::string model = cvtest::findDataFile("dnn/onnx/models/vitTracker.onnx");
+    cv::TrackerVit::Params params;
+    params.net = model;
+    cv::Ptr<Tracker> tracker = TrackerVit::create(params);
+
+    Mat img0 = imread(findDataFile("tracking/bag/00000001.jpg"), 1);
+    cv::Rect imgRect(0, 0, img0.cols, img0.rows);
+    cv::Rect roi = imgRect;
+    tracker->init(img0, roi);
+
+    for (int i = 2; i <= 6; i++)
+    {
+        Mat img = imread(findDataFile(cv::format("tracking/bag/%08d.jpg", i)), 1);
+        bool res = tracker->update(img, roi);
+        ASSERT_TRUE(res);
+        ASSERT_EQ(roi & imgRect, roi) << cv::format("Fail at img %d.", i);
+    }
+}
+
+TEST(vittrack, bbox_inside_tiny_image)
+{
+    std::string model = cvtest::findDataFile("dnn/onnx/models/vitTracker.onnx");
+    cv::TrackerVit::Params params;
+    params.net = model;
+    params.tracking_score_threshold = 0.f;
+    cv::Ptr<Tracker> tracker = TrackerVit::create(params);
+
+    Mat img;
+    resize(imread(findDataFile("tracking/bag/00000001.jpg"), 1), img, Size(5, 5));
+    cv::Rect imgRect(0, 0, img.cols, img.rows);
+    cv::Rect roi = imgRect;
+    tracker->init(img, roi);
+
+    bool res = tracker->update(img, roi);
+    ASSERT_TRUE(res);
+    ASSERT_EQ(roi & imgRect, roi);
 }
 
 }}  // namespace opencv_test::

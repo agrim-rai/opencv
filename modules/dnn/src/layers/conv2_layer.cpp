@@ -4,12 +4,20 @@
 
 #include "../precomp.hpp"
 #include "../net_impl.hpp"
+#include "../adjacency_graph.hpp"
 #include "layers_common.hpp"
 #include "conv2_common.hpp"
 #include "cpu_kernels/mlas_gemm.hpp"
 #include "opencv2/core/hal/intrin.hpp"
 #include <algorithm>
 #include <cstring>
+
+#include "../op_cuda.hpp"
+#include <opencv2/dnn/layer.details.hpp>  // CV_DNN_REGISTER_EXEC_CLASS
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/primitives/convolution.hpp"
+using namespace cv::dnn::cuda4dnn;
+#endif
 
 namespace cv
 {
@@ -28,6 +36,8 @@ class Conv2LayerImpl : public Conv2Layer
 public:
     Conv2LayerImpl(const LayerParams& params)
     {
+        registerFusionOpsOnce<Conv2LayerImpl>({ nullptr, &Conv2LayerImpl::absorbOp, true,
+                                               &Conv2LayerImpl::foldInputScaleOp });
         setParamsFrom(params);
         auto_pad = getAutoPadding(params);
         ceil_mode = params.get<bool>("ceil_mode", false);
@@ -39,6 +49,129 @@ public:
         fastActivation = FAST_ACTIV_NONE;
         activationFunc = nullptr;
         addResidual = false;
+    }
+
+    static bool foldInputScaleOp(Layer* self, const Mat& scale, const Mat& shift)
+    {
+        return static_cast<Conv2LayerImpl*>(self)->foldInputScale(scale, shift);
+    }
+
+    //! conv(scale*x + shift) becomes conv'(x). Every weight copy the layer holds moves.
+    bool foldInputScale(const Mat& scale, const Mat& shift)
+    {
+        if (fusedBatchNorm || addResidual || fastActivation != FAST_ACTIV_NONE ||
+            activationFunc != nullptr || !activ.empty())
+            return false;
+        // The bias correction sums the whole kernel, so padding adds a spurious border
+        // shift. SAME_* carries its padding in auto_pad rather than in pads.
+        if (auto_pad != AUTO_PAD_NONE && auto_pad != AUTO_PAD_VALID)
+            return false;
+        for (int p : pads)
+            if (p > 0)
+                return false;
+        if (weights.empty() || weights.type() != CV_32F || wshape0.dims != 4 || packC0 <= 0)
+            return false;
+        if (scale.type() != CV_32F || shift.type() != CV_32F ||
+            !scale.isContinuous() || !shift.isContinuous() ||
+            scale.total() != shift.total())
+            return false;
+
+        const int K = wshape0[0], Cg = wshape0[1];
+        if (ngroups <= 0 || K % ngroups != 0 || (int)scale.total() != Cg * ngroups)
+            return false;
+        // The loops below rewrite the weights in place, so nothing may fail after them.
+        if (!bias.empty() && (bias.type() != CV_32F || (int)bias.total() != K))
+            return false;
+
+        const float* sc = scale.ptr<float>();
+        const float* sh = shift.ptr<float>();
+        std::vector<float> adj(K, 0.f);
+        const MatShape ws = weights.shape();
+        float* W = weights.ptr<float>();
+
+        // MLAS holds its own copy, packed from the plain matrix setWeights() then dropped.
+        // It arms only for 1x1 dense, so the fold below walks exactly those weights.
+        Mat plain;
+        if (!mlas_packed_B_.empty())
+            plain.create(K, Cg, CV_32F);
+
+        if (ngroups == K && Cg == 1) {
+            // depthwise: C1 x ksize x C0, and the input channel is the output channel
+            const int ksize = ws[1], C0 = ws[2];
+            parallel_for_(Range(0, K), [&](const Range& r) {
+                for (int ch = r.start; ch < r.end; ch++) {
+                    float* w = W + (size_t)(ch / C0) * ksize * C0 + (ch % C0);
+                    float sw = 0.f;
+                    for (int i = 0; i < ksize; i++) {
+                        sw += w[(size_t)i * C0];
+                        w[(size_t)i * C0] *= sc[ch];
+                    }
+                    adj[ch] += sh[ch] * sw;
+                }
+            });
+        } else {
+            const ConvWeightPack pack = ConvWeightPack::forConv(wshape0, ws, ngroups, packC0);
+            const int ksize = pack.ksize;
+            const size_t sstride = pack.tapStride();
+            parallel_for_(Range(0, K), [&](const Range& r) {
+                for (int k = r.start; k < r.end; k++) {
+                    const int cbase = (k / pack.Kg) * Cg;  // first input channel of k's group
+                    for (int c = 0; c < Cg; c++) {
+                        float* w = W + pack.offset(k, c);
+                        float sw = 0.f;
+                        for (int i = 0; i < ksize; i++) {
+                            sw += w[i * sstride];
+                            w[i * sstride] *= sc[cbase + c];
+                        }
+                        if (!plain.empty())
+                            plain.ptr<float>(k)[c] = w[0];  // ksize == 1 whenever MLAS armed
+                        adj[k] += sh[cbase + c] * sw;
+                    }
+                }
+            });
+        }
+
+        if (!plain.empty() &&
+            !mlasSgemmPackB(false, true, K, Cg, plain.ptr<float>(), Cg, mlas_packed_B_.data))
+            mlas_packed_B_.release();
+
+        // The CUDA path reads this plain copy instead of the packed one.
+        if (!origWeights.empty() && origWeights.type() == CV_32F) {
+            Mat w2d = origWeights.reshape(1, K);
+            const int Kg = K / ngroups, inner = (int)(origWeights.total() / ((size_t)K * Cg));
+            parallel_for_(Range(0, K), [&](const Range& r) {
+                for (int k = r.start; k < r.end; k++) {
+                    float* row = w2d.ptr<float>(k);
+                    for (int c = 0; c < Cg; c++) {
+                        float* wc = row + (size_t)c * inner;
+                        for (int i = 0; i < inner; i++)
+                            wc[i] *= sc[(k / Kg) * Cg + c];
+                    }
+                }
+            });
+        }
+
+        // forwardMlasIm2col() reads this copy; it exists only for ngroups == 1.
+        if (!im2colWeights_.empty()) {
+            const int inner = im2colWeights_.cols / Cg;
+            parallel_for_(Range(0, K), [&](const Range& r) {
+                for (int k = r.start; k < r.end; k++) {
+                    float* row = im2colWeights_.ptr<float>(k);
+                    for (int c = 0; c < Cg; c++)
+                        for (int i = 0; i < inner; i++)
+                            row[c*inner + i] *= sc[c];
+                }
+            });
+        }
+
+        if (bias.empty()) {
+            bias.fit(1, &K, CV_32F);
+            bias.setTo(0.f);
+        }
+        float* bp = bias.ptr<float>();
+        for (int k = 0; k < K; k++)
+            bp[k] += adj[k];
+        return true;
     }
 
     virtual std::ostream& dumpAttrs(std::ostream& strm, int indent) const CV_OVERRIDE
@@ -110,11 +243,25 @@ public:
         Mat bias_ = bias_arr.getMat();
         CV_Assert(!weights_.empty());
         int wtype0 = weights_.type();
-        CV_Assert(wtype0 == CV_32F || wtype0 == CV_16F || wtype0 == CV_16BF);
+        CV_Assert(wtype0 == CV_32F || wtype0 == CV_16F || wtype0 == CV_16BF ||
+                  wtype0 == CV_8F_E4M3FN || wtype0 == CV_8F_E4M3FNUZ);
+        // repackConvWeights is FP32-only; FP8 reaches here only from vendor-quantised
+        // graphs that feed Conv without a DequantizeLinear. Half stays as it was --
+        // repackDepthwiseConvWeights takes CV_16F/CV_16BF natively.
+        if (wtype0 == CV_8F_E4M3FN || wtype0 == CV_8F_E4M3FNUZ) {
+            Mat widened;
+            weights_.convertTo(widened, CV_32F);
+            weights_ = widened;
+        }
         CV_Assert(accuracy == -1 || accuracy == CV_32F);
         int wtype = accuracy < 0 ? CV_32F : accuracy;
 
         wshape0 = weights_.shape();
+        packC0 = C0;
+#ifdef HAVE_CUDA
+        // Retain the original NCHW filter for the CUDA (cuDNN) path.
+        weights_.convertTo(origWeights, CV_32F);
+#endif
         bool depthwise = ngroups == wshape0[0] && wshape0[1] == 1;
 
         if (depthwise) {
@@ -132,7 +279,7 @@ public:
         // >= 256*256 so the reorder cost is amortized).
         mlas_packed_B_.release();
         mlas_packed_M_ = mlas_packed_K_ = 0;
-        if (!depthwise && ngroups == 1 && wtype0 == CV_32F &&
+        if (!depthwise && ngroups == 1 && weights_.type() == CV_32F &&
             wtype == CV_32F && mlasAvailable())
         {
             bool ksize_all_one = wshape0.dims >= 3;
@@ -162,48 +309,43 @@ public:
                 }
             }
         }
-    }
 
-    void fuseBatchNormWeights(const BatchNorm2Layer* bn)
-    {
-        Mat bn_scale, bn_bias;
-        bn->getScaleBias(bn_scale, bn_bias);
-
-        CV_Assert(bn_scale.isContinuous() && bn_bias.isContinuous());
-        CV_Assert(bn_scale.type() == CV_32F && bn_bias.type() == CV_32F);
-        CV_Assert(bn_scale.total() == bn_bias.total());
-        int K = (int)bn_scale.total();
-        CV_Assert(bias.empty() || (bias.type() == CV_32F && bias.total() == (size_t)K));
-        const float* bias_data = bias.data ? bias.ptr<float>() : nullptr;
-
-        fusedScale.fit(1, &K, CV_32F);
-        fusedBias.fit(1, &K, CV_32F);
-
-        const float* bn_scale_data = bn_scale.ptr<float>();
-        const float* bn_bias_data = bn_bias.ptr<float>();
-        float* fused_scale_data = fusedScale.ptr<float>();
-        float* fused_bias_data = fusedBias.ptr<float>();
-
-        // (sum(x*w) + bias)*bn_scale + bn_bias => sum(x*w)*fused_scale + fused_bias,
-        // where fused_scale = bn_scale and fused_bias = bias*bn_scale + bn_bias.
-        for (size_t i = 0; i < K; i++) {
-            fused_scale_data[i] = bn_scale_data[i];
-            fused_bias_data[i] = (bias_data ? bn_scale_data[i]*bias_data[i] : 0.f) + bn_bias_data[i];
+        // Weights as a (Cout, Cin*kh*kw) matrix for forwardMlasIm2col().
+        im2colWeights_.release();
+        if (!depthwise && ngroups == 1 && wshape0[1] <= SMALL_CIN_MAX && isPatchEmbedding() &&
+            weights_.type() == CV_32F && wtype == CV_32F && weights_.isContinuous() &&
+            mlasAvailable())
+        {
+            im2colWeights_ = weights_.reshape(1, wshape0[0]).clone();
         }
     }
 
-    virtual bool fuseBatchNorm(const Ptr<Layer>& bnlayer) override
+    // A ViT patch embedding with few input channels skips block layout: padding 3 channels to 8
+    // would cost an extra layout conversion and 8/3 of the work.
+    static constexpr int SMALL_CIN_MAX = 4;
+
+    // Kernel equal to stride, no padding or dilation: patches do not overlap or leave the image.
+    // Other small convs keep the blocked kernel, so their results stay the same.
+    bool isPatchEmbedding() const
     {
-        BatchNorm2Layer* bn = dynamic_cast<BatchNorm2Layer*>(bnlayer.get());
-        // addResidual means the graph order is conv->add->bn: the residual is added
-        // before BN, but the conv applies the fused BN scale only to conv(x), not to
-        // the residual. Refuse so BN stays separate and runs on (conv + residual).
-        if (fusedBatchNorm || !bn || bn->inputs.size() > 1 ||
-            fastActivation != FAST_ACTIV_NONE || !activ.empty() || addResidual)
+        if (wshape0.dims != 4 || wshape0[2]*wshape0[3] <= 1 || strides.size() != 2 || ceil_mode ||
+            (auto_pad != AUTO_PAD_NONE && auto_pad != AUTO_PAD_VALID))
             return false;
-        fuseBatchNormWeights(bn);
-        fusedBatchNorm = true;
+        for (int i = 0; i < 2; i++)
+            if (strides[i] != wshape0[i + 2] || (!dilations.empty() && dilations[i] != 1))
+                return false;
+        for (int p : pads)
+            if (p != 0)
+                return false;
         return true;
+    }
+
+    // Only with one input: constant weights taken by constArgs(), no residual. Runtime weights
+    // are re-set in forward() on the block path, so a copy of them here could go stale.
+    bool mlasIm2colEnabled() const
+    {
+        return inputs.size() == 1 && !im2colWeights_.empty() &&
+               getNetImpl(this)->originalLayout == DATA_LAYOUT_NCHW;
     }
 
     virtual bool fuseAddBias(InputArray arr) CV_OVERRIDE
@@ -227,52 +369,317 @@ public:
         return true;
     }
 
-    virtual bool fuseActivation(const Ptr<Layer>& activlayer) override
+private:
+    static bool splitConstOperand(const std::vector<FusionNode>& nd, int node,
+                             int& other, int& bufId, float& scalarVal)
     {
-        ActivationLayer* activ_ptr = dynamic_cast<ActivationLayer*>(activlayer.get());
-        if (!activ_ptr || fastActivation != FAST_ACTIV_NONE ||
-            activationFunc != nullptr || !activ.empty())
+        const FusionNode& n = nd[node];
+        if (n.inputs.size() != 2)
+            return false;
+        for (int s = 0; s < 2; s++) {
+            const FusionNode& c = nd[n.inputs[s]];
+            if (c.op == FusionEltwiseOp::CONST) {
+                bufId = -1;
+                scalarVal = c.scalar;
+                other = n.inputs[1 - s];
+                return true;
+            }
+            if (c.op == FusionEltwiseOp::PER_CHANNEL_CONST) {
+                bufId = c.constBufferId;
+                scalarVal = 0.f;
+                other = n.inputs[1 - s];
+                return true;
+            }
+        }
+        return false;
+    }
+
+    //! The operand of max(v, 0) or min(v, 0), or -1 when @p node is not that shape.
+    static int zeroClamped(const std::vector<FusionNode>& nd, int node, FusionEltwiseOp op)
+    {
+        const FusionNode& n = nd[node];
+        if (n.op != op || n.inputs.size() != 2)
+            return -1;
+        for (int k = 0; k < 2; k++) {
+            const FusionNode& z = nd[n.inputs[k]];
+            if (z.op == FusionEltwiseOp::CONST && z.scalar == 0.f)
+                return n.inputs[1 - k];
+        }
+        return -1;
+    }
+
+    //! Matches max(x,0) + s*min(x,0). Interning sorts commutative operands, so both
+    //! sides of every node are tried.
+    static bool splitLeakyRelu(const std::vector<FusionNode>& nd, int node,
+                               int& operand, int& slopeNode)
+    {
+        const FusionNode& add = nd[node];
+        if (add.op != FusionEltwiseOp::ADD || add.inputs.size() != 2)
             return false;
 
-        ReLULayer* activRelu = dynamic_cast<ReLULayer*>(activ_ptr);
-        ReLU6Layer* activClip = dynamic_cast<ReLU6Layer*>(activ_ptr);
-        ChannelsPReLULayer* activPRelu = dynamic_cast<ChannelsPReLULayer*>(activ_ptr);
-        if (activRelu) {
-            float alpha = activRelu->negativeSlope;
-            if (alpha == 0.f) {
-                fastActivation = FAST_ACTIV_RELU;
-            } else {
-                fastActivation = FAST_ACTIV_LEAKY_RELU;
-                activParams = {alpha};
+        for (int s = 0; s < 2; s++) {
+            const FusionNode& mul = nd[add.inputs[1 - s]];
+            if (mul.op != FusionEltwiseOp::MUL || mul.inputs.size() != 2)
+                continue;
+            const int x = zeroClamped(nd, add.inputs[s], FusionEltwiseOp::MAX);
+            if (x < 0)
+                continue;
+            for (int k = 0; k < 2; k++) {
+                if (zeroClamped(nd, mul.inputs[k], FusionEltwiseOp::MIN) != x)
+                    continue;
+                operand = x;
+                slopeNode = mul.inputs[1 - k];
+                return true;
             }
-        } else if (activClip && activClip->minValue == 0.f) {
-            fastActivation = FAST_ACTIV_CLIP;
-            activParams = {activClip->minValue, activClip->maxValue};
-        } else if (activPRelu && activPRelu->blobs.size() == 1) {
-            fastActivation = FAST_ACTIV_PRELU;
-            const Mat& slopes = activPRelu->blobs[0];
-            int slopesType = slopes.type();
-            CV_Assert_N((slopesType == CV_32F || slopesType == CV_16F || slopesType == CV_16BF),
-                        slopes.isContinuous());
-            int nslopes = int(slopes.total());
-            Mat(1, &nslopes, slopesType, (void*)slopes.data).convertTo(activParams, CV_32F);
-        } else {
-            activationFunc = activ_ptr->getActivationFunc(CV_32F, activParams);
-            if (!activationFunc)
-                return false;
         }
+        return false;
+    }
+
+    //! Splits one affine term off @p cur into @p out and steps past it.
+    bool splitAffineTerm(const std::vector<FusionNode>& nd, const AdjacencyGraph& g,
+                         int& cur, int K, std::vector<float>& out) const
+    {
+        int other = -1, bufId = -1;
+        float sv = 0.f;
+        if (!splitConstOperand(nd, cur, other, bufId, sv) ||
+            !readPerChannelValues(g, bufId, sv, K, out))
+            return false;
+        cur = other;
         return true;
     }
 
-    virtual bool fuseAddResidual(Arg residual) CV_OVERRIDE
+    bool readPerChannelValues(const AdjacencyGraph& g, int bufId, float scalarVal, int K,
+                       std::vector<float>& out) const
     {
-        if (activ.empty() && fastActivation == FAST_ACTIV_NONE &&
-            activationFunc == nullptr && !addResidual && residual.idx >= 0) {
-            addResidual = true;
-            inputs.push_back(residual);
+        if (bufId < 0) {
+            std::fill(out.begin(), out.end(), scalarVal);
+            return true;
+        }
+        if (bufId >= (int)g.constBufs.size())
+            return false;
+        const Mat& c = g.constBufs[bufId];
+        if (c.empty() || c.type() != CV_32F || !c.isContinuous() || (int)c.total() != K)
+            return false;
+
+        // A flagged buffer is declared or proven per-channel; any other must prove it here,
+        // since a bare [K] broadcasts onto the last axis, not the channel axis.
+        if (bufId >= (int)g.constBufPerChannel.size() || !g.constBufPerChannel[bufId]) {
+            const int nspatial = wshape0.dims - 2;
+            const int ax = c.dims - nspatial - 1;
+            if (ax < 0)
+                return false;
+            for (int d = 0; d < c.dims; d++) {
+                if (c.size[d] != (d == ax ? K : 1))
+                    return false;
+            }
+        }
+        const float* p = c.ptr<float>();
+        std::copy(p, p + K, out.begin());
+        return true;
+    }
+
+public:
+    static bool absorbOp(Layer* self, const Ptr<AdjacencyGraph>& expr)
+    {
+        return static_cast<Conv2LayerImpl*>(self)->absorbMath(expr);
+    }
+
+    //! The TENSOR side of a binary node, if it has one. Reports only; the caller commits.
+    static bool splitTensorOperand(const std::vector<FusionNode>& nd, int node,
+                                   int& other, int& tensorId)
+    {
+        const FusionNode& n = nd[node];
+        if (n.inputs.size() != 2)
+            return false;
+        for (int s = 0; s < 2; s++) {
+            if (nd[n.inputs[s]].op != FusionEltwiseOp::TENSOR)
+                continue;
+            tensorId = nd[n.inputs[s]].constBufferId;
+            other = n.inputs[1 - s];
             return true;
         }
         return false;
+    }
+
+    //! Fills locals, not layer members: the match can still be refused after this.
+    bool splitActivation(const AdjacencyGraph& g, int node, int K, int& operand,
+                         FastActivation& act, std::vector<float>& ap) const
+    {
+        const std::vector<FusionNode>& nd = g.nodes();
+        if (nd[node].op == FusionEltwiseOp::CLAMP && nd[node].scalar == 0.f) {
+            act = FAST_ACTIV_CLIP;
+            ap.assign(2, 0.f);
+            ap[1] = nd[node].scalar2;
+            operand = nd[node].inputs[0];
+            return true;
+        }
+        if (nd[node].op == FusionEltwiseOp::MAX && nd[node].inputs.size() == 2 &&
+            nd[nd[node].inputs[1]].op == FusionEltwiseOp::CONST &&
+            nd[nd[node].inputs[1]].scalar == 0.f) {
+            act = FAST_ACTIV_RELU;
+            operand = nd[node].inputs[0];
+            return true;
+        }
+        int leakyOperand = -1, slopeNode = -1;
+        if (!splitLeakyRelu(nd, node, leakyOperand, slopeNode))
+            return false;
+        const FusionNode& sl = nd[slopeNode];
+        if (sl.op == FusionEltwiseOp::CONST) {
+            act = FAST_ACTIV_LEAKY_RELU;
+            ap.assign(1, sl.scalar);
+            operand = leakyOperand;
+            return true;
+        }
+        if (sl.op == FusionEltwiseOp::PER_CHANNEL_CONST) {
+            ap.assign(K, 0.f);
+            if (readPerChannelValues(g, sl.constBufferId, 0.f, K, ap)) {
+                act = FAST_ACTIV_PRELU;
+                operand = leakyOperand;
+                return true;
+            }
+            ap.clear();
+        }
+        return false;
+    }
+
+    bool absorbMath(const Ptr<AdjacencyGraph>& expr)
+    {
+        return absorbAffine(expr) || absorbKernel(expr);
+    }
+
+    //! Takes an expression the layer has a kernel for. Only a one-layer chain carries
+    //! one, so this cannot swallow math absorbAffine() just turned down.
+    bool absorbKernel(const Ptr<AdjacencyGraph>& expr)
+    {
+        if (!expr || !expr->kernel.fn || !expr->tensorArgs.empty())
+            return false;
+        if (fastActivation != FAST_ACTIV_NONE || activationFunc != nullptr || !activ.empty())
+            return false;
+
+        activationFunc = expr->kernel.fn;
+        activParams.assign(expr->kernel.params, expr->kernel.params + expr->kernel.nparams);
+        return true;
+    }
+
+    bool absorbAffine(const Ptr<AdjacencyGraph>& expr)
+    {
+        if (!expr || expr->size() == 0)
+            return false;
+        const std::vector<FusionNode>& nd = expr->nodes();
+        if (nd[0].op != FusionEltwiseOp::INPUT)
+            return false;
+        if (addResidual || inputs.size() > 1)
+            return false;
+        if (activationFunc != nullptr || !activ.empty())
+            return false;
+        if (wshape0.empty() || wshape0.dims < 3)
+            return false;
+
+        const int K = wshape0[0];
+        // Only K contiguous floats are needed; the rank is the producer's business.
+        if (!bias.empty() && (!bias.isContinuous() || (int)bias.total() != K))
+            return false;
+
+        int cur = expr->outputNode();
+
+        // act(x)*s == act(x*s) only for s >= 0 and a positively homogeneous act.
+        float postScale = 1.f;
+        {
+            int other = -1, bufId = -1;
+            float sv = 0.f;
+            if (nd[cur].op == FusionEltwiseOp::MUL &&
+                splitConstOperand(nd, cur, other, bufId, sv) && bufId < 0 && sv >= 0.f) {
+                postScale = sv;
+                cur = other;
+            }
+        }
+        const bool hasPostScale = cur != expr->outputNode();
+
+        if (fusedBatchNorm || fastActivation != FAST_ACTIV_NONE) {
+            if (!hasPostScale || cur != 0 ||
+                (fastActivation != FAST_ACTIV_RELU && fastActivation != FAST_ACTIV_LEAKY_RELU))
+                return false;
+        }
+
+        FastActivation act = FAST_ACTIV_NONE;
+        std::vector<float> ap;
+        int activOperand = -1;
+        if (splitActivation(*expr, cur, K, activOperand, act, ap))
+            cur = activOperand;
+        if (act == FAST_ACTIV_CLIP)
+            ap[1] *= postScale;
+
+        // The kernel adds the residual after the scale and bias and before the activation,
+        // so that is the only position it can occupy; a postScale would scale the sum too.
+        bool takesResidual = false;
+        if (nd[cur].op == FusionEltwiseOp::ADD) {
+            int other = -1, tensorId = -1;
+            if (splitTensorOperand(nd, cur, other, tensorId)) {
+                if (hasPostScale || tensorId != 0)
+                    return false;
+                takesResidual = true;
+                cur = other;
+            }
+        }
+        // An unread tensor would still be wired on as an input, so refuse rather than ignore.
+        if (expr->tensorArgs.size() != (size_t)(takesResidual ? 1 : 0))
+            return false;
+
+        std::vector<float> scale(K, 1.f), shift(K, 0.f);
+        bool affine = false;
+
+        // A chain can stack more than one affine, so peel rounds until the input and
+        // compose them: x*a+b then *c+d is x*(a*c) + (b*c+d).
+        while (cur != 0) {
+            const int before = cur;
+            std::vector<float> s(K, 1.f), t(K, 0.f);
+
+            if (nd[cur].op == FusionEltwiseOp::ADD &&
+                !splitAffineTerm(nd, *expr, cur, K, t))
+                return false;
+            if (nd[cur].op == FusionEltwiseOp::MUL &&
+                !splitAffineTerm(nd, *expr, cur, K, s))
+                return false;
+            if (cur == before)
+                return false;
+
+            for (int k = 0; k < K; k++) {
+                shift[k] += t[k]*scale[k];  // uses the old scale, so it goes first
+                scale[k] *= s[k];
+            }
+            affine = true;
+        }
+
+        if (!affine && !hasPostScale && act == FAST_ACTIV_NONE && !takesResidual)
+            return false;
+
+        if (affine || hasPostScale) {
+            if (fusedBatchNorm) {
+                float* fs = fusedScale.ptr<float>();
+                float* fb = fusedBias.ptr<float>();
+                for (int k = 0; k < K; k++) {
+                    fs[k] *= postScale;
+                    fb[k] *= postScale;
+                }
+            } else {
+                fusedScale.fit(1, &K, CV_32F);
+                fusedBias.fit(1, &K, CV_32F);
+                float* fs = fusedScale.ptr<float>();
+                float* fb = fusedBias.ptr<float>();
+                const float* b = bias.empty() ? nullptr : bias.ptr<float>();
+                for (int k = 0; k < K; k++) {
+                    fs[k] = postScale * scale[k];
+                    fb[k] = postScale * ((b ? b[k] * scale[k] : 0.f) + shift[k]);
+                }
+                fusedBatchNorm = true;
+            }
+        }
+        if (act != FAST_ACTIV_NONE) {
+            fastActivation = act;
+            activParams = ap;
+        }
+        addResidual = takesResidual;
+        return true;
     }
 
     virtual int64_t getFLOPS(const std::vector<MatShape>& inputs,
@@ -288,7 +695,7 @@ public:
     }
 
     virtual void getTypes(const std::vector<MatType>& inptypes,
-                          const int, const int,
+                          const int, const int requiredInternals,
                           std::vector<MatType>& outtypes,
                           std::vector<MatType>& temptypes) const CV_OVERRIDE
     {
@@ -296,7 +703,8 @@ public:
         CV_Assert(ninputs >= 1);
 
         outtypes.assign(1, inferType(inptypes[0]));
-        temptypes.clear();
+        // Only the patch embedding has an internal buffer: one image's FP32 im2col matrix.
+        temptypes.assign(requiredInternals, CV_32F);
     }
 
     virtual bool getMemoryShapes(const std::vector<MatShape>& inpshapes,
@@ -314,6 +722,11 @@ public:
                                            ngroups, strides, dilations,
                                            pads, auto_pad, ceil_mode));
         tempshapes.clear();
+        if (inpshapes[0].layout != DATA_LAYOUT_BLOCK && inpshapes[0].dims == 4 && mlasIm2colEnabled()) {
+            const MatShape& o = outshapes[0];
+            if (o.total() > 0)
+                tempshapes.assign(1, MatShape({inpshapes[0][1]*wshape0[2]*wshape0[3], o[2]*o[3]}));
+        }
         return true;
     }
 
@@ -325,9 +738,13 @@ public:
         size_t ninputs = actualInputs.size();
         CV_Assert(ninputs >= 1u && requiredOutputs == 1u);
         desiredInputs = actualInputs;
-        desiredInputs[0] = DATA_LAYOUT_BLOCK;
         for (size_t i = 1; i < ninputs; i++)
             desiredInputs[i] = DATA_LAYOUT_UNKNOWN;
+        if (actualInputs[0] != DATA_LAYOUT_BLOCK && mlasIm2colEnabled()) {
+            outputs.assign(requiredOutputs, actualInputs[0]);
+            return getNetImpl(this)->defaultC0;
+        }
+        desiredInputs[0] = DATA_LAYOUT_BLOCK;
         if (addResidual && ninputs > 1)
             desiredInputs[ninputs - 1] = DATA_LAYOUT_BLOCK;
         outputs.assign(requiredOutputs, DATA_LAYOUT_BLOCK);
@@ -352,8 +769,13 @@ public:
         const void* resptr = nullptr;
         int inptype = inp.type();
         MatShape inpshape = inp.shape();
-        CV_Assert(inpshape.layout == DATA_LAYOUT_BLOCK);
         CV_Assert(inp.isContinuous());
+        if (inpshape.layout != DATA_LAYOUT_BLOCK) {
+            // getLayouts() leaves the input in plain layout only for this path
+            CV_Assert(mlasIm2colEnabled());
+            forwardMlasIm2col(inp, output_arrs, *temp_mats);
+            return;
+        }
 
         if (addResidual) {
             residual = input_arrs.getMat(ninputs-1);
@@ -423,6 +845,13 @@ public:
             out.fit(outshape, outtype);
         }
 
+        // An empty output (e.g. a zero batch) has nothing to compute; the kernels assume work.
+        if (out.total() == 0) {
+            if (dynamicWeights)
+                weights.release();
+            return;
+        }
+
         const void* inptr = inp.data;
         void* outptr = out.data;
         const void* wptr = weights.data;
@@ -457,6 +886,109 @@ public:
             // very rare situation of dynamic convolution weights,
             // we release temporarily allocated and reordered copy of the weights
             weights.release();
+        }
+    }
+
+    // Patch embedding on the plain NCHW tensor: for each image, gather the input patches
+    // (im2col), run one MLAS matrix multiply, then apply bias and activation.
+    void forwardMlasIm2col(const Mat& inp0, OutputArrayOfArrays output_arrs, const std::vector<Mat>& temps)
+    {
+        const MatShape inpshape = inp0.shape();
+        CV_Assert(inpshape.dims == 4);
+        const MatShape outshape = convInferShape(inpshape, wshape0, emptyKernelShape,
+                                                 ngroups, strides, dilations,
+                                                 pads, auto_pad, ceil_mode);
+        const int outtype = inferType(inp0.type());
+
+        Mat inp = inp0, out;
+        if (inp.type() != CV_32F)
+            inp0.convertTo(inp, CV_32F);
+        const int outkind = output_arrs.kind();
+        if (outkind == _InputArray::STD_VECTOR_MAT) {
+            std::vector<Mat>& outs = output_arrs.getMatVecRef();
+            outs.resize(1);
+            outs[0].fit(outshape, outtype);
+            if (outtype == CV_32F)
+                out = outs[0];
+        } else {
+            CV_Assert(outkind == _InputArray::STD_VECTOR_UMAT);
+            output_arrs.getUMatVecRef().resize(1);
+            output_arrs.getUMatVecRef()[0].fit(outshape, outtype);
+        }
+        if (out.empty())
+            out.fit(outshape, CV_32F);
+        if (out.total() == 0)
+            return;  // e.g. a zero batch
+
+        const int N = inpshape[0], C = inpshape[1], H = inpshape[2], W = inpshape[3];
+        const int K = outshape[1], OH = outshape[2], OW = outshape[3];
+        const int kh = wshape0[2], kw = wshape0[3];  // also the strides
+        const int KD = C*kh*kw;
+        const size_t P = (size_t)OH*OW;
+        CV_Assert(im2colWeights_.rows == K && im2colWeights_.cols == KD);
+        CV_Assert(OH*kh <= H && OW*kw <= W);
+        CV_Assert(!temps.empty() && temps[0].type() == CV_32F && temps[0].isContinuous() &&
+                  temps[0].total() >= KD*P);
+        float* col = (float*)temps[0].data;
+        const float* wptr = im2colWeights_.ptr<float>();
+        const float* inpdata = inp.ptr<float>();
+        float* outdata = out.ptr<float>();
+
+        for (int n = 0; n < N; n++) {
+            const float* x = inpdata + (size_t)n*C*H*W;
+            // im2col: row (c, ky, kx) of col holds that input value for every output pixel.
+            // Patches do not overlap or leave the image, so every read is inside the input.
+            parallel_for_(Range(0, KD), [&](const Range& r) {
+                for (int d = r.start; d < r.end; d++) {
+                    const int c = d/(kh*kw), ky = d/kw % kh, kx = d % kw;
+                    float* row = col + (size_t)d*P;
+                    for (int oy = 0; oy < OH; oy++, row += OW) {
+                        const float* src = x + ((size_t)c*H + oy*kh + ky)*W + kx;
+                        for (int ox = 0; ox < OW; ox++)
+                            row[ox] = src[(size_t)ox*kw];
+                    }
+                }
+            });
+            // One call per image, so that MLAS splits it over the threads itself.
+            bool ok = mlasSgemm(false, false, K, (int)P, KD, 1.f, wptr, KD, col, (int)P, 0.f,
+                                outdata + (size_t)n*K*P, (int)P);
+            CV_Assert(ok);
+        }
+
+        const float* scale = fusedBatchNorm ? fusedScale.ptr<float>() : nullptr;
+        const float* shift = fusedBatchNorm ? fusedBias.ptr<float>() :
+                             bias.empty() ? nullptr : bias.ptr<float>();
+        const float* prm = activParams.empty() ? nullptr : activParams.data();
+        const FastActivation act = fastActivation;
+        // Every fast activation is a slope for v < 0 and a clamp: alpha is 0 for ReLU, the slope
+        // for LeakyReLU, per channel for PReLU, 1 otherwise; lo/hi are Clip's bounds or +-FLT_MAX.
+        const float defAlpha = act == FAST_ACTIV_RELU ? 0.f :
+                               act == FAST_ACTIV_LEAKY_RELU ? activParams[0] : 1.f;
+        const float lo = act == FAST_ACTIV_CLIP ? activParams[0] : -FLT_MAX;
+        const float hi = act == FAST_ACTIV_CLIP ? activParams[1] : FLT_MAX;
+        if (scale || shift || act != FAST_ACTIV_NONE || activationFunc) {
+            parallel_for_(Range(0, N*K), [&](const Range& r) {
+                for (int nk = r.start; nk < r.end; nk++) {
+                    const int k = nk % K;
+                    float* yk = outdata + (size_t)nk*P;
+                    const float s = scale ? scale[k] : 1.f, b = shift ? shift[k] : 0.f;
+                    const float alpha = act == FAST_ACTIV_PRELU ? activParams[k] : defAlpha;
+                    for (size_t j = 0; j < P; j++) {
+                        const float v = yk[j]*s + b;
+                        yk[j] = std::min(std::max(v >= 0.f ? v : v*alpha, lo), hi);
+                    }
+                    if (activationFunc)
+                        activationFunc(yk, yk, P, prm);
+                }
+            });
+        }
+
+        if (outkind == _InputArray::STD_VECTOR_MAT) {
+            Mat& dst = output_arrs.getMatVecRef()[0];
+            if (dst.data != out.data)
+                out.convertTo(dst, outtype);
+        } else {
+            out.convertTo(output_arrs.getUMatVecRef()[0], outtype);
         }
     }
 
@@ -660,10 +1192,115 @@ public:
         }
     }
 
+#ifdef HAVE_CUDA
+    bool cudaSupported() const
+    {
+        if (origWeights.empty() || wshape0.dims != 4)  // [Cout, Cin/group, kh, kw] (2D conv)
+            return false;
+        if (!activ.empty())
+            return false;
+        // a fused kernel activation runs on CUDA only if ConvolutionOp has the same one
+        if (activationFunc != nullptr &&
+            activationFunc != getActivationFunc(ACTIV_SIGMOID) && activationFunc != getActivationFunc(ACTIV_SWISH) &&
+            activationFunc != getActivationFunc(ACTIV_MISH) && activationFunc != getActivationFunc(ACTIV_TANH))
+            return false;
+        if (fastActivation != FAST_ACTIV_NONE && fastActivation != FAST_ACTIV_RELU &&
+            fastActivation != FAST_ACTIV_LEAKY_RELU && fastActivation != FAST_ACTIV_CLIP)
+            return false;
+        return true;
+    }
+
+    Ptr<BackendNode> initCudaConvNode(void* context_, const MatShape& inpShape,
+                                      const MatShape& outShape, int targetId)
+    {
+        csl::CSLContext context = *reinterpret_cast<csl::CSLContext*>(context_);
+        const int nspatial = wshape0.dims - 2;
+
+        ConvolutionConfiguration config;
+        for (int i = 0; i < nspatial; i++) {
+            config.kernel_size.push_back((size_t)wshape0[2 + i]);
+            config.strides.push_back(strides.empty() ? 1 : (size_t)strides[i]);
+            config.dilations.push_back(dilations.empty() ? 1 : (size_t)dilations[i]);
+        }
+        if (auto_pad == AUTO_PAD_VALID) {
+            config.padMode = ConvolutionConfiguration::PaddingMode::VALID;
+        } else {
+            config.padMode = ConvolutionConfiguration::PaddingMode::MANUAL;
+            for (int i = 0; i < nspatial; i++) {
+                int pad0, pad1;
+                getPadding(pads, i, nspatial, auto_pad,
+                           {(int)wshape0[2 + i], inpShape[i + 2],
+                            strides.empty() ? 1 : strides[i],
+                            dilations.empty() ? 1 : dilations[i]},
+                           pad0, pad1);
+                config.pads_begin.push_back((size_t)pad0);
+                config.pads_end.push_back((size_t)pad1);
+            }
+        }
+        config.input_shape.assign(inpShape.begin(), inpShape.end());
+        config.output_shape.assign(outShape.begin(), outShape.end());
+        config.groups = (size_t)ngroups;
+
+        Mat filters = origWeights, biasMat = bias;
+        if (fusedBatchNorm) {
+            filters = origWeights.clone();
+            const int Cout = wshape0[0];
+            const size_t inner = filters.total() / (size_t)Cout;
+            const float* sc = fusedScale.ptr<float>();
+            float* wp = filters.ptr<float>();
+            for (int co = 0; co < Cout; co++) {
+                float s = sc[co];
+                for (size_t k = 0; k < inner; k++)
+                    wp[co * inner + k] *= s;
+            }
+            biasMat = fusedBias;  // already b*scale + bn_bias
+        }
+
+        config.activation_type = ConvolutionConfiguration::ActivationType::IDENTITY;
+        config.relu_negative_slope = 0.f;
+        config.crelu_floor = 0.f; config.crelu_ceil = 0.f;
+        config.power_exp = 1.f; config.power_scale = 1.f; config.power_shift = 0.f;
+        bool hasAct = fastActivation != FAST_ACTIV_NONE || activationFunc != nullptr;
+        if (activationFunc == getActivationFunc(ACTIV_SIGMOID)) {
+            config.activation_type = ConvolutionConfiguration::ActivationType::SIGMOID;
+        } else if (activationFunc == getActivationFunc(ACTIV_SWISH)) {
+            config.activation_type = ConvolutionConfiguration::ActivationType::SWISH;
+        } else if (activationFunc == getActivationFunc(ACTIV_MISH)) {
+            config.activation_type = ConvolutionConfiguration::ActivationType::MISH;
+        } else if (activationFunc == getActivationFunc(ACTIV_TANH)) {
+            config.activation_type = ConvolutionConfiguration::ActivationType::TANH;
+        } else if (fastActivation == FAST_ACTIV_RELU) {
+            config.activation_type = ConvolutionConfiguration::ActivationType::RELU;
+        } else if (fastActivation == FAST_ACTIV_LEAKY_RELU) {
+            config.activation_type = ConvolutionConfiguration::ActivationType::RELU;
+            config.relu_negative_slope = activParams.empty() ? 0.f : activParams[0];
+        } else if (fastActivation == FAST_ACTIV_CLIP) {
+            config.activation_type = ConvolutionConfiguration::ActivationType::CLIPPED_RELU;
+            config.crelu_floor = activParams.size() > 0 ? activParams[0] : 0.f;
+            config.crelu_ceil  = activParams.size() > 1 ? activParams[1] : 6.f;
+        }
+
+        if (addResidual && hasAct)
+            config.fusion_mode = ConvolutionConfiguration::FusionMode::ELTWISE_SUM_THEN_ACTIVATION;
+        else if (addResidual)
+            config.fusion_mode = ConvolutionConfiguration::FusionMode::ELTWISE_SUM;
+        else if (hasAct)
+            config.fusion_mode = ConvolutionConfiguration::FusionMode::ACTIVATION;
+        else
+            config.fusion_mode = ConvolutionConfiguration::FusionMode::NONE;
+
+        return make_cuda_node<cuda4dnn::ConvolutionOp>(
+            targetId, std::move(context.stream), std::move(context.cudnn_handle),
+            config, filters, biasMat);
+    }
+#endif
+
     std::vector<int> emptyKernelShape;
     Ptr<Layer> activ, batchNorm;
     Mat weights, bias, fusedScale, fusedBias;
+    Mat origWeights;  // original NCHW filter (FP32), kept for the CUDA path
     MatShape wshape0, prevInpshape;
+    int packC0 = 0;   // block factor the weights were packed with
     ConvState cs;
     bool fusedBatchNorm;
     FastActivation fastActivation;
@@ -677,11 +1314,71 @@ public:
     Mat scratch_C_;
     int mlas_packed_M_ = 0;   // == Cout
     int mlas_packed_K_ = 0;   // == Cin
+
+    // Weights for forwardMlasIm2col(), (Cout, Cin*kh*kw); empty when the path is not used.
+    Mat im2colWeights_;
 };
 
 Ptr<Conv2Layer> Conv2Layer::create(const LayerParams& params)
 {
     return Ptr<Conv2Layer>(new Conv2LayerImpl(params));
 }
+
+#ifdef HAVE_CUDA
+class CUDAConv2Layer : public Layer
+{
+public:
+    CUDAConv2Layer(const Ptr<Conv2LayerImpl>& conv_, void* ctx_) : conv(conv_), ctx(ctx_) {}
+
+    static Ptr<Layer> create(const Ptr<LayerInfo>& data, void* backendCtx)
+    {
+        Ptr<Conv2LayerImpl> conv = data.dynamicCast<Conv2LayerImpl>();
+        if (!conv || !backendCtx || !conv->cudaSupported())
+            return Ptr<Layer>();
+        Ptr<CUDAConv2Layer> layer(new CUDAConv2Layer(conv, backendCtx));
+        layer->name = conv->name;
+        layer->type = conv->type;
+        layer->inputs = conv->inputs;
+        layer->outputs = conv->outputs;
+        return layer;
+    }
+
+    void finalize(InputArrayOfArrays, OutputArrayOfArrays) CV_OVERRIDE
+    {
+        // the node bakes in the input/output shapes; rebuild it for a new input signature
+        node.release();
+        cudaNode.release();
+    }
+
+    void forwardCUDA(InputArrayOfArrays inputs_,
+                     OutputArrayOfArrays outputs_,
+                     void* workspace) CV_OVERRIDE
+    {
+        std::vector<UMat> inputs, outputs;
+        inputs_.getUMatVector(inputs);
+        outputs_.getUMatVector(outputs);
+        CV_Assert(!inputs.empty() && !outputs.empty());
+
+        auto& ws = *reinterpret_cast<cuda4dnn::csl::Workspace*>(workspace);
+        if (!node) {
+            node = conv->initCudaConvNode(ctx, cv::dnn::shape(inputs[0]), cv::dnn::shape(outputs[0]), preferableTarget);
+            cudaNode = node.dynamicCast<CUDABackendNode>();
+            CV_Assert(cudaNode);
+            ws.require(cudaNode->get_workspace_memory_in_bytes());
+        }
+        cudaNode->forward(inputs, outputs, ws);
+    }
+
+    Ptr<Conv2LayerImpl> conv;
+    void* ctx;
+    Ptr<BackendNode> node;
+    Ptr<CUDABackendNode> cudaNode;
+};
+
+void registerConv2CudaBackend()
+{
+    CV_DNN_REGISTER_EXEC_CLASS(Conv2, DNN_BACKEND_CUDA, CUDAConv2Layer);
+}
+#endif
 
 }}

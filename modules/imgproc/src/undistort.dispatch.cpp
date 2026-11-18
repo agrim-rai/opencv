@@ -66,6 +66,7 @@ void initUndistortRectifyMap( InputArray _cameraMatrix, InputArray _distCoeffs,
                               InputArray _matR, InputArray _newCameraMatrix,
                               Size size, int m1type, OutputArray _map1, OutputArray _map2 )
 {
+    CV_Assert( size.width > 0 && size.height > 0 );
     Mat cameraMatrix = _cameraMatrix.getMat(), distCoeffs = _distCoeffs.getMat();
     Mat matR = _matR.getMat(), newCameraMatrix = _newCameraMatrix.getMat();
 
@@ -103,7 +104,10 @@ void initUndistortRectifyMap( InputArray _cameraMatrix, InputArray _distCoeffs,
 
     CV_Assert( A.size() == Size(3,3) && A.size() == R.size() );
     CV_Assert( Ar.size() == Size(3,3) || Ar.size() == Size(4, 3));
-    Mat_<double> iR = (Ar.colRange(0,3)*R).inv(DECOMP_LU);
+    Mat_<double> iR;
+    // a singular matrix would turn all the map coordinates into NaN's
+    if( invert(Ar.colRange(0,3)*R, iR, DECOMP_LU) == 0 )
+        CV_Error(Error::StsBadArg, "newCameraMatrix*R is singular (not invertible)");
     const double* ir = &iR(0,0);
 
     double u0 = A(0, 2),  v0 = A(1, 2);
@@ -147,6 +151,7 @@ void initInverseRectificationMap( InputArray _cameraMatrix, InputArray _distCoef
                               InputArray _matR, InputArray _newCameraMatrix,
                               const Size& size, int m1type, OutputArray _map1, OutputArray _map2 )
 {
+    CV_Assert( size.width > 0 && size.height > 0 );
     // Parameters
     Mat cameraMatrix = _cameraMatrix.getMat(), distCoeffs = _distCoeffs.getMat();
     Mat matR = _matR.getMat(), newCameraMatrix = _newCameraMatrix.getMat();
@@ -270,6 +275,15 @@ void undistort( InputArray _src, OutputArray _dst, InputArray _cameraMatrix,
 
     Mat src = _src.getMat(), cameraMatrix = _cameraMatrix.getMat();
     Mat distCoeffs = _distCoeffs.getMat(), newCameraMatrix = _newCameraMatrix.getMat();
+
+    CV_Assert( cameraMatrix.size() == Size(3, 3) );
+    CV_Assert( newCameraMatrix.empty() || newCameraMatrix.size() == Size(3, 3) );
+
+    if( src.empty() )
+    {
+        _dst.release();
+        return;
+    }
 
     _dst.create( src.size(), src.type() );
     Mat dst = _dst.getMat();

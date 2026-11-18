@@ -549,6 +549,28 @@ DISOpticalFlowImpl::PatchInverseSearch_ParBody::PatchInverseSearch_ParBody(DISOp
     I1_row_shifted_4_left = I1_row_next_shifted_4_left;                                                                \
     I1_row_shifted_4_right = I1_row_next_shifted_4_right;
 
+#if CV_SIMD_SCALABLE
+#define HAL_INIT_BILINEAR_PATCH_EXTRACTION                                                                             \
+    v_uint32 I1_row = vx_load_expand_q(I1_ptr + col);                                                                  \
+    v_uint32 I1_row_shifted = vx_load_expand_q(I1_ptr + col + 1);
+
+#define HAL_PROCESS_BILINEAR_PATCH_EXTRACTION                                                                          \
+    const uchar *I1_row_ptr = I1_ptr + (row + 1) * I1_stride + col;                                                    \
+    v_uint32 I1_row_next = vx_load_expand_q(I1_row_ptr);                                                               \
+    v_uint32 I1_row_next_shifted = vx_load_expand_q(I1_row_ptr + 1);                                                   \
+    v_uint32 I0_row = vx_load_expand_q(I0_ptr + row * I0_stride + col);                                                \
+                                                                                                                       \
+    v_float32 I_diff = v_sub(v_add(v_mul(w00v, v_cvt_f32(v_reinterpret_as_s32(I1_row))),                              \
+                                  v_mul(w01v, v_cvt_f32(v_reinterpret_as_s32(I1_row_shifted))),                        \
+                                  v_mul(w10v, v_cvt_f32(v_reinterpret_as_s32(I1_row_next))),                           \
+                                  v_mul(w11v, v_cvt_f32(v_reinterpret_as_s32(I1_row_next_shifted)))),                  \
+                            v_cvt_f32(v_reinterpret_as_s32(I0_row)));
+
+#define HAL_BILINEAR_PATCH_EXTRACTION_NEXT_ROW                                                                         \
+    I1_row = I1_row_next;                                                                                              \
+    I1_row_shifted = I1_row_next_shifted;
+#endif
+
 /* This function essentially performs one iteration of gradient descent when finding the most similar patch in I1 for a
  * given one in I0. It assumes that I0_ptr and I1_ptr already point to the corresponding patches and w00, w01, w10, w11
  * are precomputed bilinear interpolation weights. It returns the SSD (sum of squared differences) between these patches
@@ -596,7 +618,6 @@ inline float processPatch(float &dst_dUx, float &dst_dUy, uchar *I0_ptr, uchar *
         SSD = v_reduce_sum(SSD_vec);
     }
     else
-#endif
     {
         dst_dUx = 0.0f;
         dst_dUy = 0.0f;
@@ -613,6 +634,71 @@ inline float processPatch(float &dst_dUx, float &dst_dUy, uchar *I0_ptr, uchar *
                 dst_dUy += diff * I0y_ptr[i * I0_stride + j];
             }
     }
+#elif CV_SIMD_SCALABLE
+    dst_dUx = 0.0f;
+    dst_dUy = 0.0f;
+    int col = 0;
+    const int vlanes = VTraits<v_float32>::vlanes();
+    if (patch_sz >= vlanes)
+    {
+        const v_float32 w00v = vx_setall_f32(w00);
+        const v_float32 w01v = vx_setall_f32(w01);
+        const v_float32 w10v = vx_setall_f32(w10);
+        const v_float32 w11v = vx_setall_f32(w11);
+        v_float32 Ux_vec = vx_setzero_f32();
+        v_float32 Uy_vec = vx_setzero_f32();
+        v_float32 SSD_vec = vx_setzero_f32();
+
+        for (; col <= patch_sz - vlanes; col += vlanes)
+        {
+            HAL_INIT_BILINEAR_PATCH_EXTRACTION;
+            for (int row = 0; row < patch_sz; row++)
+            {
+                HAL_PROCESS_BILINEAR_PATCH_EXTRACTION;
+                v_float32 I0x_row = v_cvt_f32(vx_load_expand(I0x_ptr + row * I0_stride + col));
+                v_float32 I0y_row = v_cvt_f32(vx_load_expand(I0y_ptr + row * I0_stride + col));
+                Ux_vec = v_add(Ux_vec, v_mul(I_diff, I0x_row));
+                Uy_vec = v_add(Uy_vec, v_mul(I_diff, I0y_row));
+                SSD_vec = v_add(SSD_vec, v_mul(I_diff, I_diff));
+                HAL_BILINEAR_PATCH_EXTRACTION_NEXT_ROW;
+            }
+        }
+        dst_dUx = v_reduce_sum(Ux_vec);
+        dst_dUy = v_reduce_sum(Uy_vec);
+        SSD = v_reduce_sum(SSD_vec);
+        vx_cleanup();
+    }
+    {
+        float diff;
+        for (int i = 0; i < patch_sz; i++)
+            for (int j = col; j < patch_sz; j++)
+            {
+                diff = w00 * I1_ptr[i * I1_stride + j] + w01 * I1_ptr[i * I1_stride + j + 1] +
+                       w10 * I1_ptr[(i + 1) * I1_stride + j] + w11 * I1_ptr[(i + 1) * I1_stride + j + 1] -
+                       I0_ptr[i * I0_stride + j];
+                SSD += diff * diff;
+                dst_dUx += diff * I0x_ptr[i * I0_stride + j];
+                dst_dUy += diff * I0y_ptr[i * I0_stride + j];
+            }
+    }
+#else
+    {
+        dst_dUx = 0.0f;
+        dst_dUy = 0.0f;
+        float diff;
+        for (int i = 0; i < patch_sz; i++)
+            for (int j = 0; j < patch_sz; j++)
+            {
+                diff = w00 * I1_ptr[i * I1_stride + j] + w01 * I1_ptr[i * I1_stride + j + 1] +
+                       w10 * I1_ptr[(i + 1) * I1_stride + j] + w11 * I1_ptr[(i + 1) * I1_stride + j + 1] -
+                       I0_ptr[i * I0_stride + j];
+
+                SSD += diff * diff;
+                dst_dUx += diff * I0x_ptr[i * I0_stride + j];
+                dst_dUy += diff * I0y_ptr[i * I0_stride + j];
+            }
+    }
+#endif
     return SSD;
 }
 
@@ -666,7 +752,6 @@ inline float processPatchMeanNorm(float &dst_dUx, float &dst_dUy, uchar *I0_ptr,
         sum_diff_sq = v_reduce_sum(sum_diff_sq_vec);
     }
     else
-#endif
     {
         float diff;
         for (int i = 0; i < patch_sz; i++)
@@ -683,6 +768,72 @@ inline float processPatchMeanNorm(float &dst_dUx, float &dst_dUy, uchar *I0_ptr,
                 sum_I0y_mul += diff * I0y_ptr[i * I0_stride + j];
             }
     }
+#elif CV_SIMD_SCALABLE
+    int col = 0;
+    const int vlanes = VTraits<v_float32>::vlanes();
+    if (patch_sz >= vlanes)
+    {
+        const v_float32 w00v = vx_setall_f32(w00);
+        const v_float32 w01v = vx_setall_f32(w01);
+        const v_float32 w10v = vx_setall_f32(w10);
+        const v_float32 w11v = vx_setall_f32(w11);
+        v_float32 sum_I0x_mul_vec = vx_setzero_f32();
+        v_float32 sum_I0y_mul_vec = vx_setzero_f32();
+        v_float32 sum_diff_vec = vx_setzero_f32();
+        v_float32 sum_diff_sq_vec = vx_setzero_f32();
+        for (; col <= patch_sz - vlanes; col += vlanes)
+        {
+            HAL_INIT_BILINEAR_PATCH_EXTRACTION;
+            for (int row = 0; row < patch_sz; row++)
+            {
+                HAL_PROCESS_BILINEAR_PATCH_EXTRACTION;
+                v_float32 I0x_row = v_cvt_f32(vx_load_expand(I0x_ptr + row * I0_stride + col));
+                v_float32 I0y_row = v_cvt_f32(vx_load_expand(I0y_ptr + row * I0_stride + col));
+                sum_I0x_mul_vec = v_add(sum_I0x_mul_vec, v_mul(I_diff, I0x_row));
+                sum_I0y_mul_vec = v_add(sum_I0y_mul_vec, v_mul(I_diff, I0y_row));
+                sum_diff_sq_vec = v_add(sum_diff_sq_vec, v_mul(I_diff, I_diff));
+                sum_diff_vec = v_add(sum_diff_vec, I_diff);
+                HAL_BILINEAR_PATCH_EXTRACTION_NEXT_ROW;
+            }
+        }
+        sum_I0x_mul = v_reduce_sum(sum_I0x_mul_vec);
+        sum_I0y_mul = v_reduce_sum(sum_I0y_mul_vec);
+        sum_diff = v_reduce_sum(sum_diff_vec);
+        sum_diff_sq = v_reduce_sum(sum_diff_sq_vec);
+        vx_cleanup();
+    }
+    {
+        float diff;
+        for (int i = 0; i < patch_sz; i++)
+            for (int j = col; j < patch_sz; j++)
+            {
+                diff = w00 * I1_ptr[i * I1_stride + j] + w01 * I1_ptr[i * I1_stride + j + 1] +
+                       w10 * I1_ptr[(i + 1) * I1_stride + j] + w11 * I1_ptr[(i + 1) * I1_stride + j + 1] -
+                       I0_ptr[i * I0_stride + j];
+                sum_diff += diff;
+                sum_diff_sq += diff * diff;
+                sum_I0x_mul += diff * I0x_ptr[i * I0_stride + j];
+                sum_I0y_mul += diff * I0y_ptr[i * I0_stride + j];
+            }
+    }
+#else
+    {
+        float diff;
+        for (int i = 0; i < patch_sz; i++)
+            for (int j = 0; j < patch_sz; j++)
+            {
+                diff = w00 * I1_ptr[i * I1_stride + j] + w01 * I1_ptr[i * I1_stride + j + 1] +
+                       w10 * I1_ptr[(i + 1) * I1_stride + j] + w11 * I1_ptr[(i + 1) * I1_stride + j + 1] -
+                       I0_ptr[i * I0_stride + j];
+
+                sum_diff += diff;
+                sum_diff_sq += diff * diff;
+
+                sum_I0x_mul += diff * I0x_ptr[i * I0_stride + j];
+                sum_I0y_mul += diff * I0y_ptr[i * I0_stride + j];
+            }
+    }
+#endif
     dst_dUx = sum_I0x_mul - sum_diff * x_grad_sum / n;
     dst_dUy = sum_I0y_mul - sum_diff * y_grad_sum / n;
     return sum_diff_sq - sum_diff * sum_diff / n;
@@ -707,7 +858,6 @@ inline float computeSSD(uchar *I0_ptr, uchar *I1_ptr, int I0_stride, int I1_stri
         SSD = v_reduce_sum(SSD_vec);
     }
     else
-#endif
     {
         float diff;
         for (int i = 0; i < patch_sz; i++)
@@ -719,6 +869,53 @@ inline float computeSSD(uchar *I0_ptr, uchar *I1_ptr, int I0_stride, int I1_stri
                 SSD += diff * diff;
             }
     }
+#elif CV_SIMD_SCALABLE
+    int col = 0;
+    const int vlanes = VTraits<v_float32>::vlanes();
+    if (patch_sz >= vlanes)
+    {
+        const v_float32 w00v = vx_setall_f32(w00);
+        const v_float32 w01v = vx_setall_f32(w01);
+        const v_float32 w10v = vx_setall_f32(w10);
+        const v_float32 w11v = vx_setall_f32(w11);
+        v_float32 SSD_vec = vx_setzero_f32();
+        for (; col <= patch_sz - vlanes; col += vlanes)
+        {
+            HAL_INIT_BILINEAR_PATCH_EXTRACTION;
+            for (int row = 0; row < patch_sz; row++)
+            {
+                HAL_PROCESS_BILINEAR_PATCH_EXTRACTION;
+                SSD_vec = v_add(SSD_vec, v_mul(I_diff, I_diff));
+                HAL_BILINEAR_PATCH_EXTRACTION_NEXT_ROW;
+            }
+        }
+        SSD = v_reduce_sum(SSD_vec);
+        vx_cleanup();
+    }
+    {
+        float diff;
+        for (int i = 0; i < patch_sz; i++)
+            for (int j = col; j < patch_sz; j++)
+            {
+                diff = w00 * I1_ptr[i * I1_stride + j] + w01 * I1_ptr[i * I1_stride + j + 1] +
+                       w10 * I1_ptr[(i + 1) * I1_stride + j] + w11 * I1_ptr[(i + 1) * I1_stride + j + 1] -
+                       I0_ptr[i * I0_stride + j];
+                SSD += diff * diff;
+            }
+    }
+#else
+    {
+        float diff;
+        for (int i = 0; i < patch_sz; i++)
+            for (int j = 0; j < patch_sz; j++)
+            {
+                diff = w00 * I1_ptr[i * I1_stride + j] + w01 * I1_ptr[i * I1_stride + j + 1] +
+                       w10 * I1_ptr[(i + 1) * I1_stride + j] + w11 * I1_ptr[(i + 1) * I1_stride + j + 1] -
+                       I0_ptr[i * I0_stride + j];
+                SSD += diff * diff;
+            }
+    }
+#endif
     return SSD;
 }
 
@@ -746,7 +943,6 @@ inline float computeSSDMeanNorm(uchar *I0_ptr, uchar *I1_ptr, int I0_stride, int
     }
     else
     {
-#endif
         float diff;
         for (int i = 0; i < patch_sz; i++)
             for (int j = 0; j < patch_sz; j++)
@@ -758,7 +954,58 @@ inline float computeSSDMeanNorm(uchar *I0_ptr, uchar *I1_ptr, int I0_stride, int
                 sum_diff += diff;
                 sum_diff_sq += diff * diff;
             }
-#if CV_SIMD128
+    }
+#elif CV_SIMD_SCALABLE
+    int col = 0;
+    const int vlanes = VTraits<v_float32>::vlanes();
+    if (patch_sz >= vlanes)
+    {
+        const v_float32 w00v = vx_setall_f32(w00);
+        const v_float32 w01v = vx_setall_f32(w01);
+        const v_float32 w10v = vx_setall_f32(w10);
+        const v_float32 w11v = vx_setall_f32(w11);
+        v_float32 sum_diff_vec = vx_setzero_f32();
+        v_float32 sum_diff_sq_vec = vx_setzero_f32();
+        for (; col <= patch_sz - vlanes; col += vlanes)
+        {
+            HAL_INIT_BILINEAR_PATCH_EXTRACTION;
+            for (int row = 0; row < patch_sz; row++)
+            {
+                HAL_PROCESS_BILINEAR_PATCH_EXTRACTION;
+                sum_diff_sq_vec = v_add(sum_diff_sq_vec, v_mul(I_diff, I_diff));
+                sum_diff_vec = v_add(sum_diff_vec, I_diff);
+                HAL_BILINEAR_PATCH_EXTRACTION_NEXT_ROW;
+            }
+        }
+        sum_diff = v_reduce_sum(sum_diff_vec);
+        sum_diff_sq = v_reduce_sum(sum_diff_sq_vec);
+        vx_cleanup();
+    }
+    {
+        float diff;
+        for (int i = 0; i < patch_sz; i++)
+            for (int j = col; j < patch_sz; j++)
+            {
+                diff = w00 * I1_ptr[i * I1_stride + j] + w01 * I1_ptr[i * I1_stride + j + 1] +
+                       w10 * I1_ptr[(i + 1) * I1_stride + j] + w11 * I1_ptr[(i + 1) * I1_stride + j + 1] -
+                       I0_ptr[i * I0_stride + j];
+                sum_diff += diff;
+                sum_diff_sq += diff * diff;
+            }
+    }
+#else
+    {
+        float diff;
+        for (int i = 0; i < patch_sz; i++)
+            for (int j = 0; j < patch_sz; j++)
+            {
+                diff = w00 * I1_ptr[i * I1_stride + j] + w01 * I1_ptr[i * I1_stride + j + 1] +
+                       w10 * I1_ptr[(i + 1) * I1_stride + j] + w11 * I1_ptr[(i + 1) * I1_stride + j + 1] -
+                       I0_ptr[i * I0_stride + j];
+
+                sum_diff += diff;
+                sum_diff_sq += diff * diff;
+            }
     }
 #endif
     return sum_diff_sq - sum_diff * sum_diff / n;
@@ -767,6 +1014,11 @@ inline float computeSSDMeanNorm(uchar *I0_ptr, uchar *I1_ptr, int I0_stride, int
 #undef HAL_INIT_BILINEAR_8x8_PATCH_EXTRACTION
 #undef HAL_PROCESS_BILINEAR_8x8_PATCH_EXTRACTION
 #undef HAL_BILINEAR_8x8_PATCH_EXTRACTION_NEXT_ROW
+#if CV_SIMD_SCALABLE
+#undef HAL_INIT_BILINEAR_PATCH_EXTRACTION
+#undef HAL_PROCESS_BILINEAR_PATCH_EXTRACTION
+#undef HAL_BILINEAR_PATCH_EXTRACTION_NEXT_ROW
+#endif
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void DISOpticalFlowImpl::PatchInverseSearch_ParBody::operator()(const Range &range) const
@@ -818,10 +1070,12 @@ void DISOpticalFlowImpl::PatchInverseSearch_ParBody::operator()(const Range &ran
     int i, j, dir;
     int start_is, end_is, start_js, end_js;
     int start_i, start_j;
-    float i_lower_limit = bsz - psz + 1.0f;
-    float i_upper_limit = bsz + dis->h - 1.0f;
-    float j_lower_limit = bsz - psz + 1.0f;
-    float j_upper_limit = bsz + dis->w - 1.0f;
+    // Clamp so the psz+1 (bilinear) read stays inside the padded I1_ext buffer even when
+    // psz > bsz; unchanged for psz <= bsz (the common case). See #20185.
+    float i_lower_limit = std::max(bsz - psz + 1.0f, 0.0f);
+    float i_upper_limit = std::min(bsz + dis->h - 1.0f, dis->h + 2.0f * bsz - 1.0f - psz);
+    float j_lower_limit = std::max(bsz - psz + 1.0f, 0.0f);
+    float j_upper_limit = std::min(bsz + dis->w - 1.0f, dis->w + 2.0f * bsz - 1.0f - psz);
     float dUx, dUy, i_I1, j_I1, w00, w01, w10, w11, dx, dy;
 
 #define INIT_BILINEAR_WEIGHTS(Ux, Uy) \
@@ -1049,12 +1303,116 @@ void DISOpticalFlowImpl::Densification_ParBody::operator()(const Range &range) c
     {
         UPDATE_SPARSE_I_COORDINATES;
     }
+#if CV_SIMD_SCALABLE
+    const bool use_simd = useOptimized();
+    const int nlanes = VTraits<v_float32>::vlanes();
+    int start_js_buf[VTraits<v_int32>::max_nlanes], end_js_buf[VTraits<v_int32>::max_nlanes];
+    int j_l_buf[VTraits<v_int32>::max_nlanes];
+    int I1_ll_buf[VTraits<v_int32>::max_nlanes], I1_lu_buf[VTraits<v_int32>::max_nlanes];
+    int I1_ul_buf[VTraits<v_int32>::max_nlanes], I1_uu_buf[VTraits<v_int32>::max_nlanes];
+    for (int k = 0; k < nlanes; k++)
+        j_l_buf[k] = k;
+    const v_int32 v_iota = vx_load(j_l_buf);
+    const v_int32 v_one_s32 = vx_setall_s32(1);
+    const v_float32 v_one_f32 = vx_setall_f32(1.0f);
+    const v_float32 v_zero_f32 = vx_setzero_f32();
+    const v_float32 v_j_max = vx_setall_f32(dis->w - 1.0f - EPS);
+#endif
     for (int i = start_i; i < end_i; i++)
     {
         UPDATE_SPARSE_I_COORDINATES;
         start_js = 0;
         end_js = -1;
-        for (int j = 0; j < dis->w; j++)
+        int j = 0;
+#if CV_SIMD_SCALABLE
+        /* Process nlanes consecutive locations (i,j) at once. Each lane accumulates the contributions of its own
+         * overlapping patches in the same order as the scalar loop below; patches from the union of the lanes' ranges
+         * that do not overlap a given lane get zero weight in it, so results match the scalar loop up to FMA rounding.
+         * i_m does not depend on j, so I1 can usually be read with contiguous loads instead of gathers. */
+        for (; use_simd && j <= dis->w - nlanes;)
+        {
+            const int j0 = j;
+            for (int k = 0; k < nlanes; k++, j++)
+            {
+                UPDATE_SPARSE_J_COORDINATES;
+                start_js_buf[k] = start_js;
+                end_js_buf[k] = end_js;
+            }
+            v_int32 v_start_js = vx_load(start_js_buf);
+            v_int32 v_end_js = vx_load(end_js_buf);
+            v_int32 v_j = v_add(vx_setall_s32(j0), v_iota);
+            v_float32 v_j_f = v_cvt_f32(v_j);
+            v_float32 v_I0 = v_cvt_f32(v_reinterpret_as_s32(vx_load_expand_q(I0_ptr + i * dis->w + j0)));
+            v_float32 v_sum_coef = vx_setzero_f32();
+            v_float32 v_sum_Ux = vx_setzero_f32();
+            v_float32 v_sum_Uy = vx_setzero_f32();
+
+            for (int is = start_is; is <= end_is; is++)
+            {
+                for (int js = start_js_buf[0]; js <= end_js_buf[nlanes - 1]; js++)
+                {
+                    float sx = Sx_ptr[is * dis->ws + js];
+                    float sy = Sy_ptr[is * dis->ws + js];
+                    i_m = min(max(i + sy, 0.0f), dis->h - 1.0f - EPS);
+                    i_l = (int)i_m;
+                    i_u = i_l + 1;
+                    v_float32 v_wi_u = vx_setall_f32(i_m - i_l);
+                    v_float32 v_wi_l = vx_setall_f32(i_u - i_m);
+                    const uchar *I1_row_l = I1_ptr + i_l * dis->w;
+                    const uchar *I1_row_u = I1_ptr + i_u * dis->w;
+
+                    v_float32 v_j_m = v_min(v_max(v_add(v_j_f, vx_setall_f32(sx)), v_zero_f32), v_j_max);
+                    v_int32 v_j_l = v_trunc(v_j_m);
+                    v_float32 v_wj_u = v_sub(v_j_m, v_cvt_f32(v_j_l));
+                    v_float32 v_wj_l = v_sub(v_cvt_f32(v_add(v_j_l, v_one_s32)), v_j_m);
+
+                    v_float32 v_I1_ll, v_I1_lu, v_I1_ul, v_I1_uu;
+                    v_int32 v_dj = v_sub(v_j_l, v_j);
+                    int dj0 = v_get0(v_dj);
+                    if (v_check_all(v_eq(v_dj, vx_setall_s32(dj0))))
+                    {
+                        const int jl0 = j0 + dj0;
+                        v_I1_ll = v_cvt_f32(v_reinterpret_as_s32(vx_load_expand_q(I1_row_l + jl0)));
+                        v_I1_lu = v_cvt_f32(v_reinterpret_as_s32(vx_load_expand_q(I1_row_l + jl0 + 1)));
+                        v_I1_ul = v_cvt_f32(v_reinterpret_as_s32(vx_load_expand_q(I1_row_u + jl0)));
+                        v_I1_uu = v_cvt_f32(v_reinterpret_as_s32(vx_load_expand_q(I1_row_u + jl0 + 1)));
+                    }
+                    else
+                    {
+                        v_store(j_l_buf, v_j_l);
+                        for (int k = 0; k < nlanes; k++)
+                        {
+                            I1_ll_buf[k] = I1_row_l[j_l_buf[k]];
+                            I1_lu_buf[k] = I1_row_l[j_l_buf[k] + 1];
+                            I1_ul_buf[k] = I1_row_u[j_l_buf[k]];
+                            I1_uu_buf[k] = I1_row_u[j_l_buf[k] + 1];
+                        }
+                        v_I1_ll = v_cvt_f32(vx_load(I1_ll_buf));
+                        v_I1_lu = v_cvt_f32(vx_load(I1_lu_buf));
+                        v_I1_ul = v_cvt_f32(vx_load(I1_ul_buf));
+                        v_I1_uu = v_cvt_f32(vx_load(I1_uu_buf));
+                    }
+
+                    v_float32 v_diff = v_mul(v_mul(v_wj_u, v_wi_u), v_I1_uu);
+                    v_diff = v_fma(v_mul(v_wj_l, v_wi_u), v_I1_ul, v_diff);
+                    v_diff = v_fma(v_mul(v_wj_u, v_wi_l), v_I1_lu, v_diff);
+                    v_diff = v_fma(v_mul(v_wj_l, v_wi_l), v_I1_ll, v_diff);
+                    v_diff = v_sub(v_diff, v_I0);
+                    v_float32 v_coef = v_div(v_one_f32, v_max(v_one_f32, v_abs(v_diff)));
+
+                    v_int32 v_js = vx_setall_s32(js);
+                    v_int32 v_mask = v_and(v_ge(v_js, v_start_js), v_le(v_js, v_end_js));
+                    v_coef = v_select(v_reinterpret_as_f32(v_mask), v_coef, v_zero_f32);
+                    v_sum_Ux = v_fma(v_coef, vx_setall_f32(sx), v_sum_Ux);
+                    v_sum_Uy = v_fma(v_coef, vx_setall_f32(sy), v_sum_Uy);
+                    v_sum_coef = v_add(v_sum_coef, v_coef);
+                }
+            }
+            v_store(Ux_ptr + i * dis->w + j0, v_div(v_sum_Ux, v_sum_coef));
+            v_store(Uy_ptr + i * dis->w + j0, v_div(v_sum_Uy, v_sum_coef));
+        }
+#endif
+        for (; j < dis->w; j++)
         {
             UPDATE_SPARSE_J_COORDINATES;
             float coef, sum_coef = 0.0f;
@@ -1538,12 +1896,18 @@ void DISOpticalFlowImpl::collectGarbage()
     I0ys.clear();
     Ux.clear();
     Uy.clear();
+    initial_Ux.clear();
+    initial_Uy.clear();
     U.release();
     Sx.release();
     Sy.release();
+    I0x_buf.release();
+    I0y_buf.release();
     I0xx_buf.release();
     I0yy_buf.release();
     I0xy_buf.release();
+    I0x_buf_aux.release();
+    I0y_buf_aux.release();
     I0xx_buf_aux.release();
     I0yy_buf_aux.release();
     I0xy_buf_aux.release();
@@ -1555,18 +1919,22 @@ void DISOpticalFlowImpl::collectGarbage()
     u_I0xs.clear();
     u_I0ys.clear();
     u_U.clear();
+    u_initial_U.clear();
     u_S.release();
+    u_I0x_buf.release();
+    u_I0y_buf.release();
     u_I0xx_buf.release();
     u_I0yy_buf.release();
     u_I0xy_buf.release();
+    u_I0x_buf_aux.release();
+    u_I0y_buf_aux.release();
     u_I0xx_buf_aux.release();
     u_I0yy_buf_aux.release();
     u_I0xy_buf_aux.release();
 #endif
 
-    for (int i = finest_scale; i <= coarsest_scale; i++)
+    for (size_t i = 0; i < variational_refinement_processors.size(); i++)
         variational_refinement_processors[i]->collectGarbage();
-    variational_refinement_processors.clear();
 }
 
 Ptr<DISOpticalFlow> DISOpticalFlow::create(int preset)

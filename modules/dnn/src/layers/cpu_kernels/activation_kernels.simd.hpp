@@ -19,7 +19,7 @@ CV_CPU_OPTIMIZATION_NAMESPACE_BEGIN
 cv::dnn::ActivationFunc getActivationFunc_(int type);
 
 // Per-row softmax over a contiguous Mat axis.
-void softmax_(Mat &dst, const Mat &src, int axis, int axisBias, int axisStep, float scale);
+void softmax_(Mat &dst, const Mat &src, int axis, int axisBias, int axisStep, float scale, bool logSoftmax);
 
 // Fused clamp on a single contiguous chunk, 4x unrolled. Used by clip_layer.
 void clampFloatChunk_(const float* src, float* dst, size_t n, float lo, float hi);
@@ -139,9 +139,15 @@ static void activationTanH(const void* input, void* output,
 #if (CV_SIMD || CV_SIMD_SCALABLE)
     const int vlanes = VTraits<v_float32>::vlanes();
     v_float32 one = vx_setall_f32(1.f), two = vx_setall_f32(2.f);
+    // Clamp 2x to [-18, 18]: tanh already saturates to +-1.f in float at |x| = 9, so this
+    // costs no accuracy, and it keeps exp(2x) out of the range where v_div() breaks down.
+    // Same solution as in activationGELUApprox()
+    // see details in https://github.com/opencv/opencv/issues/30474
+    v_float32 min_val = vx_setall_f32(-18.f), max_val = vx_setall_f32(18.f);
     for (; i + vlanes <= len; i += vlanes) {
         v_float32 x = vx_load(inp + i);
-        v_float32 e2x = v_exp(v_mul(two, x));
+        v_float32 z = v_min(v_max(v_mul(two, x), min_val), max_val);
+        v_float32 e2x = v_exp(z);
         v_float32 t = v_div(v_sub(e2x, one), v_add(e2x, one));
         vx_store(out + i, t);
     }
@@ -347,7 +353,7 @@ void clampFloatChunk_(const float* src, float* dst, size_t n, float lo, float hi
         dst[i] = std::min(std::max(src[i], lo), hi);
 }
 
-void softmax_(Mat &dst, const Mat &src, int axis, int axisBias, int axisStep, float scale) {
+void softmax_(Mat &dst, const Mat &src, int axis, int axisBias, int axisStep, float scale, bool logSoftmax) {
     CV_Assert(src.type() == CV_32F);
     CV_Assert(src.isContinuous() && dst.isContinuous());
     CV_Assert(src.size == dst.size);
@@ -431,6 +437,17 @@ void softmax_(Mat &dst, const Mat &src, int axis, int axisBias, int axisStep, fl
             for (; cnDim < axisStep; cnDim++) {
                 axisBuf[cnDim] = expf((axisBuf[cnDim] - maxVal) * scale);
                 s += axisBuf[cnDim];
+            }
+
+            if (logSoftmax) {
+                // log(softmax(x)) underflows to -inf once x is far below the maximum,
+                // so compute (x - max) * scale - log(sum(exp((x - max) * scale))) instead.
+                const float logSum = std::log(s);
+                for (_cnDim = 0; _cnDim < axisStep; _cnDim++) {
+                    const size_t idx = srcOffset + (_cnDim + axisBias) * cnStep;
+                    dstPtr[idx] = (srcPtr[idx] - maxVal) * scale - logSum;
+                }
+                continue;
             }
 
             _cnDim = 0;

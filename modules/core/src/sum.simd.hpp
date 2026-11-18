@@ -9,6 +9,12 @@
 namespace cv {
 CV_CPU_OPTIMIZATION_NAMESPACE_BEGIN
 
+template<typename T, typename ST, int (*fn)(const T*, const uchar*, ST*, int, int)>
+static int sumWrap(const uchar* src, const uchar* mask, uchar* sum, int len, int cn)
+{
+    return fn((const T*)src, mask, (ST*)sum, len, cn);
+}
+
 SumFunc getSumFunc(int depth);
 
 #ifndef CV_CPU_OPTIMIZATION_DECLARATIONS_ONLY
@@ -118,6 +124,10 @@ template<> struct Sum_SIMD<T, ST> \
     ST maskbuf[VTraits<VecT>::max_nlanes*9]; \
 };
 
+// The channel limit is 4 only once the vector holds at least four lanes: init_maskbuf builds
+// the cn == 4 masks under that condition, so a narrower vector would reduce against all-zero
+// masks and silently drop the vectorized elements. Every 32-bit register type has four lanes
+// or more; v_float64 on an SSE2 baseline has two.
 #undef DEFINE_SUM_SIMD_16
 #define DEFINE_SUM_SIMD_16(T, ST, iST, VecT, load_op) \
 template<> struct Sum_SIMD<T, ST> \
@@ -128,10 +138,10 @@ template<> struct Sum_SIMD<T, ST> \
     } \
     int operator ()(const T* src, const uchar* mask, ST* dst, int len, int cn) const \
     { \
-        if (mask || (cn < 1 || cn > 4)) \
+        int x = 0, simd_width = VTraits<VecT>::vlanes(); \
+        if (mask || (cn < 1 || cn > 3+(simd_width>=4))) \
             return 0; \
         len *= cn; \
-        int x = 0, simd_width = VTraits<VecT>::vlanes(); \
         VecT m0 = vx_load(maskbuf), m1, m2, m3, m4, m5, m6, m7, m8; \
         if (cn == 1) { \
             m1 = m2 = m3 = m4 = m5 = m6 = m7 = m8 = m0; \
@@ -223,6 +233,8 @@ template<> struct Sum_SIMD<T, ST> \
 
 DEFINE_SUM_SIMD_32(int, double, int64, v_float64)
 DEFINE_SUM_SIMD_32(float, double, int64, v_float64)
+
+DEFINE_SUM_SIMD_16(double, double, int64, v_float64, vx_load)
 #endif
 #endif
 
@@ -357,10 +369,10 @@ static int sum16s( const short* src, const uchar* mask, int* dst, int len, int c
 { CV_INSTRUMENT_REGION(); return sum_(src, mask, dst, len, cn); }
 
 static int sum32u( const unsigned* src, const uchar* mask, double* dst, int len, int cn )
-{ CV_INSTRUMENT_REGION(); return sum_(src, mask, dst, len, cn); }
+{ CV_INSTRUMENT_REGION(); return sum_<unsigned, double, uint64>(src, mask, dst, len, cn); }
 
 static int sum32s( const int* src, const uchar* mask, double* dst, int len, int cn )
-{ CV_INSTRUMENT_REGION(); return sum_(src, mask, dst, len, cn); }
+{ CV_INSTRUMENT_REGION(); return sum_<int, double, int64>(src, mask, dst, len, cn); }
 
 static int sum64u( const uint64* src, const uchar* mask, double* dst, int len, int cn )
 { CV_INSTRUMENT_REGION(); return sum_(src, mask, dst, len, cn); }
@@ -380,23 +392,31 @@ static int sum16f( const hfloat* src, const uchar* mask, float* dst, int len, in
 static int sum16bf( const bfloat* src, const uchar* mask, float* dst, int len, int cn )
 { CV_INSTRUMENT_REGION(); return sum_<bfloat, float, float>(src, mask, dst, len, cn); }
 
+static int sum8f( const fp8_t* src, const uchar* mask, float* dst, int len, int cn )
+{ CV_INSTRUMENT_REGION(); return sum_<fp8_t, float, float>(src, mask, dst, len, cn); }
+
+static int sum8fnuz( const fp8a_t* src, const uchar* mask, float* dst, int len, int cn )
+{ CV_INSTRUMENT_REGION(); return sum_<fp8a_t, float, float>(src, mask, dst, len, cn); }
+
 SumFunc getSumFunc(int depth)
 {
     static SumFunc sumTab[CV_DEPTH_MAX] =
     {
-        (SumFunc)GET_OPTIMIZED(sum8u),
-        (SumFunc)sum8s,
-        (SumFunc)sum16u,
-        (SumFunc)sum16s,
-        (SumFunc)sum32s,
-        (SumFunc)GET_OPTIMIZED(sum32f),
-        (SumFunc)sum64f,
-        (SumFunc)sum16f,
-        (SumFunc)sum16bf,
+        sumWrap<uchar, int, sum8u>,
+        sumWrap<schar, int, sum8s>,
+        sumWrap<ushort, int, sum16u>,
+        sumWrap<short, int, sum16s>,
+        sumWrap<int, double, sum32s>,
+        sumWrap<float, double, sum32f>,
+        sumWrap<double, double, sum64f>,
+        sumWrap<hfloat, float, sum16f>,
+        sumWrap<bfloat, float, sum16bf>,
         0,
-        (SumFunc)sum64u,
-        (SumFunc)sum64s,
-        (SumFunc)sum32u,
+        sumWrap<uint64, double, sum64u>,
+        sumWrap<int64, double, sum64s>,
+        sumWrap<unsigned, double, sum32u>,
+        sumWrap<fp8_t, float, sum8f>,
+        sumWrap<fp8a_t, float, sum8fnuz>,
         0
     };
 

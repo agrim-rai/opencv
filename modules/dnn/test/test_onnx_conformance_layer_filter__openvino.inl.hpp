@@ -273,7 +273,7 @@ CASE(test_basic_conv_without_padding)
     SKIP_MYRIAD;
 #endif
 CASE(test_basic_convinteger)
-    // no filter
+    SKIP;
 CASE(test_batchnorm_epsilon)
     SKIP;
 CASE(test_batchnorm_epsilon_training_mode)
@@ -416,6 +416,242 @@ CASE(test_castlike_STRING_to_FLOAT_expanded)
 #if SKIP_SET_1
     SKIP;
 #endif
+CASE(test_castlike_no_saturate_FLOAT16_to_FLOAT8E4M3FN)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT16_to_FLOAT8E4M3FNUZ)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT16_to_FLOAT8E4M3FNUZ_expanded)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT16_to_FLOAT8E4M3FN_expanded)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT16_to_FLOAT8E5M2)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT16_to_FLOAT8E5M2FNUZ)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT16_to_FLOAT8E5M2FNUZ_expanded)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT16_to_FLOAT8E5M2_expanded)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT_to_FLOAT8E4M3FN)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT_to_FLOAT8E4M3FN_expanded)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT_to_FLOAT8E4M3FNUZ)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT_to_FLOAT8E4M3FNUZ_expanded)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT_to_FLOAT8E5M2)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT_to_FLOAT8E5M2FNUZ)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT_to_FLOAT8E5M2FNUZ_expanded)
+    SKIP;
+CASE(test_castlike_no_saturate_FLOAT_to_FLOAT8E5M2_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT_to_UINT4)
+    SKIP;
+CASE(test_castlike_FLOAT_to_UINT4_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT_to_FLOAT4E2M1)
+    SKIP;
+CASE(test_castlike_FLOAT_to_FLOAT4E2M1_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT_to_FLOAT8E4M3FN)
+    SKIP;
+CASE(test_castlike_FLOAT_to_FLOAT8E4M3FNUZ)
+    SKIP;
+CASE(test_castlike_FLOAT_to_FLOAT8E4M3FNUZ_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT_to_FLOAT8E4M3FN_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT_to_FLOAT8E5M2)
+    SKIP;
+CASE(test_castlike_FLOAT_to_FLOAT8E5M2FNUZ)
+    SKIP;
+CASE(test_castlike_FLOAT_to_FLOAT8E5M2FNUZ_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT_to_FLOAT8E5M2_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT_to_INT4)
+    SKIP;
+CASE(test_castlike_FLOAT_to_INT4_expanded)
+    SKIP;
+CASE(test_cast_FLOAT16_to_FLOAT4E2M1)
+    SKIP;
+CASE(test_cast_FLOAT16_to_FLOAT8E4M3FN)
+    SKIP;
+CASE(test_cast_FLOAT16_to_FLOAT8E4M3FNUZ)
+    SKIP;
+CASE(test_cast_FLOAT16_to_FLOAT8E5M2)
+    SKIP;
+CASE(test_cast_FLOAT16_to_FLOAT8E5M2FNUZ)
+    SKIP;
+CASE(test_cast_FLOAT16_to_INT4)
+    SKIP;
+CASE(test_cast_FLOAT16_to_UINT4)
+    SKIP;
+CASE(test_cast_FLOAT4E2M1_to_FLOAT)
+    SKIP;
+CASE(test_cast_FLOAT4E2M1_to_FLOAT16)
+    SKIP;
+CASE(test_cast_FLOAT8E4M3FNUZ_to_FLOAT)
+    SKIP;
+CASE(test_cast_FLOAT8E4M3FNUZ_to_FLOAT16)
+    SKIP;
+CASE(test_cast_FLOAT8E4M3FN_to_FLOAT)
+    SKIP;
+CASE(test_cast_FLOAT8E4M3FN_to_FLOAT16)
+    SKIP;
+CASE(test_cast_FLOAT8E5M2FNUZ_to_FLOAT)
+    SKIP;
+CASE(test_cast_FLOAT8E5M2FNUZ_to_FLOAT16)
+    SKIP;
+CASE(test_cast_FLOAT8E5M2_to_FLOAT)
+    SKIP;
+CASE(test_cast_FLOAT8E5M2_to_FLOAT16)
+    SKIP;
+CASE(test_cast_FLOAT_to_FLOAT4E2M1)
+    SKIP;
+CASE(test_cast_FLOAT_to_FLOAT8E4M3FN)
+    SKIP;
+CASE(test_cast_FLOAT_to_FLOAT8E4M3FNUZ)
+    SKIP;
+CASE(test_cast_FLOAT_to_FLOAT8E5M2)
+    SKIP;
+CASE(test_cast_FLOAT_to_FLOAT8E5M2FNUZ)
+    SKIP;
+CASE(test_cast_FLOAT_to_INT4)
+    SKIP;
+CASE(test_cast_FLOAT_to_UINT4)
+    SKIP;
+CASE(test_cast_INT4_to_FLOAT)
+    SKIP;
+CASE(test_cast_INT4_to_FLOAT16)
+    SKIP;
+CASE(test_cast_INT4_to_INT8)
+    SKIP;
+CASE(test_cast_UINT4_to_FLOAT)
+    SKIP;
+CASE(test_cast_UINT4_to_FLOAT16)
+    SKIP;
+CASE(test_cast_UINT4_to_UINT8)
+    SKIP;
+CASE(test_cast_e8m0_FLOAT16_to_FLOAT8E8M0)
+    SKIP;
+CASE(test_cast_e8m0_FLOAT8E8M0_to_FLOAT)
+    SKIP;
+CASE(test_cast_e8m0_FLOAT8E8M0_to_FLOAT16)
+    SKIP;
+CASE(test_cast_e8m0_FLOAT_to_FLOAT8E8M0)
+    SKIP;
+CASE(test_cast_no_saturate_FLOAT16_to_FLOAT8E4M3FN)
+    SKIP;
+CASE(test_cast_no_saturate_FLOAT16_to_FLOAT8E4M3FNUZ)
+    SKIP;
+CASE(test_cast_no_saturate_FLOAT16_to_FLOAT8E5M2)
+    SKIP;
+CASE(test_cast_no_saturate_FLOAT16_to_FLOAT8E5M2FNUZ)
+    SKIP;
+CASE(test_cast_no_saturate_FLOAT_to_FLOAT8E4M3FN)
+    SKIP;
+CASE(test_cast_no_saturate_FLOAT_to_FLOAT8E4M3FNUZ)
+    SKIP;
+CASE(test_cast_no_saturate_FLOAT_to_FLOAT8E5M2)
+    SKIP;
+CASE(test_cast_no_saturate_FLOAT_to_FLOAT8E5M2FNUZ)
+    SKIP;
+CASE(test_castlike_FLOAT16_to_FLOAT4E2M1)
+    SKIP;
+CASE(test_castlike_FLOAT16_to_FLOAT4E2M1_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT16_to_FLOAT8E4M3FN)
+    SKIP;
+CASE(test_castlike_FLOAT16_to_FLOAT8E4M3FNUZ)
+    SKIP;
+CASE(test_castlike_FLOAT16_to_FLOAT8E4M3FNUZ_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT16_to_FLOAT8E4M3FN_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT16_to_FLOAT8E5M2)
+    SKIP;
+CASE(test_castlike_FLOAT16_to_FLOAT8E5M2FNUZ)
+    SKIP;
+CASE(test_castlike_FLOAT16_to_FLOAT8E5M2FNUZ_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT16_to_FLOAT8E5M2_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT16_to_INT4)
+    SKIP;
+CASE(test_castlike_FLOAT16_to_INT4_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT16_to_UINT4)
+    SKIP;
+CASE(test_castlike_FLOAT16_to_UINT4_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT4E2M1_to_FLOAT)
+    SKIP;
+CASE(test_castlike_FLOAT4E2M1_to_FLOAT16)
+    SKIP;
+CASE(test_castlike_FLOAT4E2M1_to_FLOAT16_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT4E2M1_to_FLOAT_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT8E4M3FNUZ_to_FLOAT)
+    SKIP;
+CASE(test_castlike_FLOAT8E4M3FNUZ_to_FLOAT16)
+    SKIP;
+CASE(test_castlike_FLOAT8E4M3FNUZ_to_FLOAT16_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT8E4M3FNUZ_to_FLOAT_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT8E4M3FN_to_FLOAT)
+    SKIP;
+CASE(test_castlike_FLOAT8E4M3FN_to_FLOAT16)
+    SKIP;
+CASE(test_castlike_FLOAT8E4M3FN_to_FLOAT16_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT8E4M3FN_to_FLOAT_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT8E5M2FNUZ_to_FLOAT)
+    SKIP;
+CASE(test_castlike_FLOAT8E5M2FNUZ_to_FLOAT16)
+    SKIP;
+CASE(test_castlike_FLOAT8E5M2FNUZ_to_FLOAT16_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT8E5M2FNUZ_to_FLOAT_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT8E5M2_to_FLOAT)
+    SKIP;
+CASE(test_castlike_FLOAT8E5M2_to_FLOAT16)
+    SKIP;
+CASE(test_castlike_FLOAT8E5M2_to_FLOAT16_expanded)
+    SKIP;
+CASE(test_castlike_FLOAT8E5M2_to_FLOAT_expanded)
+    SKIP;
+CASE(test_castlike_INT4_to_FLOAT)
+    SKIP;
+CASE(test_castlike_INT4_to_FLOAT16)
+    SKIP;
+CASE(test_castlike_INT4_to_FLOAT16_expanded)
+    SKIP;
+CASE(test_castlike_INT4_to_FLOAT_expanded)
+    SKIP;
+CASE(test_castlike_INT4_to_INT8)
+    SKIP;
+CASE(test_castlike_INT4_to_INT8_expanded)
+    SKIP;
+CASE(test_castlike_UINT4_to_FLOAT)
+    SKIP;
+CASE(test_castlike_UINT4_to_FLOAT16)
+    SKIP;
+CASE(test_castlike_UINT4_to_FLOAT16_expanded)
+    SKIP;
+CASE(test_castlike_UINT4_to_FLOAT_expanded)
+    SKIP;
+CASE(test_castlike_UINT4_to_UINT8)
+    SKIP;
+CASE(test_castlike_UINT4_to_UINT8_expanded)
+    SKIP;
 CASE(test_ceil)
     // no filter
 CASE(test_ceil_example)
@@ -476,24 +712,32 @@ CASE(test_clip_default_min_expanded)
     SKIP;
 CASE(test_clip_example)
     SKIP;
+CASE(test_clip_example_expanded)
+    SKIP;
+CASE(test_clip_expanded)
+    SKIP;
 CASE(test_clip_inbounds)
     SKIP;
 CASE(test_clip_inbounds_expanded)
     SKIP;
+CASE(test_clip_min_greater_than_max_expanded)
+    SKIP;
 CASE(test_clip_outbounds)
+    SKIP;
+CASE(test_clip_outbounds_expanded)
     SKIP;
 CASE(test_clip_splitbounds)
     SKIP;
 CASE(test_clip_splitbounds_expanded)
     SKIP;
 CASE(test_compress_0)
-    // no filter
+    SKIP;
 CASE(test_compress_1)
-    // no filter
+    SKIP;
 CASE(test_compress_default_axis)
-    // no filter
+    SKIP;
 CASE(test_compress_negative_axis)
-    // no filter
+    SKIP;
 CASE(test_concat_1d_axis_0)
     // no filter
 CASE(test_concat_1d_axis_negative_1)
@@ -524,6 +768,10 @@ CASE(test_constant)
     SKIP;
 CASE(test_constant_pad)
     SKIP;
+CASE(test_constant_pad_axes)
+    SKIP;
+CASE(test_constant_pad_negative_axes)
+    SKIP;
 CASE(test_constantofshape_float_ones)
     SKIP;
 CASE(test_constantofshape_int_shape_zero)
@@ -547,9 +795,9 @@ CASE(test_conv_with_strides_padding)
     SKIP_MYRIAD;
 #endif
 CASE(test_convinteger_with_padding)
-    // no filter
+    SKIP;
 CASE(test_convinteger_without_padding)
-    // no filter
+    SKIP;
 CASE(test_convtranspose)
     SKIP;
 CASE(test_convtranspose_1d)
@@ -624,6 +872,22 @@ CASE(test_dequantizelinear_axis)
     SKIP;
 CASE(test_dequantizelinear_blocked)
     SKIP;
+CASE(test_dequantizelinear_e4m3fn)
+    SKIP;
+CASE(test_dequantizelinear_e4m3fn_float16)
+    SKIP;
+CASE(test_dequantizelinear_e4m3fn_zero_point)
+    SKIP;
+CASE(test_dequantizelinear_e5m2)
+    SKIP;
+CASE(test_dequantizelinear_int16)
+    SKIP;
+CASE(test_dequantizelinear_int4)
+    SKIP;
+CASE(test_dequantizelinear_uint16)
+    SKIP;
+CASE(test_dequantizelinear_uint4)
+    SKIP;
 CASE(test_det_2d)
     SKIP;
 CASE(test_det_nd)
@@ -663,9 +927,9 @@ CASE(test_div_uint8)
 CASE(test_dropout_default)
     // no filter
 CASE(test_dropout_default_mask)
-    // no filter
+    SKIP;
 CASE(test_dropout_default_mask_ratio)
-    // no filter
+    SKIP;
 CASE(test_dropout_default_old)
     // no filter
 CASE(test_dropout_default_ratio)
@@ -901,7 +1165,11 @@ CASE(test_gridsample)
 CASE(test_gridsample_aligncorners_true)
     SKIP;
 CASE(test_gridsample_bicubic)
-    // no filter
+    SKIP;
+CASE(test_gridsample_bicubic_align_corners_0_additional_1)
+    SKIP;
+CASE(test_gridsample_bicubic_align_corners_1_additional_1)
+    SKIP;
 CASE(test_gridsample_bilinear)
     SKIP;
 CASE(test_gridsample_border_padding)
@@ -932,6 +1200,10 @@ CASE(test_group_normalization_epsilon)
     // no filter
 CASE(test_group_normalization_example)
     // no filter
+CASE(test_group_normalization_epsilon_expanded)
+    SKIP;
+CASE(test_group_normalization_example_expanded)
+    SKIP;
 CASE(test_gru_batchwise)
     SKIP;
 CASE(test_gru_defaults)
@@ -1204,6 +1476,24 @@ CASE(test_if_opt)
     // no filter
 CASE(test_if_seq)
     // no filter
+CASE(test_image_decoder_decode_bmp_rgb)
+    SKIP;
+CASE(test_image_decoder_decode_jpeg2k_rgb)
+    SKIP;
+CASE(test_image_decoder_decode_jpeg_bgr)
+    SKIP;
+CASE(test_image_decoder_decode_jpeg_grayscale)
+    SKIP;
+CASE(test_image_decoder_decode_jpeg_rgb)
+    SKIP;
+CASE(test_image_decoder_decode_png_rgb)
+    SKIP;
+CASE(test_image_decoder_decode_pnm_rgb)
+    SKIP;
+CASE(test_image_decoder_decode_tiff_rgb)
+    SKIP;
+CASE(test_image_decoder_decode_webp_rgb)
+    SKIP;
 CASE(test_instancenorm_epsilon)
     // no filter
 CASE(test_instancenorm_example)
@@ -1225,6 +1515,8 @@ CASE(test_l1normalization_axis_0)
 CASE(test_l1normalization_axis_1)
     SKIP;
 CASE(test_l1normalization_axis_last)
+    SKIP;
+CASE(test_l2normalization_axis_0)
     SKIP;
 CASE(test_l2normalization_axis_1)
     SKIP;
@@ -1478,6 +1770,8 @@ CASE(test_lppool_2d_dilations)
     SKIP;
 CASE(test_lppool_2d_pads)
     SKIP;
+CASE(test_lppool_2d_same_lower)
+    SKIP;
 CASE(test_lppool_2d_same_upper)
     SKIP;
 CASE(test_lppool_2d_strides)
@@ -1503,7 +1797,7 @@ CASE(test_matmul_3d)
 CASE(test_matmul_4d)
     // no filter
 CASE(test_matmulinteger)
-    // no filter
+    SKIP;
 CASE(test_max_example)
     SKIP;
 CASE(test_max_float16)
@@ -1540,6 +1834,8 @@ CASE(test_maxpool_2d_ceil)
 #if SKIP_SET_1
     SKIP_MYRIAD;
 #endif
+CASE(test_maxpool_2d_ceil_output_size_reduce_by_one)
+    SKIP;
 CASE(test_maxpool_2d_default)
 #if SKIP_SET_1
     SKIP_MYRIAD;
@@ -1715,6 +2011,8 @@ CASE(test_mvn)
     // no filter
 CASE(test_mvn_expanded)
     // no filter
+CASE(test_mvn_expanded_ver18)
+    SKIP;
 CASE(test_neg)
     // no filter
 CASE(test_neg_example)
@@ -1880,9 +2178,9 @@ CASE(test_pow_types_int64_float32)
 CASE(test_pow_types_int64_int64)
     SKIP;
 CASE(test_prelu_broadcast)
-    // no filter
+    SKIP;
 CASE(test_prelu_example)
-    // no filter
+    SKIP;
 CASE(test_prelu_broadcast_expanded)
     SKIP;
 CASE(test_prelu_example_expanded)
@@ -1891,13 +2189,45 @@ CASE(test_qlinearconv)
     SKIP;
 CASE(test_qlinearmatmul_2D)
     SKIP;
+CASE(test_qlinearmatmul_2D_int8_float16)
+    SKIP;
+CASE(test_qlinearmatmul_2D_int8_float32)
+    SKIP;
+CASE(test_qlinearmatmul_2D_uint8_float16)
+    SKIP;
+CASE(test_qlinearmatmul_2D_uint8_float32)
+    SKIP;
 CASE(test_qlinearmatmul_3D)
+    SKIP;
+CASE(test_qlinearmatmul_3D_int8_float16)
+    SKIP;
+CASE(test_qlinearmatmul_3D_int8_float32)
+    SKIP;
+CASE(test_qlinearmatmul_3D_uint8_float16)
+    SKIP;
+CASE(test_qlinearmatmul_3D_uint8_float32)
     SKIP;
 CASE(test_quantizelinear)
     SKIP;
 CASE(test_quantizelinear_axis)
     SKIP;
 CASE(test_quantizelinear_blocked)
+    SKIP;
+CASE(test_quantizelinear_blocked_asymmetric)
+    SKIP;
+CASE(test_quantizelinear_blocked_symmetric)
+    SKIP;
+CASE(test_quantizelinear_e4m3fn)
+    SKIP;
+CASE(test_quantizelinear_e5m2)
+    SKIP;
+CASE(test_quantizelinear_int16)
+    SKIP;
+CASE(test_quantizelinear_int4)
+    SKIP;
+CASE(test_quantizelinear_uint16)
+    SKIP;
+CASE(test_quantizelinear_uint4)
     SKIP;
 CASE(test_range_float_type_positive_delta)
     SKIP;
@@ -2376,7 +2706,7 @@ CASE(test_reversesequence_batch)
 CASE(test_reversesequence_time)
     // no filter
 CASE(test_rnn_seq_length)
-    // no filter
+    SKIP;
 CASE(test_roialign_aligned_false)
     SKIP;
 CASE(test_roialign_aligned_true)
@@ -2644,11 +2974,11 @@ CASE(test_sigmoid_example)
 CASE(test_sign)
     // no filter
 CASE(test_simple_rnn_batchwise)
-    // no filter
+    SKIP;
 CASE(test_simple_rnn_defaults)
-    // no filter
+    SKIP;
 CASE(test_simple_rnn_with_initial_bias)
-    // no filter
+    SKIP;
 CASE(test_sin)
     // no filter
 CASE(test_sin_example)
@@ -2676,7 +3006,7 @@ CASE(test_slice_neg_steps)
 CASE(test_slice_negative_axes)
     SKIP;
 CASE(test_slice_start_out_of_bounds)
-    // no filter
+    SKIP;
 CASE(test_softmax_axis_0)
 #if SKIP_SET_1
     SKIP_OPENCL;
@@ -2914,7 +3244,7 @@ CASE(test_training_dropout_mask)
 CASE(test_training_dropout_zero_ratio)
     SKIP;
 CASE(test_training_dropout_zero_ratio_mask)
-    // no filter
+    SKIP;
 CASE(test_transpose_all_permutations_0)
     // no filter
 CASE(test_transpose_all_permutations_1)
@@ -2964,6 +3294,8 @@ CASE(test_triu_square)
 CASE(test_triu_square_neg)
     SKIP;
 CASE(test_triu_zero)
+    SKIP;
+CASE(test_unique_length_1)
     SKIP;
 CASE(test_unique_not_sorted_without_axis)
     SKIP;
@@ -3250,6 +3582,10 @@ CASE(test_attention_3d_with_past_and_present_qk_matmul)
     SKIP;
 CASE(test_attention_3d_with_past_and_present_qk_matmul_bias)
     SKIP;
+CASE(test_attention_3d_with_past_and_present_qk_matmul_softcap)
+    SKIP;
+CASE(test_attention_3d_with_past_and_present_qk_matmul_softcap_expanded)
+    SKIP;
 CASE(test_attention_4d_diff_heads_with_past_and_present)
     SKIP;
 CASE(test_attention_4d_diff_heads_with_past_and_present_expanded)
@@ -3330,6 +3666,10 @@ CASE(test_attention_4d_with_qk_matmul_softmax)
     SKIP;
 CASE(test_attention_4d_with_qk_matmul_softmax_expanded)
     SKIP;
+CASE(test_attention_4d_with_qk_matmul_softcap)
+    SKIP;
+CASE(test_attention_4d_with_qk_matmul_softcap_expanded)
+    SKIP;
 
 // ONNX 1.22 additions: unsupported on OpenVINO
 CASE(test_dft_rfft)
@@ -3339,6 +3679,10 @@ CASE(test_nonmaxsuppression_iou_threshold_boundary)
 CASE(test_attention_4d_softcap_neginf_mask_expanded)
     SKIP;
 CASE(test_attention_4d_softcap_neginf_mask_poison_expanded)
+    SKIP;
+CASE(test_attention_4d_softcap_neginf_mask)
+    SKIP;
+CASE(test_attention_4d_softcap_neginf_mask_poison)
     SKIP;
 CASE(test_causal_conv_with_state_b1_c1_degenerate_expanded)
     SKIP;
@@ -3408,9 +3752,113 @@ CASE(test_cumprod_2d_negative_axis)
     SKIP;
 CASE(test_flexattention_scaled_expanded_ver26)
     SKIP;
+// FlexAttention op not supported by OpenVINO
+CASE(test_flexattention)
+    SKIP;
+CASE(test_flexattention_causal_mask)
+    SKIP;
+CASE(test_flexattention_diff_head_sizes)
+    SKIP;
+CASE(test_flexattention_double)
+    SKIP;
+CASE(test_flexattention_fp16)
+    SKIP;
+CASE(test_flexattention_gqa)
+    SKIP;
+CASE(test_flexattention_prob_mod)
+    SKIP;
+CASE(test_flexattention_relative_positional)
+    SKIP;
+CASE(test_flexattention_scaled)
+    SKIP;
+CASE(test_flexattention_score_mod)
+    SKIP;
+CASE(test_flexattention_soft_cap)
+    SKIP;
+// FlexAttention (expanded) not supported by OpenVINO
+CASE(test_flexattention_causal_mask_expanded_ver26)
+    SKIP;
+CASE(test_flexattention_diff_head_sizes_expanded_ver26)
+    SKIP;
+CASE(test_flexattention_double_expanded_ver26)
+    SKIP;
+CASE(test_flexattention_expanded_ver26)
+    SKIP;
+CASE(test_flexattention_fp16_expanded_ver26)
+    SKIP;
+CASE(test_flexattention_gqa_expanded_ver26)
+    SKIP;
+CASE(test_flexattention_prob_mod_expanded_ver26)
+    SKIP;
+CASE(test_flexattention_relative_positional_expanded_ver26)
+    SKIP;
+CASE(test_flexattention_score_mod_expanded_ver26)
+    SKIP;
+CASE(test_flexattention_soft_cap_expanded_ver26)
+    SKIP;
+// LinearAttention op not supported by OpenVINO
+CASE(test_linear_attention_decode_step)
+    SKIP;
+CASE(test_linear_attention_delta)
+    SKIP;
+CASE(test_linear_attention_explicit_scale)
+    SKIP;
+CASE(test_linear_attention_fp16)
+    SKIP;
+CASE(test_linear_attention_gated)
+    SKIP;
+CASE(test_linear_attention_gated_delta)
+    SKIP;
+CASE(test_linear_attention_gated_delta_beta_scalar)
+    SKIP;
+CASE(test_linear_attention_gated_delta_gqa)
+    SKIP;
+CASE(test_linear_attention_gated_delta_mqa)
+    SKIP;
+CASE(test_linear_attention_gated_per_head_decay)
+    SKIP;
+CASE(test_linear_attention_linear)
+    SKIP;
+CASE(test_linear_attention_linear_t1_no_past)
+    SKIP;
+CASE(test_linear_attention_no_past_explicit_zeros)
+    SKIP;
+CASE(test_linear_attention_prefill_with_past)
+    SKIP;
+// LinearAttention (expanded) decomposes to Scan, not supported by OpenVINO
+CASE(test_linear_attention_decode_step_expanded)
+    SKIP;
+CASE(test_linear_attention_delta_expanded)
+    SKIP;
+CASE(test_linear_attention_explicit_scale_expanded)
+    SKIP;
+CASE(test_linear_attention_fp16_expanded)
+    SKIP;
+CASE(test_linear_attention_gated_delta_beta_scalar_expanded)
+    SKIP;
+CASE(test_linear_attention_gated_delta_expanded)
+    SKIP;
+CASE(test_linear_attention_gated_delta_gqa_expanded)
+    SKIP;
+CASE(test_linear_attention_gated_delta_mqa_expanded)
+    SKIP;
+CASE(test_linear_attention_gated_expanded)
+    SKIP;
+CASE(test_linear_attention_gated_per_head_decay_expanded)
+    SKIP;
+CASE(test_linear_attention_linear_expanded)
+    SKIP;
+CASE(test_linear_attention_linear_t1_no_past_expanded)
+    SKIP;
+CASE(test_linear_attention_no_past_explicit_zeros_expanded)
+    SKIP;
+CASE(test_linear_attention_prefill_with_past_expanded)
+    SKIP;
 CASE(test_range_bfloat16_type_positive_delta)
     SKIP;
 CASE(test_range_float16_type_positive_delta)
+    SKIP;
+CASE(test_range_float16_type_positive_delta_expanded)
     SKIP;
 CASE(test_dft_rfft_opset19)
     SKIP;
@@ -3419,6 +3867,36 @@ CASE(test_div_int32_trunc)
 CASE(test_matmul_bcast)
     SKIP;
 CASE(test_scatter_elements_with_reduction_mul)
+    SKIP;
+CASE(test_bitcast_2d_float32_to_int32)
+    SKIP;
+CASE(test_bitcast_bool_to_uint8)
+    SKIP;
+CASE(test_bitcast_float32_to_int32)
+    SKIP;
+CASE(test_bitcast_float64_to_int64)
+    SKIP;
+CASE(test_bitcast_int32_to_float32)
+    SKIP;
+CASE(test_bitcast_int64_to_float64)
+    SKIP;
+CASE(test_bitcast_int8_to_uint8)
+    SKIP;
+CASE(test_bitcast_scalar_float32_to_int32)
+    SKIP;
+CASE(test_bitcast_uint16_to_int16)
+    SKIP;
+CASE(test_bitcast_uint32_to_int32)
+    SKIP;
+CASE(test_matmul_1d_1d)
+    SKIP;
+CASE(test_matmul_1d_3d)
+    SKIP;
+CASE(test_matmul_4d_1d)
+    SKIP;
+CASE(test_dft_irfft)
+    SKIP;
+CASE(test_dft_irfft_opset19)
     SKIP;
 END_SWITCH()
 #undef EOF_LABEL

@@ -68,6 +68,7 @@
 #    pragma warning(disable:4714)  // const marked as __forceinline not inlined
 #  endif
 #  include <Eigen/Core>
+#  include <Eigen/Geometry>
 #  if defined(_MSC_VER)
 #    pragma warning(pop)
 #  endif
@@ -121,6 +122,7 @@ namespace cv
 /* IEEE754 constants and macros */
 #define  CV_TOGGLE_FLT(x) ((x)^((int)(x) < 0 ? 0x7fffffff : 0))
 #define  CV_TOGGLE_DBL(x) ((x)^((int64)(x) < 0 ? CV_BIG_INT(0x7fffffffffffffff) : 0))
+#define  CV_TOGGLE_FP8(x) ((x)^((schar)(x) < 0 ? 0x7f : 0))
 
 inline void* cvAlignPtr( const void* ptr, int align = 32 )
 {

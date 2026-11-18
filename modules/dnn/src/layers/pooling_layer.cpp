@@ -42,6 +42,7 @@
 
 #include "../precomp.hpp"
 #include "layers_common.hpp"
+#include "../net_impl.hpp"
 #include "opencv2/core/hal/intrin.hpp"
 #include "../op_cuda.hpp"
 #include "../op_inf_engine.hpp"
@@ -69,6 +70,7 @@ using namespace cv::dnn::ocl4dnn;
 
 #ifdef HAVE_CUDA
 #include "../cuda4dnn/primitives/pooling.hpp"
+#include "../cuda4dnn/primitives/average_pooling.hpp"
 #include "../cuda4dnn/primitives/roi_pooling.hpp"
 #include "../cuda4dnn/primitives/max_unpooling.hpp"
 using namespace cv::dnn::cuda4dnn;
@@ -147,6 +149,8 @@ public:
         outputs_arr.getMatVector(outputs);
 
         CV_Assert(!inputs.empty());
+        if (inputs[0].size.layout == DATA_LAYOUT_BLOCK)
+            return;
 
         std::vector<int> inp;
         std::vector<int> out;
@@ -155,13 +159,16 @@ public:
             out.push_back(outputs[0].size[i]);
         }
         if (globalPooling) {
+            CV_CheckLE(inp.size(), isGlobalPooling.size(), "");
             std::vector<size_t> finalKernel;
-            for (int i = 0; i < inp.size(); i++) {
-                int idx = isGlobalPooling.size() - inp.size() + i;
+            for (size_t i = 0; i < inp.size(); i++) {
+                size_t idx = isGlobalPooling.size() - inp.size() + i;
                 finalKernel.push_back(isGlobalPooling[idx] ? inp[i] : kernel_size[idx]);
-             }
-             kernel_size = finalKernel;
-         }
+            }
+            kernel_size = finalKernel;
+
+            expandGlobalPoolingParams(pads_begin, pads_end, strides, kernel_size.size());
+        }
 
         getConvPoolPaddings(inp, kernel_size, strides, padMode, pads_begin, pads_end);
 
@@ -328,6 +335,15 @@ public:
         CV_TRACE_FUNCTION();
         CV_TRACE_ARG_VALUE(name, "name", name.c_str());
 
+        if (inputs_arr.shape(0).layout == DATA_LAYOUT_BLOCK)
+        {
+            std::vector<Mat> inputs, outputs;
+            inputs_arr.getMatVector(inputs);
+            outputs_arr.getMatVector(outputs);
+            globalPoolBlock(inputs[0], outputs[0]);
+            return;
+        }
+
         if (type == MAX || type == AVE || type == STOCHASTIC)
         {
             CV_OCL_RUN(IS_DNN_OPENCL_TARGET(preferableTarget),
@@ -373,16 +389,18 @@ public:
 #ifdef HAVE_CUDA
     Ptr<BackendNode> initCUDA(
         void *context_,
-        const std::vector<Ptr<BackendWrapper>>& inputs,
-        const std::vector<Ptr<BackendWrapper>>& outputs
+        InputArrayOfArrays inputs_,
+        InputArrayOfArrays outputs_
     ) override
     {
         auto context = reinterpret_cast<csl::CSLContext*>(context_);
         if (type == ROI)
             return make_cuda_node<cuda4dnn::ROIPoolingOp>(preferableTarget, std::move(context->stream), spatialScale);
 
-        auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
-        auto input_shape = input_wrapper->getShape();
+        std::vector<UMat> inputs, outputs;
+        inputs_.getUMatVector(inputs);
+        outputs_.getUMatVector(outputs);
+        MatShape input_shape = cv::dnn::shape(inputs[0]);
 
         /* storing max indices is a special case and we deal with it separately */
         if (computeMaxIdx) {
@@ -412,17 +430,32 @@ public:
 
             config.input_shape.assign(std::begin(input_shape), std::end(input_shape));
 
-            int indicesType = outputs[1]->getHostMatDepth();
+            int indicesType = CV_MAT_DEPTH(outputs[1].type());
             CV_CheckType(indicesType, indicesType == CV_32S || indicesType == CV_64S, "Unsupported indices type");
 
             if (indicesType == CV_32S)
-                return make_cuda_node_with_indices<cuda4dnn::MaxPoolingOp, int32_t>(preferableTarget, inputs[0]->getHostMatDepth(), std::move(context->stream), config);
+                return make_cuda_node_with_indices<cuda4dnn::MaxPoolingOp, int32_t>(preferableTarget, CV_MAT_DEPTH(inputs[0].type()), std::move(context->stream), config);
             else if (indicesType == CV_64S)
-                return make_cuda_node_with_indices<cuda4dnn::MaxPoolingOp, int64_t>(preferableTarget, inputs[0]->getHostMatDepth(), std::move(context->stream), config);
+                return make_cuda_node_with_indices<cuda4dnn::MaxPoolingOp, int64_t>(preferableTarget, CV_MAT_DEPTH(inputs[0].type()), std::move(context->stream), config);
 
             CV_Error(Error::BadDepth, "Unsupported indices type");
             return Ptr<BackendNode>();
         }
+
+#if defined(HAVE_CUDNNJIT) && !defined(HAVE_CUDNN)
+        if (type == AVE)
+        {
+            const int nspatial = (int)kernel_size.size();
+            cuda4dnn::AveragePoolingConfiguration apconfig;
+            apconfig.kernel_shape.assign(std::begin(kernel_size), std::end(kernel_size));
+            apconfig.strides.assign(std::begin(strides), std::end(strides));
+            apconfig.pads.assign(std::begin(pads_begin), std::end(pads_begin));
+            apconfig.pads.insert(apconfig.pads.end(), std::begin(pads_end), std::end(pads_end));
+            apconfig.dilations.assign(nspatial, 1);
+            apconfig.count_include_pad = avePoolPaddedArea;
+            return make_cuda_node<cuda4dnn::AveragePoolingOp>(preferableTarget, std::move(context->stream), apconfig);
+        }
+#endif
 
         if (input_shape.size() == 3)
         {
@@ -484,7 +517,8 @@ public:
 
         config.input_shape.assign(std::begin(input_shape), std::end(input_shape));
 
-        return make_cuda_node<cuda4dnn::PoolingOp>(preferableTarget, std::move(context->cudnn_handle), config);
+        return make_cuda_node<cuda4dnn::PoolingOp>(preferableTarget, std::move(context->stream),
+                                                   std::move(context->cudnn_handle), config);
     }
 #endif
 
@@ -1162,6 +1196,67 @@ public:
         PoolingInvoker::run(src, rois, dst, mask, kernel_size, strides, pads_begin, pads_end, avePoolPaddedArea, type, spatialScale, computeMaxIdx, nstripes);
     }
 
+    void globalPoolBlock(const Mat& inp, Mat& out) const
+    {
+        CV_Assert_N(inp.type() == CV_32F, inp.isContinuous(), out.isContinuous());
+        if (out.total() == 0)
+            return;
+        const int C0 = inp.size[inp.dims - 1], NC1 = inp.size[0]*inp.size[1];
+        const size_t planesize = inp.total()/((size_t)NC1*C0);
+        CV_CheckGT(planesize, (size_t)0, "Global pooling: only the batch dimension can be empty");
+        CV_Assert(out.total() == (size_t)NC1*C0);
+        const float scale = (float)(1.0/planesize);
+        const bool isMax = type == MAX;
+
+        parallel_for_(Range(0, NC1), [&](const Range& r) {
+            for (int i = r.start; i < r.end; i++) {
+                const float* x = inp.ptr<float>() + (size_t)i*planesize*C0;
+                float* y = out.ptr<float>() + (size_t)i*C0;
+                if (isMax) {
+                    reduceBlockPlane<true>(x, y, planesize, C0);
+                } else {
+                    reduceBlockPlane<false>(x, y, planesize, C0);
+                    for (int k = 0; k < C0; k++)
+                        y[k] *= scale;
+                }
+            }
+        });
+    }
+
+    // each of the C0 lanes is reduced over the plane in pixel order
+    template<bool isMax>
+    static void reduceBlockPlane(const float* x, float* y, size_t planesize, int C0)
+    {
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+        const int vl = VTraits<v_float32>::vlanes();
+        if (C0 == vl*2) {
+            v_float32 a0 = vx_load(x), a1 = vx_load(x + vl);
+            for (size_t p = 1; p < planesize; p++) {
+                const float* xp = x + p*C0;
+                a0 = isMax ? v_max(a0, vx_load(xp)) : v_add(a0, vx_load(xp));
+                a1 = isMax ? v_max(a1, vx_load(xp + vl)) : v_add(a1, vx_load(xp + vl));
+            }
+            v_store(y, a0);
+            v_store(y + vl, a1);
+            return;
+        }
+        if (C0 == vl) {
+            v_float32 a0 = vx_load(x);
+            for (size_t p = 1; p < planesize; p++)
+                a0 = isMax ? v_max(a0, vx_load(x + p*C0)) : v_add(a0, vx_load(x + p*C0));
+            v_store(y, a0);
+            return;
+        }
+#endif
+        for (int k = 0; k < C0; k++)
+            y[k] = x[k];
+        for (size_t p = 1; p < planesize; p++) {
+            const float* xp = x + p*C0;
+            for (int k = 0; k < C0; k++)
+                y[k] = isMax ? std::max(y[k], xp[k]) : y[k] + xp[k];
+        }
+    }
+
     void roiPooling(const Mat &src, const Mat &rois, Mat &dst)
     {
         const int nstripes = getNumThreads();
@@ -1180,19 +1275,33 @@ public:
     {
         CV_Assert(inputs.size() != 0);
 
+        if (inputs[0].layout == DATA_LAYOUT_BLOCK) {
+            MatShape outShape = inputs[0];
+            for (int i = 2; i < outShape.dims - 1; i++)
+                outShape[i] = 1;
+            outputs.assign(1, outShape);
+            return false;
+        }
+
         bool isPool1D = inputs[0].size() == 3;
         std::vector<int> inpShape(inputs[0].begin() + 2, inputs[0].end());
         std::vector<int> outShape(inputs[0].begin(), inputs[0].begin() + 2);
 
         std::vector<size_t> local_kernel;
         if (globalPooling) {
-            for (int i = 0; i < inpShape.size(); i++) {
-                int idx = isGlobalPooling.size() - inpShape.size() + i;
+            CV_CheckLE(inpShape.size(), isGlobalPooling.size(), "");
+            for (size_t i = 0; i < inpShape.size(); i++) {
+                size_t idx = isGlobalPooling.size() - inpShape.size() + i;
                 local_kernel.push_back(isGlobalPooling[idx] ? inpShape[i] : kernel_size[idx]);
             }
         } else {
             local_kernel = kernel_size;
         }
+
+        std::vector<size_t> local_pads_begin = pads_begin, local_pads_end = pads_end;
+        std::vector<size_t> local_strides = strides;
+        if (globalPooling)
+            expandGlobalPoolingParams(local_pads_begin, local_pads_end, local_strides, inpShape.size());
 
         if (type == ROI || type == PSROI)
         {
@@ -1211,13 +1320,13 @@ public:
             {
                 size_t addedDims = isPool1D? inpShape.size() : local_kernel.size();
                 CV_CheckLE(addedDims, inpShape.size(), "");
-                CV_CheckLE(addedDims, pads_begin.size(), "");
-                CV_CheckLE(addedDims, pads_end.size(), "");
+                CV_CheckLE(addedDims, local_pads_begin.size(), "");
+                CV_CheckLE(addedDims, local_pads_end.size(), "");
                 CV_CheckLE(addedDims, local_kernel.size(), "");
-                CV_CheckLE(addedDims, strides.size(), "");
+                CV_CheckLE(addedDims, local_strides.size(), "");
                 for (int i = 0; i < addedDims; i++)
                 {
-                    float dst = (float) (inpShape[i] + pads_begin[i] + pads_end[i] - local_kernel[i]) / strides[i];
+                    float dst = (float) (inpShape[i] + local_pads_begin[i] + local_pads_end[i] - local_kernel[i]) / local_strides[i];
                     CV_CheckGE(dst, 0.0f, "");
                     outShape.push_back(1 + (ceilMode ? ceil(dst) : floor(dst)));
                 }
@@ -1225,13 +1334,13 @@ public:
                 // If we have padding, ensure that the last pooling starts strictly
                 // inside the image (instead of at the padding); otherwise clip the last.
                 for (int i = 0; i < addedDims; i++) {
-                    if (pads_end[i] && (outShape[2 + i] - 1) * strides[i] >= inpShape[i] + pads_end[i]) {
+                    if (local_pads_end[i] && (outShape[2 + i] - 1) * local_strides[i] >= inpShape[i] + local_pads_end[i]) {
                         --outShape[2 + i];
-                        CV_Assert((outShape[2 + i] - 1) * strides[i] < inpShape[i] + pads_end[i]);
+                        CV_Assert((outShape[2 + i] - 1) * local_strides[i] < inpShape[i] + local_pads_end[i]);
                     }
                 }
             } else {
-                getConvPoolOutParams(inpShape, local_kernel, strides, padMode,
+                getConvPoolOutParams(inpShape, local_kernel, local_strides, padMode,
                                      std::vector<size_t>(local_kernel.size(), 1), outShape);
             }
         }
@@ -1271,6 +1380,21 @@ public:
         if (type == MAX && requiredOutputs == 2) {
             outputs.push_back(CV_64S);
         }
+    }
+
+    // global average/max pooling reduces each channel on its own, so block input can stay
+    int getLayouts(const std::vector<DataLayout>& actualInputs,
+                   std::vector<DataLayout>& desiredInputs,
+                   const int requiredOutputs,
+                   std::vector<DataLayout>& outputs) const CV_OVERRIDE
+    {
+        bool block = actualInputs.size() == 1 && actualInputs[0] == DATA_LAYOUT_BLOCK &&
+                     (type == MAX || type == AVE) && requiredOutputs == 1 &&
+                     isGlobalPooling[0] && isGlobalPooling[1] && isGlobalPooling[2];
+        DataLayout layout = block ? DATA_LAYOUT_BLOCK : DATA_LAYOUT_UNKNOWN;
+        desiredInputs.assign(actualInputs.size(), layout);
+        outputs.assign(requiredOutputs, layout);
+        return block ? getNetImpl(this)->defaultC0 : 0;
     }
 
     bool updateMemoryShapes(const std::vector<MatShape> &inputs) CV_OVERRIDE

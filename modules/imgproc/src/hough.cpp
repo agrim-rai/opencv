@@ -146,7 +146,7 @@ HoughLinesStandard( InputArray src, OutputArray lines, int type,
     int numrho = cvRound(((max_rho - min_rho) + 1) / rho);
 
 #if defined HAVE_IPP && IPP_VERSION_X100 >= 810 && !IPP_DISABLE_HOUGH
-    if (type == CV_32FC2 && CV_IPP_CHECK_COND)
+    if (type == CV_32FC2 && threshold > 0 && CV_IPP_CHECK_COND)
     {
         IppiSize srcSize = { width, height };
         IppPointPolar delta = { rho, theta };
@@ -556,7 +556,7 @@ HoughLinesProbabilistic( Mat& image,
     int numrho = cvRound(((width + height) * 2 + 1) / rho);
 
 #if defined HAVE_IPP && IPP_VERSION_X100 >= 810 && !IPP_DISABLE_HOUGH
-    CV_IPP_CHECK()
+    if (threshold > 0 && CV_IPP_CHECK_COND)
     {
         IppiSize srcSize = { width, height };
         IppPointPolar delta = { rho, theta };
@@ -977,6 +977,17 @@ void HoughLines( InputArray _image, OutputArray lines,
 {
     CV_INSTRUMENT_REGION();
 
+    CV_Check(rho, std::isfinite((float)rho) && (float)rho > 0, "rho must be positive and finite");
+    CV_Check(theta, std::isfinite((float)theta) && (float)theta > 0, "theta must be positive and finite");
+    CV_CheckGE(threshold, 0, "threshold must be non-negative");
+    CV_CheckGE(max_theta, min_theta, "max_theta must be greater than min_theta");
+
+    if (_image.empty())
+    {
+        lines.release();
+        return;
+    }
+
     int type = CV_32FC2;
     if (lines.fixedType())
     {
@@ -999,6 +1010,18 @@ void HoughLinesP(InputArray _image, OutputArray _lines,
                  double minLineLength, double maxGap )
 {
     CV_INSTRUMENT_REGION();
+
+    CV_Check(rho, std::isfinite((float)rho) && (float)rho > 0, "rho must be positive and finite");
+    CV_Check(theta, std::isfinite((float)theta) && (float)theta > 0, "theta must be positive and finite");
+    CV_CheckGE(threshold, 0, "threshold must be non-negative");
+    CV_Check(minLineLength, std::isfinite(minLineLength) && minLineLength >= 0, "minLineLength out of range");
+    CV_Check(maxGap, std::isfinite(maxGap) && maxGap >= 0, "maxGap out of range");
+
+    if (_image.empty())
+    {
+        _lines.release();
+        return;
+    }
 
     CV_OCL_RUN(_image.isUMat() && _lines.isUMat(),
                ocl_HoughLinesP(_image, _lines, rho, theta, threshold, minLineLength, maxGap));
@@ -2387,6 +2410,8 @@ static void HoughCircles( InputArray _image, OutputArray _circles,
                     cw[i] = GetCircle4f(circles[i]);
                 if (ncircles > 0)
                     Mat(1, (int)ncircles, cv::traits::Type<Vec4f>::value, &cw[0]).copyTo(_circles);
+                else
+                    _circles.release();
             }
             else if( type == CV_32FC3 )
             {
@@ -2395,6 +2420,8 @@ static void HoughCircles( InputArray _image, OutputArray _circles,
                     cwow[i] = GetCircle(circles[i]);
                 if (ncircles > 0)
                     Mat(1, (int)ncircles, cv::traits::Type<Vec3f>::value, &cwow[0]).copyTo(_circles);
+                else
+                    _circles.release();
             }
             else
                 CV_Error(Error::StsError, "Internal error");

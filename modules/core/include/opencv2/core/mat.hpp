@@ -160,6 +160,19 @@ struct CV_EXPORTS_W_SIMPLE MatShape
     // compute shape of the result with possible broadcasting
     CV_WRAP MatShape expand(const MatShape& another) const;
 
+    // The operations below drop the layout, except for a block one: it is applied to the
+    // semantic NCHW form and blocked again, which only works while N and C stay unchanged.
+
+    // removes the given axes of size 1; all the axes of size 1 when axes is empty
+    CV_WRAP MatShape squeeze(const std::vector<int>& axes = std::vector<int>()) const;
+    // inserts axes of size 1; axes are positions in the result
+    CV_WRAP MatShape unsqueeze(const std::vector<int>& axes) const;
+    // merges the axes from startAxis to endAxis (inclusive) into one
+    CV_WRAP MatShape flatten(int startAxis = 0, int endAxis = -1) const;
+    // the shape of the same number of elements given by newShape, where -1 is inferred
+    // and 0 copies the corresponding axis of this shape (unless allowZero is set)
+    CV_WRAP MatShape reshape(const MatShape& newShape, bool allowZero = false) const;
+
     // convert shape between layouts
     CV_WRAP MatShape toLayout(DataLayout newLayout, int C0=0) const;
 
@@ -378,6 +391,15 @@ protected:
 
     void init(int _flags, const void* _obj);
     void init(int _flags, const void* _obj, Size _sz);
+
+private:
+    int dims_(int i=-1) const;
+    int cols_(int i=-1) const;
+    int rows_(int i=-1) const;
+    Size size_(int i=-1) const;
+    int type_(int i=-1) const;
+    int depth_(int i=-1) const;
+    bool empty_() const;
 };
 CV_ENUM_FLAGS(_InputArray::KindFlag)
 __CV_ENUM_FLAGS_BITWISE_AND(_InputArray::KindFlag, int, _InputArray::KindFlag)
@@ -520,6 +542,10 @@ public:
 
     void move(UMat& u) const;
     void move(Mat& m) const;
+
+private:
+    void create_(Size sz, int type, int i=-1, bool allowTransposed=false, _OutputArray::DepthMask fixedDepthMask=static_cast<_OutputArray::DepthMask>(0)) const;
+    void create_(int rows, int cols, int type, int i=-1, bool allowTransposed=false, _OutputArray::DepthMask fixedDepthMask=static_cast<_OutputArray::DepthMask>(0)) const;
 };
 
 
@@ -665,42 +691,6 @@ public:
 
     // default implementation returns DummyBufferPoolController
     virtual BufferPoolController* getBufferPoolController(const char* id = NULL) const;
-};
-
-
-//////////////////////////////// MatCommaInitializer //////////////////////////////////
-
-/** @brief  Comma-separated Matrix Initializer
-
- The class instances are usually not created explicitly.
- Instead, they are created on "matrix << firstValue" operator.
-
- The sample below initializes 2x2 rotation matrix:
-
- \code
- double angle = 30, a = cos(angle*CV_PI/180), b = sin(angle*CV_PI/180);
- Mat R = (Mat_<double>(2,2) << a, -b, b, a);
- \endcode
-
- \deprecated Use constructors with std::initializer_list instead:
- \code
- Mat_<int> m1({1, 2, 3, 4}); // 4x1 Mat
- Mat_<uchar> m2({2, 3}, {1, 2, 3, 4, 5, 6}); // 2x3 Mat
-
- Mat_<double> R({2, 2}, {a, -b, b, a}); // from example
- \endcode
-*/
-template<typename _Tp> class MatCommaInitializer_
-{
-public:
-    //! the constructor, created by "matrix << firstValue" operator, where matrix is cv::Mat
-    MatCommaInitializer_(Mat_<_Tp>* _m);
-    //! the operator that takes the next value and put it to the matrix
-    template<typename T2> MatCommaInitializer_<_Tp>& operator , (T2 v);
-    //! another form of conversion operator
-    operator Mat_<_Tp>() const;
-protected:
-    MatIterator_<_Tp> it;
 };
 
 
@@ -890,7 +880,7 @@ sub-matrices.
 - Use a comma-separated initializer:
 @code
     // create a 3x3 double-precision identity matrix
-    Mat M = (Mat_<double>(3,3) << 1, 0, 0, 0, 1, 0, 0, 0, 1);
+    Mat M = Mat_<double>({3,3}, {1, 0, 0, 0, 1, 0, 0, 0, 1});
 @endcode
 With this approach, you first call a constructor of the Mat class with the proper parameters, and
 then you just put `<< operator` followed by comma-separated values that can be constants,
@@ -1222,8 +1212,9 @@ public:
     Mat(const Mat& m, const std::vector<Range>& ranges);
 
     /** @overload
-    @param vec STL vector whose elements form the matrix. The matrix has a single column and the number
-    of rows equal to the number of vector elements. Type of the matrix matches the type of vector
+    @param vec STL vector whose elements form the matrix. In OpenCV 5.x, the matrix is 1D
+    (dims == 1) with a single row (rows == 1, cols == vec.size()). (Previous versions: the matrix
+    had a single column.) Type of the matrix matches the type of vector
     elements. The constructor can handle arbitrary types, for which there is a properly declared
     DataType . This means that the vector elements must be primitive numbers or uni-type numerical
     tuples of numbers. Mixed-type structures are not supported. The corresponding constructor is
@@ -1267,10 +1258,6 @@ public:
     /** @overload
     */
     template<typename _Tp> explicit Mat(const Point3_<_Tp>& pt, bool copyData=true);
-
-    /** @overload
-    */
-    template<typename _Tp> CV_DEPRECATED_EXTERNAL explicit Mat(const MatCommaInitializer_<_Tp>& commaInitializer);
 
     //! download data from GpuMat
     explicit Mat(const cuda::GpuMat& m);
@@ -1384,10 +1371,10 @@ public:
       immediately above the main one.
     For example:
     @code
-        Mat m = (Mat_<int>(3,3) <<
+        Mat m = Mat_<int>({3,3}, {
                     1,2,3,
                     4,5,6,
-                    7,8,9);
+                    7,8,9});
         Mat d0 = m.diag(0);
         Mat d1 = m.diag(1);
         Mat d_1 = m.diag(-1);
@@ -2131,6 +2118,25 @@ public:
 
     The method returns a matrix element type. This is an identifier compatible with the CvMat type
     system, like CV_16SC3 or 16-bit signed 3-channel array, and so on.
+
+    The returned value is a packed bit-field that encodes two fields in the lowest 12 bits
+    (`CV_MAT_TYPE_MASK`):
+    -   bits 0-4 (`CV_MAT_DEPTH_MASK`) store the element depth, one of the CV_8U, CV_8S, CV_16U,
+        CV_16S, CV_32S, CV_32F, CV_64F, CV_16F, ... constants;
+    -   bits 5-11 (`CV_MAT_CN_MASK`) store the number of channels minus one, so a matrix may have
+        between 1 and CV_CN_MAX (128) channels.
+
+    The macros CV_MAT_DEPTH(type) and CV_MAT_CN(type) extract these fields, while
+    CV_MAKETYPE(depth, cn) assembles a type from a depth and a channel count; for example,
+    CV_MAKETYPE(CV_16S, 3) is CV_16SC3.
+
+    @note The exact bit layout is an implementation detail and is subject to change in future
+    releases. Users should not rely on the description above and should use the corresponding
+    macros (CV_MAT_DEPTH(type), CV_MAT_CN(type), CV_MAT_TYPE(depth, cn)) or the depth() and
+    channels() methods instead.
+
+    @note Only the packed type is returned. The other bits of Mat::flags, such as the continuity
+    flag (CV_MAT_CONT_FLAG) and the submatrix flag (CV_SUBMAT_FLAG), are not part of the value.
      */
     int type() const;
 
@@ -2627,7 +2633,6 @@ public:
     template<int m, int n> explicit Mat_(const Matx<typename DataType<_Tp>::channel_type, m, n>& mtx, bool copyData=true);
     explicit Mat_(const Point_<typename DataType<_Tp>::channel_type>& pt, bool copyData=true);
     explicit Mat_(const Point3_<typename DataType<_Tp>::channel_type>& pt, bool copyData=true);
-    CV_DEPRECATED_EXTERNAL explicit Mat_(const MatCommaInitializer_<_Tp>& commaInitializer);
 
     Mat_(std::initializer_list<_Tp> values);
     explicit Mat_(const std::initializer_list<int> sizes, const std::initializer_list<_Tp> values);
@@ -2785,7 +2790,31 @@ typedef Mat_<Vec2d> Mat2d;
 typedef Mat_<Vec3d> Mat3d;
 typedef Mat_<Vec4d> Mat4d;
 
-/** @todo document */
+/** @brief Matrix class whose data may reside outside host memory. \anchor UMat_Details
+
+UMat repeats the Mat interface, but the buffer is owned by a MatAllocator, and it is the
+allocator that decides where the data physically resides: in host memory, in an OpenCL
+device buffer (see cv::ocl::getOpenCLAllocator) or in CUDA device memory (see
+cv::cuda::getCudaAllocator). Headers, reference counting, ROIs and submatrices and
+n-dimensional shapes behave as they do in Mat.
+
+Passing UMat instead of Mat to a cv:: function is the basis of the Transparent API
+(T-API). The dispatch is not keyed on the allocator: a cv:: call takes its OpenCL branch
+when OpenCL is active and the arguments are UMat objects, and otherwise maps the data
+back to host memory and runs the CPU implementation. UMat has no `data` pointer and no
+element accessors, because there may be no host address to expose; host access goes
+through UMat::getMat.
+
+@note
+  A non-default allocator must be assigned to @ref cv::UMat::allocator "UMat::allocator"
+  before the data is allocated. OpenCL is the only allocator with accelerated cv::
+  implementations, and because the T-API branch tests only whether OpenCL is active, a
+  UMat backed by any other device allocator must not be passed to cv:: functions while
+  OpenCL is enabled.
+
+@sa Mat, MatAllocator, UMatUsageFlags, cv::ocl::getOpenCLAllocator,
+cv::cuda::getCudaAllocator
+*/
 class CV_EXPORTS UMat
 {
 public:
@@ -2819,6 +2848,14 @@ public:
     //! assignment operators
     UMat& operator = (const UMat& m);
 
+    /** @brief Returns a Mat header giving host access to the same data
+    @note
+      The data is mapped into host memory on the first such view and unmapped when the
+      returned Mat is destroyed. @p flags is widened to ACCESS_RW internally, so the
+      mapping is always read-write and the allocator may write back even after
+      read-only use.
+    @param flags combination of AccessFlag values
+    */
     Mat getMat(AccessFlag flags) const;
 
     //! returns a new matrix header for the specified row
@@ -2962,7 +2999,9 @@ public:
     UMat(UMat&& m);
     UMat& operator = (UMat&& m);
 
-    /*! Returns the OpenCL buffer handle on which UMat operates on.
+    /*! Returns the device buffer handle on which UMat operates on.
+        The concrete type depends on the allocator: a `cl_mem` for the OpenCL allocator,
+        a CUDA device pointer for cv::cuda::getCudaAllocator().
         The UMat instance should be kept alive during the use of the handle to prevent the buffer to be
         returned to the OpenCV buffer pool.
      */
@@ -2989,7 +3028,7 @@ public:
     //! number of columns in the matrix; -1 when the matrix has more than 2 dimensions
     int cols;
 
-    //! custom allocator
+    //! custom allocator; assign before the data is allocated, see @ref UMat_Details
     MatAllocator* allocator;
 
     //! usage flags for allocator; recommend do not set directly, instead set during construct/create/getUMat

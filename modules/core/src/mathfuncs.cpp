@@ -152,7 +152,7 @@ void magnitude( InputArray src1, InputArray src2, OutputArray dst )
     CV_INSTRUMENT_REGION();
 
     int type = src1.type(), depth = src1.depth(), cn = src1.channels();
-    CV_Assert( src1.size() == src2.size() && type == src2.type() && (depth == CV_32F || depth == CV_64F));
+    CV_Assert( src1.sameSize(src2) && type == src2.type() && (depth == CV_32F || depth == CV_64F));
 
     CV_OCL_RUN(dst.isUMat() && src1.dims() <= 2 && src2.dims() <= 2,
                ocl_math_op(src1, src2, dst, OCL_OP_MAG))
@@ -188,7 +188,7 @@ void phase( InputArray src1, InputArray src2, OutputArray dst, bool angleInDegre
     CV_INSTRUMENT_REGION();
 
     int type = src1.type(), depth = src1.depth(), cn = src1.channels();
-    CV_Assert( src1.size() == src2.size() && type == src2.type() && (depth == CV_32F || depth == CV_64F));
+    CV_Assert( src1.sameSize(src2) && type == src2.type() && (depth == CV_32F || depth == CV_64F));
 
     CV_OCL_RUN(dst.isUMat() && src1.dims() <= 2 && src2.dims() <= 2,
                ocl_math_op(src1, src2, dst, angleInDegrees ? OCL_OP_PHASE_DEGREES : OCL_OP_PHASE_RADIANS))
@@ -812,8 +812,10 @@ struct iPow_SIMD<double, double>
 
 template<typename T, typename WT>
 static void
-iPow_i( const T* src, T* dst, int len, int power )
+iPow_i( const void* _src, void* _dst, int len, int power )
 {
+    const T* src = (const T*)_src;
+    T* dst = (T*)_dst;
     if( power < 0 )
     {
         T tab[5] =
@@ -852,8 +854,10 @@ iPow_i( const T* src, T* dst, int len, int power )
 
 template<typename T>
 static void
-iPow_f( const T* src, T* dst, int len, int power0 )
+iPow_f( const void* _src, void* _dst, int len, int power0 )
 {
+    const T* src = (const T*)_src;
+    T* dst = (T*)_dst;
     iPow_SIMD<T, T> vop;
     int i = vop(src, dst, len, power0);
     int power = std::abs(power0);
@@ -878,48 +882,12 @@ iPow_f( const T* src, T* dst, int len, int power0 )
     }
 }
 
-static void iPow8u(const uchar* src, uchar* dst, int len, int power)
-{
-    iPow_i<uchar, unsigned>(src, dst, len, power);
-}
-
-static void iPow8s(const schar* src, schar* dst, int len, int power)
-{
-    iPow_i<schar, int>(src, dst, len, power);
-}
-
-static void iPow16u(const ushort* src, ushort* dst, int len, int power)
-{
-    iPow_i<ushort, unsigned>(src, dst, len, power);
-}
-
-static void iPow16s(const short* src, short* dst, int len, int power)
-{
-    iPow_i<short, int>(src, dst, len, power);
-}
-
-static void iPow32s(const int* src, int* dst, int len, int power)
-{
-    iPow_i<int, int>(src, dst, len, power);
-}
-
-static void iPow32f(const float* src, float* dst, int len, int power)
-{
-    iPow_f<float>(src, dst, len, power);
-}
-
-static void iPow64f(const double* src, double* dst, int len, int power)
-{
-    iPow_f<double>(src, dst, len, power);
-}
-
-
-typedef void (*IPowFunc)( const uchar* src, uchar* dst, int len, int power );
+typedef void (*IPowFunc)( const void* src, void* dst, int len, int power );
 
 static IPowFunc ipowTab[CV_DEPTH_MAX] =
 {
-    (IPowFunc)iPow8u, (IPowFunc)iPow8s, (IPowFunc)iPow16u, (IPowFunc)iPow16s,
-    (IPowFunc)iPow32s, (IPowFunc)iPow32f, (IPowFunc)iPow64f, 0
+    iPow_i<uchar, unsigned>, iPow_i<schar, int>, iPow_i<ushort, unsigned>, iPow_i<short, int>,
+    iPow_i<int, int>, iPow_f<float>, iPow_f<double>, 0
 };
 
 #ifdef HAVE_OPENCL
@@ -1200,6 +1168,30 @@ check_range_function check_range_functions[] =
     &checkIntegerRange<CV_32S>
 };
 
+template<typename T>
+static void checkTypedRange(Mat& src, Point& badPt, double minVal, double maxVal)
+{
+    int loc = 0;
+    int cn = src.channels();
+    Size size = getContinuousSize2D(src, cn);
+    const T* isrc = src.ptr<T>();
+    size_t step = src.step / sizeof(isrc[0]);
+
+    for( ; badPt.x < 0 && size.height--; loc += size.width, isrc += step )
+    {
+        for( int i = 0; i < size.width; i++ )
+        {
+            double val = (double)isrc[i];
+            if( !(val >= minVal && val < maxVal) )
+            {
+                int pixelId = (loc + i) / cn;
+                badPt = Point(pixelId % src.cols, pixelId / src.cols);
+                break;
+            }
+        }
+    }
+}
+
 bool checkRange(InputArray _src, bool quiet, Point* pt, double minVal, double maxVal)
 {
     CV_INSTRUMENT_REGION();
@@ -1240,7 +1232,15 @@ bool checkRange(InputArray _src, bool quiet, Point* pt, double minVal, double ma
         int cn = src.channels();
         Size size = getContinuousSize2D(src, cn);
 
-        if( depth == CV_32F )
+        if( depth == CV_16F )
+        {
+            checkTypedRange<hfloat>(src, badPt, minVal, maxVal);
+        }
+        else if( depth == CV_16BF )
+        {
+            checkTypedRange<bfloat>(src, badPt, minVal, maxVal);
+        }
+        else if( depth == CV_32F )
         {
             Cv32suf a, b;
             int ia, ib;
@@ -1269,7 +1269,7 @@ bool checkRange(InputArray _src, bool quiet, Point* pt, double minVal, double ma
                 }
             }
         }
-        else
+        else if( depth == CV_64F )
         {
             Cv64suf a, b;
             int64 ia, ib;
@@ -1297,6 +1297,62 @@ bool checkRange(InputArray _src, bool quiet, Point* pt, double minVal, double ma
                     }
                 }
             }
+        }
+        else if( depth == CV_Bool )
+        {
+            checkTypedRange<uchar>(src, badPt, minVal, maxVal);
+        }
+        else if( depth == CV_32U )
+        {
+            checkTypedRange<uint32_t>(src, badPt, minVal, maxVal);
+        }
+        else if( depth == CV_64U )
+        {
+            checkTypedRange<uint64_t>(src, badPt, minVal, maxVal);
+        }
+        else if( depth == CV_64S )
+        {
+            checkTypedRange<int64_t>(src, badPt, minVal, maxVal);
+        }
+        else if( depth == CV_8F_E4M3FN || depth == CV_8F_E4M3FNUZ )
+        {
+            // fp8 values are sign-magnitude, like float: CV_TOGGLE_FP8 maps them to int8 keys in
+            // the same order, so the values in [minVal, maxVal) have the keys in [ia, ib).
+            // NaN has no place in that order, so its key is checked separately (the other
+            // E4M3FN NaN, 0xff, maps to -128, below every ia).
+            const float* lut = depth == CV_8F_E4M3FN ? fp8_t::decodeLUT() : fp8a_t::decodeLUT();
+            const int nanKey = (schar)CV_TOGGLE_FP8(depth == CV_8F_E4M3FN ? 0x7f : 0x80);
+            int ia = 128, ib = 128;
+            for( int k = 127; k >= -128; k-- )
+            {
+                float v = lut[(uchar)CV_TOGGLE_FP8(k)];
+                if( v >= minVal )
+                    ia = k;
+                if( v >= maxVal )
+                    ib = k;
+            }
+
+            const uchar* isrc = src.ptr<uchar>();
+            size_t step = src.step/sizeof(isrc[0]);
+
+            for( ; badPt.x < 0 && size.height--; loc += size.width, isrc += step )
+            {
+                for( i = 0; i < size.width; i++ )
+                {
+                    int val = (schar)CV_TOGGLE_FP8(isrc[i]);
+
+                    if( val < ia || val >= ib || val == nanKey )
+                    {
+                        int pixelId = (loc + i) / cn;
+                        badPt = Point(pixelId % src.cols, pixelId / src.cols);
+                        break;
+                    }
+                }
+            }
+        }
+        else
+        {
+            CV_Error(Error::StsUnsupportedFormat, "Unsupported matrix depth in checkRange");
         }
     }
 
@@ -1519,7 +1575,7 @@ double cv::solvePoly( InputArray _coeffs0, OutputArray _roots0, int maxIters )
     int cdepth = CV_MAT_DEPTH(ctype);
 
     CV_Assert( CV_MAT_DEPTH(ctype) >= CV_32F && CV_MAT_CN(ctype) <= 2 );
-    CV_Assert( coeffs0.rows == 1 || coeffs0.cols == 1 );
+    CV_Assert( (coeffs0.rows == 1 || coeffs0.cols == 1) && coeffs0.total() >= 2 );
 
     int n0 = coeffs0.cols + coeffs0.rows - 2, n = n0;
 
@@ -1542,6 +1598,7 @@ double cv::solvePoly( InputArray _coeffs0, OutputArray _roots0, int maxIters )
         if( std::abs(coeffs[n].re) + std::abs(coeffs[n].im) > DBL_EPSILON )
             break;
     }
+    CV_Assert( std::abs(coeffs[n].re) + std::abs(coeffs[n].im) > DBL_EPSILON );
 
     // Related issue: https://github.com/opencv/opencv/issues/23644,
     // This the initialization scheme of "Initial approximations in Durand-Kerner's root finding method" by Guggenheimer.

@@ -5,7 +5,10 @@
 #include "../precomp.hpp"
 #include "layers_common.hpp"
 #include "../net_impl.hpp"
-//#include "../op_cuda.hpp"
+#include "../op_cuda.hpp"
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/primitives/reshape.hpp"
+#endif
 //#include "../op_inf_engine.hpp"
 //#include "../ie_ngraph.hpp"
 //#include "../op_webnn.hpp"
@@ -129,12 +132,30 @@ public:
 
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
+#ifdef HAVE_CUDA
+        if (backendId == DNN_BACKEND_CUDA)
+            return true;
+#endif
         return backendId == DNN_BACKEND_OPENCV;
     }
 
     // Reshape just re-interprets the same contiguous buffer. Let the graph
     // buffer allocator alias input and output so the memcpy in forward() is a no-op.
     virtual bool alwaysSupportInplace() const CV_OVERRIDE { return true; }
+
+#ifdef HAVE_CUDA
+    Ptr<BackendNode> initCUDA(void* context_,
+                              InputArrayOfArrays inputs_arr,
+                              InputArrayOfArrays outputs_arr) CV_OVERRIDE
+    {
+        CV_UNUSED(outputs_arr);
+        auto context = reinterpret_cast<cuda4dnn::csl::CSLContext*>(context_);
+        if (inputs_arr.depth(0) == CV_Bool)
+            return make_cuda_node_bool<cuda4dnn::ReshapeOp>(std::move(context->stream));
+        return make_cuda_node_with_type<cuda4dnn::ReshapeOp>(preferableTarget, inputs_arr.depth(0),
+                                                             std::move(context->stream));
+    }
+#endif
 
     bool haveShapeSpec() const
     {
@@ -143,43 +164,20 @@ public:
 
     MatShape getOutShape(const MatShape& inpShape, const MatShape& shapeSpec) const
     {
-        MatShape outShape = shapeSpec;
-        int m1idx = -1;
-        int i, ndims = outShape.dims;
-        int64_t outTotal = 1;
-        for (i = 0; i < ndims; i++) {
-            if (outShape[i] < 0) {
-                CV_Assert(outShape[i] == -1);
-                if (m1idx >= 0) {
-                    CV_Error(Error::StsBadArg, "invalid shape spec, there must be at most one '-1'");
-                }
-                m1idx = i;
-            }
-            else {
-                if (outShape[i] == 0) {
-                    if (i >= inpShape.dims) {
-                        CV_Error(Error::StsBadArg, "cannot copy dimension from the input tensor");
-                    }
-                    outShape[i] = inpShape[i];
-                }
-                outTotal *= outShape[i];
+        // legacy models: (1, k) with the wrong k means (1, total); 0 is resolved first so
+        // that the (0, k) spelling is recognized too
+        if (shapeSpec.dims == 2)
+        {
+            int d0 = shapeSpec[0] == 0 && inpShape.dims > 0 ? inpShape[0] : shapeSpec[0];
+            int d1 = shapeSpec[1] == 0 && inpShape.dims > 1 ? inpShape[1] : shapeSpec[1];
+            const int64_t inpTotal = (int64_t)inpShape.total();
+            if (d0 == 1 && d1 > 0 && (int64_t)d1 != inpTotal)
+            {
+                CV_CheckLE((double)inpTotal, (double)INT_MAX, "reshape: the result is too big");
+                return MatShape({1, (int)inpTotal});
             }
         }
-
-        int64_t inpTotal = (int64_t)inpShape.total();
-        if (m1idx >= 0) {
-            int64_t autoSize = inpTotal/outTotal;
-            CV_Assert(autoSize <= INT_MAX && autoSize*outTotal == inpTotal);
-            outShape[m1idx] = (int)autoSize;
-        }
-        else if (outTotal != inpTotal && ndims == 2 && outShape[0] == 1 && outShape[1] > 0) {
-            outShape[1] = (int)(inpTotal / outShape[0]);
-        }
-        else {
-            CV_Assert(outTotal == inpTotal);
-        }
-
-        return outShape;
+        return inpShape.reshape(shapeSpec);
     }
 
     bool getMemoryShapes(const std::vector<MatShape> &inputs,

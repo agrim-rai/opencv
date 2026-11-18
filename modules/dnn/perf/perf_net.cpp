@@ -22,6 +22,7 @@ public:
     dnn::Target target;
 
     dnn::Net net;
+    std::string pinnedInput;
 
     DNNTestNetwork()
     {
@@ -35,6 +36,12 @@ public:
         if (!proto.empty())
             proto = findDataFile(proto);
         net = readNet(weights, proto);
+        // "*" pins every named input to the shape it is fed
+        if (pinnedInput == "*")
+            for (auto& inp : inputs)
+                net.setInputShape(std::get<1>(inp), shape(std::get<0>(inp)));
+        else if (!pinnedInput.empty())
+            net.setInputShape(pinnedInput, shape(std::get<0>(inputs[0])));
         // Set multiple inputs
         for(auto &inp: inputs){
             net.setInput(std::get<0>(inp), std::get<1>(inp));
@@ -138,18 +145,12 @@ PERF_TEST_P_(DNNTestNetwork, SqueezeNet_v1_1)
 PERF_TEST_P_(DNNTestNetwork, Inception_5h)
 {
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019) throw SkipTestException("");
-    processNet("dnn/tensorflow_inception_graph.pb", "", cv::Size(224, 224));
+    processNet("dnn/onnx/models/tensorflow_inception_graph.onnx", "", cv::Size(224, 224));
 }
 
 PERF_TEST_P_(DNNTestNetwork, SSD)
 {
     applyTestTag(CV_TEST_TAG_DEBUG_VERYLONG);
-
-    // SSD_VGG16's specialized preprocessing is handled by the new engine importer only.
-    auto engine_forced = static_cast<dnn::EngineType>(
-        utils::getConfigurationParameterSizeT("OPENCV_FORCE_DNN_ENGINE", dnn::ENGINE_AUTO));
-    if (engine_forced == dnn::ENGINE_CLASSIC)
-        throw SkipTestException("SSD_VGG16 is supported on the new DNN engine only");
 
     processNet("dnn/onnx/models/ssd_vgg16.onnx", "", cv::Size(300, 300));
 }
@@ -170,12 +171,21 @@ PERF_TEST_P_(DNNTestNetwork, MobileNet_SSD_v1_ONNX)
 
 PERF_TEST_P_(DNNTestNetwork, MobileNet_SSD_v1_TensorFlow)
 {
-    processNet("dnn/ssd_mobilenet_v1_coco_2017_11_17.pb", "ssd_mobilenet_v1_coco_2017_11_17.pbtxt", cv::Size(300, 300));
+    // image_tensor input is NHWC uint8
+    Mat img(cv::Size(300, 300), CV_8UC3);
+    randu(img, 0, 255);
+    int s[] = {1, 300, 300, 3};
+    Mat inp(4, s, CV_8U, img.data);
+    processNet("dnn/onnx/models/ssd_mobilenet_v1_coco.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, MobileNet_SSD_v2_TensorFlow)
 {
-    processNet("dnn/ssd_mobilenet_v2_coco_2018_03_29.pb", "ssd_mobilenet_v2_coco_2018_03_29.pbtxt", cv::Size(300, 300));
+    Mat img(cv::Size(300, 300), CV_8UC3);
+    randu(img, 0, 255);
+    int s[] = {1, 300, 300, 3};
+    Mat inp(4, s, CV_8U, img.data);
+    processNet("dnn/onnx/models/ssd_mobilenet_v2_coco_2018_03_29.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, DenseNet_121)
@@ -197,7 +207,11 @@ PERF_TEST_P_(DNNTestNetwork, Inception_v2_SSD_TensorFlow)
 {
     applyTestTag(CV_TEST_TAG_DEBUG_VERYLONG);
 
-    processNet("dnn/ssd_inception_v2_coco_2017_11_17.pb", "ssd_inception_v2_coco_2017_11_17.pbtxt", cv::Size(300, 300));
+    Mat img(cv::Size(300, 300), CV_8UC3);
+    randu(img, 0, 255);
+    int s[] = {1, 300, 300, 3};
+    Mat inp(4, s, CV_8U, img.data);
+    processNet("dnn/onnx/models/ssd_inception_v2_coco_2017_11_17.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, YOLOv3)
@@ -287,7 +301,7 @@ PERF_TEST_P_(DNNTestNetwork, EAST_text_detection)
 {
     applyTestTag(CV_TEST_TAG_DEBUG_VERYLONG);
 
-    processNet("dnn/frozen_east_text_detection.pb", "", cv::Size(320, 320));
+    processNet("dnn/onnx/models/east_text_detection.onnx", "", cv::Size(320, 320));
 }
 
 PERF_TEST_P_(DNNTestNetwork, FastNeuralStyle_eccv16)
@@ -313,28 +327,34 @@ PERF_TEST_P_(DNNTestNetwork, Inception_v2_Faster_RCNN)
     if (target == DNN_TARGET_MYRIAD)
         throw SkipTestException("Test is disabled in OpenVINO 2021.1+ / MYRIAD");
 #endif
-    if ((backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 && target != DNN_TARGET_CPU) ||
-        (backend == DNN_BACKEND_OPENCV && target == DNN_TARGET_OPENCL_FP16))
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 && target != DNN_TARGET_CPU)
         throw SkipTestException("");
-    processNet("dnn/faster_rcnn_inception_v2_coco_2018_01_28.pb",
-               "dnn/faster_rcnn_inception_v2_coco_2018_01_28.pbtxt",
-               cv::Size(800, 600));
+    // image_tensor input is NHWC uint8
+    Mat img = imread(findDataFile("dnn/dog416.png"));
+    cv::resize(img, img, Size(800, 600));
+    cvtColor(img, img, COLOR_BGR2RGB);
+    int s[] = {1, 600, 800, 3};
+    Mat inp(4, s, CV_8U, img.data);
+    processNet("dnn/onnx/models/faster_rcnn_inception_v2_coco_2018_01_28.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, EfficientDet)
 {
     if (target != DNN_TARGET_CPU)
         throw SkipTestException("");
-    Mat sample = imread(findDataFile("dnn/dog416.png"));
-    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(512, 512), Scalar(), true);
-    processNet("dnn/efficientdet-d0.pb", "dnn/efficientdet-d0.pbtxt", inp);
+    // image_arrays input is NHWC uint8
+    Mat img(cv::Size(512, 512), CV_8UC3);
+    randu(img, 0, 255);
+    int s[] = {1, 512, 512, 3};
+    Mat inp(4, s, CV_8U, img.data);
+    processNet("dnn/onnx/models/efficientdet-d0.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, EfficientNet)
 {
     Mat sample = imread(findDataFile("dnn/dog416.png"));
     Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(224, 224), Scalar(), true);
-    transposeND(inp, {0, 2, 3, 1}, inp);
+    cv::transpose(inp, {0, 2, 3, 1}, inp);
     processNet("dnn/efficientnet-lite4.onnx", "", inp);
 }
 
@@ -358,7 +378,7 @@ PERF_TEST_P_(DNNTestNetwork, MPPalm) {
     Mat inp(cv::Size(192, 192), CV_32FC3);
     randu(inp, 0.0f, 1.0f);
     inp = blobFromImage(inp, 1.0, Size(), Scalar(), false);
-    transposeND(inp, {0, 2, 3, 1}, inp);
+    cv::transpose(inp, {0, 2, 3, 1}, inp);
     processNet("dnn/palm_detection_mediapipe_2023feb.onnx", "", inp);
 }
 
@@ -366,7 +386,7 @@ PERF_TEST_P_(DNNTestNetwork, MPHand) {
     Mat inp(cv::Size(224, 224), CV_32FC3);
     randu(inp, 0.0f, 1.0f);
     inp = blobFromImage(inp, 1.0, Size(), Scalar(), false);
-    transposeND(inp, {0, 2, 3, 1}, inp);
+    cv::transpose(inp, {0, 2, 3, 1}, inp);
     processNet("dnn/handpose_estimation_mediapipe_2023feb.onnx", "", inp);
 }
 
@@ -374,7 +394,7 @@ PERF_TEST_P_(DNNTestNetwork, MPPose) {
     Mat inp(cv::Size(256, 256), CV_32FC3);
     randu(inp, 0.0f, 1.0f);
     inp = blobFromImage(inp, 1.0, Size(), Scalar(), false);
-    transposeND(inp, {0, 2, 3, 1}, inp);
+    cv::transpose(inp, {0, 2, 3, 1}, inp);
     processNet("dnn/pose_estimation_mediapipe_2023mar.onnx", "", inp);
 }
 
@@ -415,6 +435,119 @@ PERF_TEST_P_(DNNTestNetwork, EfficientDet_int8)
     processNet("dnn/tflite/coco_efficientdet_lite0_v1_1.0_quant_2021_09_06.tflite", "", inp);
 }
 
+PERF_TEST_P_(DNNTestNetwork, YuNet_int8)
+{
+    if (target != DNN_TARGET_CPU || backend != DNN_BACKEND_OPENCV)
+        throw SkipTestException("");
+    processNet("dnn/onnx/models/face_detection_yunet_2023mar_int8.onnx", "", cv::Size(640, 640));
+}
+
+PERF_TEST_P_(DNNTestNetwork, SFace_int8)
+{
+    if (target != DNN_TARGET_CPU || backend != DNN_BACKEND_OPENCV)
+        throw SkipTestException("");
+    processNet("dnn/onnx/models/face_recognition_sface_2021dec_int8.onnx", "", cv::Size(112, 112));
+}
+
+PERF_TEST_P_(DNNTestNetwork, DenseNet_121_int8)
+{
+    if (target != DNN_TARGET_CPU || backend != DNN_BACKEND_OPENCV)
+        throw SkipTestException("");
+    processNet("dnn/onnx/models/densenet-12-int8.onnx", "", cv::Size(224, 224));
+}
+
+PERF_TEST_P_(DNNTestNetwork, EfficientNet_int8)
+{
+    if (target != DNN_TARGET_CPU || backend != DNN_BACKEND_OPENCV)
+        throw SkipTestException("");
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(224, 224), Scalar(), true);
+    transposeND(inp, {0, 2, 3, 1}, inp);
+    processNet("dnn/onnx/models/efficientnet-lite4-11-int8.onnx", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, PPOCRv3_int8)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    if (target != DNN_TARGET_CPU || backend != DNN_BACKEND_OPENCV)
+        throw SkipTestException("");
+    processNet("dnn/onnx/models/text_detection_en_ppocrv3_2023may_int8.onnx", "", cv::Size(736, 736));
+}
+
+PERF_TEST_P_(DNNTestNetwork, YOLOv8n_TFLite)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    Mat inp = imread(findDataFile("dnn/dog416.png"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(640, 640), Scalar(), true);
+    processNet("dnn/tflite/yolov8n.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, YOLOv5nu_TFLite)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    Mat inp = imread(findDataFile("dnn/dog416.png"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(640, 640), Scalar(), true);
+    processNet("dnn/tflite/yolov5nu.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, YOLO26n_TFLite)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    Mat inp = imread(findDataFile("dnn/dog416.png"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(640, 640), Scalar(), true);
+    processNet("dnn/tflite/yolo26n.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, YOLO26n_seg_TFLite)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    Mat inp = imread(findDataFile("dnn/street.png"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(640, 640), Scalar(), true);
+    processNet("dnn/tflite/yolo26n-seg.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, ResNet18_TFLite)
+{
+    Mat inp = imread(findDataFile("dnn/space_shuttle.jpg"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(224, 224), Scalar(), true);
+    processNet("dnn/tflite/resnet18.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, MobileNetV2_TFLite)
+{
+    Mat inp = imread(findDataFile("dnn/space_shuttle.jpg"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(224, 224), Scalar(), true);
+    processNet("dnn/tflite/mobilenet_v2.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, SqueezeNet_v1_1_TFLite)
+{
+    Mat inp = imread(findDataFile("dnn/space_shuttle.jpg"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(224, 224), Scalar(), true);
+    processNet("dnn/tflite/squeezenet1_1.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, YuNet_TFLite)
+{
+    Mat inp = imread(findDataFile("cv/shared/lena.png"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(160, 120), Scalar(), true);
+    processNet("dnn/tflite/yunet_float32.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, HandLandmark_TFLite)
+{
+    Mat inp = imread(findDataFile("dnn/pose.png"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(224, 224), Scalar(), true);
+    processNet("dnn/tflite/hand_landmark_lite.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, PoseLandmark_TFLite)
+{
+    Mat inp = imread(findDataFile("dnn/pose.png"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(256, 256), Scalar(), true);
+    processNet("dnn/tflite/pose_landmark_lite.tflite", "", inp);
+}
+
 PERF_TEST_P_(DNNTestNetwork, VIT_B_32)
 {
     applyTestTag(CV_TEST_TAG_DEBUG_VERYLONG);
@@ -441,11 +574,13 @@ PERF_TEST_P_(DNNTestNetwork, BERT)
 PERF_TEST_P_(DNNTestNetwork, VIT_Base_Patch16_224)
 {
     applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    pinnedInput = "x";
     processNet("dnn/vit_base_patch16_224_Opset16.onnx", "", cv::Size(224, 224));
 }
 
 PERF_TEST_P_(DNNTestNetwork, DeiT_Tiny_Patch16_224)
 {
+    pinnedInput = "x";
     processNet("dnn/deit_tiny_patch16_224_Opset16.onnx", "", cv::Size(224, 224));
 }
 
@@ -536,6 +671,42 @@ PERF_TEST_P_(DNNTestNetwork, SAM2_Decoder)
                 std::make_tuple(point_labels,     "point_labels"),
                 std::make_tuple(mask_input,       "mask_input"),
                 std::make_tuple(has_mask_input,   "has_mask_input")});
+}
+
+// Model: https://huggingface.co/onnx-community/sam3-tracker-ONNX/blob/main/onnx/prompt_encoder_mask_decoder.onnx
+PERF_TEST_P_(DNNTestNetwork, SAM3_Decoder)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_1GB, CV_TEST_TAG_VERYLONG);
+
+    // Synthetic encoder outputs used as decoder inputs
+    int shp_emb0[4] = {1, 32, 288, 288};
+    int shp_emb1[4] = {1, 64, 144, 144};
+    int shp_emb2[4] = {1, 256, 72, 72};
+    Mat image_embeddings_0(4, shp_emb0, CV_32F);
+    Mat image_embeddings_1(4, shp_emb1, CV_32F);
+    Mat image_embeddings_2(4, shp_emb2, CV_32F);
+    randu(image_embeddings_0, -0.2f, 0.2f);
+    randu(image_embeddings_1, -0.2f, 0.2f);
+    randu(image_embeddings_2, -0.2f, 0.2f);
+
+    // One foreground point and one box in the 1008x1008 input image
+    int shp_pts[4] = {1, 1, 1, 2};
+    int shp_lbl[3] = {1, 1, 1};
+    int shp_box[3] = {1, 1, 4};
+    float input_points_data[2] = {504.0f, 504.0f};
+    int64_t input_labels_data[1] = {1};
+    float input_boxes_data[4] = {252.0f, 252.0f, 756.0f, 756.0f};
+    Mat input_points(4, shp_pts, CV_32F, input_points_data);
+    Mat input_labels(3, shp_lbl, CV_64S, input_labels_data);
+    Mat input_boxes(3, shp_box, CV_32F, input_boxes_data);
+
+    processNet("dnn/onnx/models/sam3_tracker/prompt_encoder_mask_decoder.onnx", "",
+               {std::make_tuple(input_points,       "input_points"),
+                std::make_tuple(input_labels,       "input_labels"),
+                std::make_tuple(input_boxes,        "input_boxes"),
+                std::make_tuple(image_embeddings_0, "image_embeddings.0"),
+                std::make_tuple(image_embeddings_1, "image_embeddings.1"),
+                std::make_tuple(image_embeddings_2, "image_embeddings.2")});
 }
 
 // Model: https://github.com/opencv/opencv_zoo/tree/main/models/optical_flow_estimation_raft
@@ -763,6 +934,88 @@ PERF_TEST_P_(DNNTestNetwork, DINOv2_Small)
     Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(224, 224), Scalar(), true);
     processNet("dnn/onnx/models/dinov2_small.onnx", "",
                {std::make_tuple(inp, "pixel_values")});
+}
+
+// CUDA only: dynamic-shape models with their inputs pinned, so Shape chains fold and forward() replays as a CUDA Graph
+PERF_TEST_P_(DNNTestNetwork, YOLOv3_CUDA_pinned)
+{
+    if (backend != DNN_BACKEND_CUDA)
+        throw SkipTestException("CUDA only");
+    applyTestTag(CV_TEST_TAG_MEMORY_2GB);
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    cv::resize(sample, sample, Size(416, 416));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(), Scalar(), true);
+    pinnedInput = "input";
+    processNet("dnn/yolov3-converted.onnx", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, YOLOv4_CUDA_pinned)
+{
+    if (backend != DNN_BACKEND_CUDA)
+        throw SkipTestException("CUDA only");
+    applyTestTag(CV_TEST_TAG_MEMORY_2GB);
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    cv::resize(sample, sample, Size(608, 608));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(), Scalar(), true);
+    pinnedInput = "input";
+    processNet("dnn/yolov4.onnx", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, YOLOv4_tiny_CUDA_pinned)
+{
+    if (backend != DNN_BACKEND_CUDA)
+        throw SkipTestException("CUDA only");
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(), Scalar(), true);
+    pinnedInput = "input";
+    processNet("dnn/yolov4-tiny.onnx", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, BEiT_Base_Patch16_224_CUDA_pinned)
+{
+    if (backend != DNN_BACKEND_CUDA)
+        throw SkipTestException("CUDA only");
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    pinnedInput = "x";
+    processNet("dnn/beit_base_patch16_224_Opset16.onnx", "", cv::Size(224, 224));
+}
+
+PERF_TEST_P_(DNNTestNetwork, BERT_CUDA_pinned)
+{
+    if (backend != DNN_BACKEND_CUDA)
+        throw SkipTestException("CUDA only");
+    const int seq_len = 9;
+    int64_t input_ids_data[seq_len] = {101, 1996, 103, 2938, 2006, 1996, 13523, 1012, 102};
+    int64_t attention_mask_data[seq_len] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
+    int64_t token_type_ids_data[seq_len] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int shp[2] = {1, seq_len};
+    Mat input_ids(2, shp, CV_64S, input_ids_data);
+    Mat attention_mask(2, shp, CV_64S, attention_mask_data);
+    Mat token_type_ids(2, shp, CV_64S, token_type_ids_data);
+    pinnedInput = "*";
+    processNet("dnn/onnx/models/bert.onnx", "",
+               {std::make_tuple(input_ids, "input_ids"),
+                std::make_tuple(attention_mask, "attention_mask"),
+                std::make_tuple(token_type_ids, "token_type_ids")});
+}
+
+PERF_TEST_P_(DNNTestNetwork, SigLIP_CUDA_pinned)
+{
+    if (backend != DNN_BACKEND_CUDA)
+        throw SkipTestException("CUDA only");
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat pixel_values = blobFromImage(sample, 1.0 / 255.0, Size(224, 224), Scalar(0.5, 0.5, 0.5), true);
+    pixel_values = (pixel_values - 0.5f) / 0.5f;
+    const int seq_len = 64;
+    int shp[2] = {1, seq_len};
+    Mat input_ids(2, shp, CV_64S, Scalar(0));
+    int64_t* ids = input_ids.ptr<int64_t>();
+    ids[0] = 1; ids[1] = 263; ids[2] = 2514; ids[3] = 275; ids[4] = 262; ids[5] = 3914; ids[6] = 2;
+    pinnedInput = "*";
+    processNet("dnn/onnx/models/siglip_base_patch16_224.onnx", "",
+               {std::make_tuple(input_ids,    "input_ids"),
+                std::make_tuple(pixel_values, "pixel_values")});
 }
 
 INSTANTIATE_TEST_CASE_P(/*nothing*/, DNNTestNetwork, dnnBackendsAndTargets());

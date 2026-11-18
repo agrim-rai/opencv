@@ -350,6 +350,11 @@ void gemm(InputArray matA, InputArray matB, double alpha,
 #endif
 
     Mat A = matA.getMat(), B = matB.getMat(), C = beta != 0.0 ? matC.getMat() : Mat();
+    // A 1D Mat is one row, but its step[0] is the size of one element, not of the whole row.
+    // Give it an ordinary 2D one-row header so the row step passed to the kernels is right.
+    if (A.dims == 1) A = A.reshape(0, 1);
+    if (B.dims == 1) B = B.reshape(0, 1);
+    if (C.dims == 1) C = C.reshape(0, 1);
     Size a_size = A.size(), d_size;
     int len = 0, type = A.type();
 
@@ -388,6 +393,8 @@ void gemm(InputArray matA, InputArray matB, double alpha,
 
     _matD.create( d_size.height, d_size.width, type );
     Mat D = _matD.getMat();
+    // A preallocated 1D output keeps its 1D header after create(), so normalize it like A, B and C.
+    if (D.dims == 1) D = D.reshape(0, 1);
     if( (flags & GEMM_3_T) != 0 && C.data == D.data )
     {
         transpose( C, C );
@@ -421,7 +428,7 @@ void gemm(InputArray matA, InputArray matB, double alpha,
         CV_Assert( type == CV_64FC2 );
         hal::gemm64fc(A.ptr<double>(), A.step, B.ptr<double>(), B.step, alpha,
                       C.ptr<double>(), C.step, beta,
-                      D.ptr<double>(), D.step,
+                      DProxyPtr->ptr<double>(), DProxyPtr->step,
                       a_size.height, a_size.width, DProxyPtr->cols, flags);
     }
 
@@ -757,17 +764,15 @@ void calcCovarMatrix( InputArray _src, OutputArray _covar, InputOutputArray _mea
         if( (flags & cv::COVAR_USE_AVG) != 0 )
         {
             CV_Assert( _mean.size() == size );
+            Mat mean0 = _mean.getMat();
 
-            if( mean.type() != ctype )
+            if( mean0.isContinuous() && mean0.type() == ctype )
+                mean = mean0.reshape(1, 1);
+            else
             {
-                mean = _mean.getMat();
-                _mean.create(mean.size(), ctype);
-                Mat tmp = _mean.getMat();
-                mean.convertTo(tmp, ctype);
-                mean = tmp;
+                mean0.convertTo(mean, ctype);
+                mean = mean.reshape(1, 1);
             }
-
-            mean = _mean.getMat().reshape(1, 1);
         }
 
         calcCovarMatrix( _data, _covar, mean, (flags & ~(cv::COVAR_ROWS|cv::COVAR_COLS)) | cv::COVAR_ROWS, ctype );
@@ -932,59 +937,59 @@ void mulTransposed(InputArray _src, OutputArray _dst, bool ata,
 *                                      Dot Product                                       *
 \****************************************************************************************/
 
-static double dotProd_8u(const uchar* src1, const uchar* src2, int len)
+static double dotProd_8u(const void* src1, const void* src2, int len)
 {
     CV_INSTRUMENT_REGION();
-    CV_CPU_DISPATCH(dotProd_8u, (src1, src2, len),
+    CV_CPU_DISPATCH(dotProd_8u, ((const uchar*)src1, (const uchar*)src2, len),
         CV_CPU_DISPATCH_MODES_ALL);
 }
-static double dotProd_8s(const schar* src1, const schar* src2, int len)
+static double dotProd_8s(const void* src1, const void* src2, int len)
 {
     CV_INSTRUMENT_REGION();
-    CV_CPU_DISPATCH(dotProd_8s, (src1, src2, len),
+    CV_CPU_DISPATCH(dotProd_8s, ((const schar*)src1, (const schar*)src2, len),
         CV_CPU_DISPATCH_MODES_ALL);
 }
-static double dotProd_16u(const ushort* src1, const ushort* src2, int len)
+static double dotProd_16u(const void* src1, const void* src2, int len)
 {
     CV_INSTRUMENT_REGION();
-    CV_CPU_DISPATCH(dotProd_16u, (src1, src2, len),
+    CV_CPU_DISPATCH(dotProd_16u, ((const ushort*)src1, (const ushort*)src2, len),
         CV_CPU_DISPATCH_MODES_ALL);
 }
-static double dotProd_16s(const short* src1, const short* src2, int len)
+static double dotProd_16s(const void* src1, const void* src2, int len)
 {
     CV_INSTRUMENT_REGION();
-    CV_CPU_DISPATCH(dotProd_16s, (src1, src2, len),
+    CV_CPU_DISPATCH(dotProd_16s, ((const short*)src1, (const short*)src2, len),
         CV_CPU_DISPATCH_MODES_ALL);
 }
-static double dotProd_32s(const int* src1, const int* src2, int len)
+static double dotProd_32s(const void* src1, const void* src2, int len)
 {
     CV_INSTRUMENT_REGION();
-    CV_CPU_DISPATCH(dotProd_32s, (src1, src2, len),
+    CV_CPU_DISPATCH(dotProd_32s, ((const int*)src1, (const int*)src2, len),
         CV_CPU_DISPATCH_MODES_ALL);
 }
-static double dotProd_32f(const float* src1, const float* src2, int len)
+static double dotProd_32f(const void* src1, const void* src2, int len)
 {
     CV_INSTRUMENT_REGION();
-    CV_CPU_DISPATCH(dotProd_32f, (src1, src2, len),
+    CV_CPU_DISPATCH(dotProd_32f, ((const float*)src1, (const float*)src2, len),
         CV_CPU_DISPATCH_MODES_ALL);
 }
-static double dotProd_64f(const double* src1, const double* src2, int len)
+static double dotProd_64f(const void* src1, const void* src2, int len)
 {
     CV_INSTRUMENT_REGION();
-    CV_CPU_DISPATCH(dotProd_64f, (src1, src2, len),
+    CV_CPU_DISPATCH(dotProd_64f, ((const double*)src1, (const double*)src2, len),
         CV_CPU_DISPATCH_MODES_ALL);
 }
 
-typedef double (*DotProdFunc)(const uchar* src1, const uchar* src2, int len);
+typedef double (*DotProdFunc)(const void* src1, const void* src2, int len);
 
 static DotProdFunc getDotProdFunc(int depth)
 {
     static DotProdFunc dotProdTab[CV_DEPTH_MAX] =
     {
-        (DotProdFunc)GET_OPTIMIZED(dotProd_8u), (DotProdFunc)GET_OPTIMIZED(dotProd_8s),
-        (DotProdFunc)dotProd_16u, (DotProdFunc)dotProd_16s,
-        (DotProdFunc)dotProd_32s, (DotProdFunc)GET_OPTIMIZED(dotProd_32f),
-        (DotProdFunc)dotProd_64f, 0
+        dotProd_8u, dotProd_8s,
+        dotProd_16u, dotProd_16s,
+        dotProd_32s, dotProd_32f,
+        dotProd_64f, 0
     };
 
     return dotProdTab[depth];

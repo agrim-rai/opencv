@@ -884,6 +884,70 @@ TEST(Core_InputOutput, filestorage_nd_matrix_too_many_dims)
     EXPECT_ANY_THROW(fs["sm"] >> sm);
 }
 
+TEST(Core_InputOutput, filestorage_sparse_matrix_bad_index)
+{
+    // write() delta-compresses the element indices: a negative entry in "data"
+    // is the first dimension that changed, stored as k - dims + 1. read()
+    // recovered it as dims + k - 1 without a lower bound, so a value below
+    // 1 - dims gave a negative index into the idx[CV_MAX_DIM] stack buffer.
+    {
+        const std::string content =
+            "%YAML:1.0\n---\n"
+            "sm: !!opencv-sparse-matrix\n"
+            "   sizes: [ 4, 5 ]\n"
+            "   dt: f\n"
+            "   data: [ 0, 1, 1., -6, 0, 0, 0, 0, 0, 0, 1, 2. ]\n";
+
+        FileStorage fs(content, FileStorage::READ | FileStorage::MEMORY);
+        SparseMat sm;
+        EXPECT_ANY_THROW(fs["sm"] >> sm);
+    }
+
+    // An index component outside the sizes of the same node was accepted, so the
+    // returned SparseMat held elements outside its own dims and copyTo() wrote
+    // them past the end of the dense Mat.
+    {
+        const std::string content =
+            "%YAML:1.0\n---\n"
+            "sm: !!opencv-sparse-matrix\n"
+            "   sizes: [ 4, 5 ]\n"
+            "   dt: f\n"
+            "   data: [ 0, 4000, 7. ]\n";
+
+        FileStorage fs(content, FileStorage::READ | FileStorage::MEMORY);
+        SparseMat sm;
+        EXPECT_ANY_THROW(fs["sm"] >> sm);
+    }
+
+    // well-formed sparse matrices still round-trip
+    const int sizes[] = { 7, 5, 4 };
+    for (int dims = 1; dims <= 3; dims++)
+    {
+        SparseMat sm(dims, sizes, CV_32F);
+        RNG& rng = theRNG();
+        for (int i = 0; i < 40; i++)
+        {
+            int idx[3];
+            for (int j = 0; j < dims; j++)
+                idx[j] = (int)rng.uniform(0, sizes[j]);
+            sm.ref<float>(idx) = (float)i + 1.f;
+        }
+
+        FileStorage fs_out(".yml", FileStorage::WRITE | FileStorage::MEMORY);
+        fs_out << "sm" << sm;
+
+        FileStorage fs_in(fs_out.releaseAndGetString(), FileStorage::READ | FileStorage::MEMORY);
+        SparseMat sm2;
+        ASSERT_NO_THROW(fs_in["sm"] >> sm2);
+        EXPECT_EQ(sm.nzcount(), sm2.nzcount());
+
+        Mat dense, dense2;
+        sm.copyTo(dense);
+        sm2.copyTo(dense2);
+        EXPECT_EQ(0, cvtest::norm(dense, dense2, NORM_INF));
+    }
+}
+
 TEST(Core_InputOutput, filestorage_matrix_dt_too_long)
 {
     // A "dt" string with many distinct adjacent types makes decodeFormat()
@@ -1080,6 +1144,21 @@ TEST(Core_InputOutput, filestorage_json_comment)
     });
 
     EXPECT_EQ(str, String("value"));
+}
+
+TEST(Core_InputOutput, filestorage_json_escape_string)
+{
+    const String value = "O'Reilly\x01";
+    FileStorage writer("test.json", FileStorage::WRITE | FileStorage::MEMORY);
+    writer << "text" << value;
+    const String json = writer.releaseAndGetString();
+
+    EXPECT_NE(String::npos, json.find("\"text\": \"O'Reilly\\u0001\""));
+
+    FileStorage reader(json, FileStorage::READ | FileStorage::MEMORY);
+    String restored;
+    reader["text"] >> restored;
+    EXPECT_EQ(value, restored);
 }
 
 TEST(Core_InputOutput, filestorage_utf8_bom)
@@ -1801,6 +1880,61 @@ TEST(Core_InputOutput, FileStorage_json_unicode_escape)
     fs.release();
 }
 
+
+TEST(Core_InputOutput, FileStorage_json_unicode_surrogate_pairs)
+{
+    // A \\uXXXX escape holds one UTF-16 code unit, so a character above the BMP is written as a
+    // surrogate pair and has to be recombined into one 4-byte UTF-8 sequence; encoding each half
+    // separately produces CESU-8, which is not valid UTF-8.
+    // Written with doubled backslashes in a normal literal on purpose: in a raw string the
+    // escapes are easy to decode before the parser ever sees them, which silently voids the test.
+    std::string test =
+        "{"
+        "\"first_supplementary\": \"\\uD800\\uDC00\","
+        "\"emoji\": \"\\uD83D\\uDE00\","
+        "\"last_valid\": \"\\uDBFF\\uDFFF\","
+        "\"bmp_max\": \"\\uFFFF\","
+        "\"embedded\": \"a\\uD83D\\uDE00b\","
+        "\"\\uD83D\\uDE00\": \"key_is_a_surrogate_pair\""
+        "}";
+    ASSERT_NE(test.find("\\u"), std::string::npos) << "escapes were decoded before the parser";
+
+    FileStorage fs(test, FileStorage::READ | FileStorage::MEMORY | FileStorage::FORMAT_JSON);
+
+    EXPECT_EQ((std::string)fs["first_supplementary"], "\xF0\x90\x80\x80");  // U+10000
+    EXPECT_EQ((std::string)fs["emoji"], "\xF0\x9F\x98\x80");                // U+1F600
+    EXPECT_EQ((std::string)fs["last_valid"], "\xF4\x8F\xBF\xBF");           // U+10FFFF
+    EXPECT_EQ((std::string)fs["bmp_max"], "\xEF\xBF\xBF");   // U+FFFF stays 3-byte
+    EXPECT_EQ((std::string)fs["embedded"], "a\xF0\x9F\x98\x80" "b");
+    // Keys go through the same escape handling as values.
+    EXPECT_EQ((std::string)fs["\xF0\x9F\x98\x80"], "key_is_a_surrogate_pair");
+
+    fs.release();
+}
+
+TEST(Core_InputOutput, FileStorage_json_unicode_malformed_surrogates)
+{
+    // Half a pair names no character, and a lone surrogate cannot be encoded in UTF-8 at all,
+    // so these are rejected instead of becoming CESU-8 bytes.
+    const char* bad[] = {
+        "{\"v\": \"\\uD83D\"}",         // high surrogate, nothing after it
+        "{\"v\": \"\\uDE00\"}",         // low surrogate on its own
+        "{\"v\": \"\\uD83Dx\"}",        // high surrogate then a plain character
+        "{\"v\": \"\\uD83D\\un\"}",      // high surrogate then a non-\\u escape
+        "{\"v\": \"\\uD83D\\u0041\"}",   // high surrogate then a BMP escape
+        "{\"v\": \"\\uD83D\\uD83D\"}",   // two high surrogates
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+    {
+        SCOPED_TRACE(cv::format("case %d: %s", (int)i, bad[i]));
+        EXPECT_ANY_THROW({
+            FileStorage fs(bad[i], FileStorage::READ | FileStorage::MEMORY | FileStorage::FORMAT_JSON);
+            std::string unused = (std::string)fs["v"];
+            (void)unused;
+        });
+    }
+}
+
 TEST(Core_InputOutput, FileStorage_free_file_after_exception)
 {
     const std::string fileName = cv::tempfile("FileStorage_free_file_after_exception_test.yml");
@@ -2143,6 +2277,36 @@ TEST(Core_InputOutput, FileStorage_invalid_path_regression_21448_JSON)
     fs.release();
 }
 
+TEST(Core_InputOutput, FileStorage_recursion_depth_limit_29939_XML)
+{
+    const int N = 2000; // well past CV_PERSISTENCE_MAX_DEPTH, small enough to run fast
+    std::string open_tags, close_tags;
+    for (int i = 0; i < N; i++) { open_tags += "<a>"; close_tags += "</a>"; }
+    std::string content = "<?xml version=\"1.0\"?>\n<opencv_storage>\n"
+        + open_tags + "1" + close_tags + "\n</opencv_storage>\n";
+
+    EXPECT_THROW(FileStorage(content, FileStorage::READ | FileStorage::MEMORY), cv::Exception);
+}
+
+TEST(Core_InputOutput, FileStorage_recursion_depth_limit_29939_YAML)
+{
+    const int N = 2000;
+    std::string content = "%YAML:1.0\n---\n" + std::string(N, '[') + std::string(N, ']') + "\n";
+
+    EXPECT_THROW(FileStorage(content, FileStorage::READ | FileStorage::MEMORY), cv::Exception);
+}
+
+TEST(Core_InputOutput, FileStorage_recursion_depth_limit_29939_JSON)
+{
+    const int N = 2000;
+    std::string content;
+    for (int i = 0; i < N; i++) content += "{\"a\":";
+    content += "1";
+    for (int i = 0; i < N; i++) content += "}";
+    content += "\n";
+
+    EXPECT_THROW(FileStorage(content, FileStorage::READ | FileStorage::MEMORY), cv::Exception);
+}
 // see https://github.com/opencv/opencv/issues/25073
 typedef testing::TestWithParam< std::string > Core_InputOutput_regression_25073;
 
@@ -2469,6 +2633,57 @@ TEST(Core_InputOutput, YAML_Compatibility)
     }
 
     remove(filename.c_str());
+}
+
+TEST(Core_InputOutput, filestorage_read_uppercase_exponent)
+{
+    // JSON, YAML and XML all allow an upper-case exponent marker. A number whose
+    // mantissa has no '.' was only read as a real for a lower-case 'e', so "1E5"
+    // was read as the integer 1 followed by stray "E5".
+    const char* contents[] = {
+        "{\n  \"a\": 1E5,\n  \"b\": -3E-2,\n  \"c\": 1e5\n}\n",
+        "%YAML:1.0\n---\na: 1E5\nb: -3E-2\nc: 1e5\n",
+        "<?xml version=\"1.0\"?>\n<opencv_storage>\n<a>1E5</a>\n<b>-3E-2</b>\n<c>1e5</c>\n</opencv_storage>\n",
+    };
+    for (const char* content : contents)
+    {
+        SCOPED_TRACE(content);
+        double a = 0, b = 0, c = 0;
+        ASSERT_NO_THROW({
+            FileStorage fs(content, FileStorage::READ | FileStorage::MEMORY);
+            EXPECT_TRUE(fs["a"].isReal());
+            fs["a"] >> a;
+            fs["b"] >> b;
+            fs["c"] >> c;
+        });
+        EXPECT_EQ(1e5, a);
+        EXPECT_EQ(-3e-2, b);
+        EXPECT_EQ(1e5, c);
+    }
+}
+
+// CV_32U values above INT_MAX must survive saving and loading, in every format
+TEST(Core_InputOutput, filestorage_32u_large_values)
+{
+    const unsigned values[] = { 0u, 1u, 2147483647u, 2147483648u, 4294967295u };
+    const Mat src(1, 5, CV_32U, (void*)values);
+
+    for (const char* ext : { ".yml", ".xml", ".json" })
+    {
+        for (int base64 : { 0, (int)FileStorage::WRITE_BASE64 })
+        {
+            FileStorage writer(ext, FileStorage::WRITE | FileStorage::MEMORY | base64);
+            writer << "m" << src;
+            const std::string text = writer.releaseAndGetString();
+
+            FileStorage reader(text, FileStorage::READ | FileStorage::MEMORY);
+            Mat dst;
+            reader["m"] >> dst;
+
+            EXPECT_EQ(CV_32U, dst.type()) << ext << " base64=" << base64;
+            EXPECT_EQ(0, cv::norm(src, dst, NORM_INF)) << ext << " base64=" << base64;
+        }
+    }
 }
 
 }} // namespace

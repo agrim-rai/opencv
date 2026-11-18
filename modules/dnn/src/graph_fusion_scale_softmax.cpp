@@ -40,7 +40,7 @@ struct ModelFusionScaleSoftmax
 
     bool fuseGraph(Ptr<Graph>& graph)
     {
-        const vector<Ptr<Layer>>& prog = graph->prog();
+        const vector<Ptr<LayerInfo>>& prog = graph->prog();
         size_t nops = prog.size();
         bool modified = false;
 
@@ -53,12 +53,9 @@ struct ModelFusionScaleSoftmax
             }
         }
 
+        // Graph outputs count as uses, so a producer that is one never reaches zero.
         vector<int> usecounts;
         netimpl->useCounts(usecounts);
-
-        std::set<int> externalArgs;
-        for (Arg out : graph->outputs())
-            externalArgs.insert(out.idx);
 
         std::map<int, int> producer;
         for (size_t i = 0; i < nops; i++) {
@@ -70,7 +67,7 @@ struct ModelFusionScaleSoftmax
         vector<bool> dropped(nops, false);
 
         for (size_t i = 0; i < nops; i++) {
-            const Ptr<Layer>& layer = prog[i];
+            const Ptr<LayerInfo>& layer = prog[i];
             if (!layer || dropped[i]) continue;
 
             SoftmaxLayer* sm = dynamic_cast<SoftmaxLayer*>(layer.get());
@@ -83,7 +80,7 @@ struct ModelFusionScaleSoftmax
             int prod_idx = it->second;
             if (prod_idx < 0 || dropped[prod_idx]) continue;
 
-            const Ptr<Layer>& pl = prog[prod_idx];
+            const Ptr<LayerInfo>& pl = prog[prod_idx];
             NaryEltwiseLayer* elt = dynamic_cast<NaryEltwiseLayer*>(pl.get());
             if (!elt) continue;
             const auto op = elt->op;
@@ -111,19 +108,22 @@ struct ModelFusionScaleSoftmax
             }
             if (!std::isfinite(scalar)) continue;
 
-            bool single_consumer = usecounts[sm_in.idx] == 1
-                                && externalArgs.count(sm_in.idx) == 0;
-            if (!single_consumer) continue;
-
             sm->scale *= scalar;
-            layer->inputs[0] = pl->inputs[x_slot];
-            dropped[prod_idx] = true;
-            usecounts[sm_in.idx] = 0;
+            // A shared Mul/Div stays until its last consumer has folded it.
+            Arg src = pl->inputs[x_slot];
+            layer->inputs[0] = src;
+            usecounts[src.idx]++;
+            if (--usecounts[sm_in.idx] == 0) {
+                dropped[prod_idx] = true;
+                for (Arg a : pl->inputs)
+                    if (a.idx > 0)
+                        usecounts[a.idx]--;
+            }
             modified = true;
         }
 
         if (modified) {
-            vector<Ptr<Layer>> newprog;
+            vector<Ptr<LayerInfo>> newprog;
             newprog.reserve(nops);
             for (size_t i = 0; i < nops; i++) {
                 if (!dropped[i] && prog[i])

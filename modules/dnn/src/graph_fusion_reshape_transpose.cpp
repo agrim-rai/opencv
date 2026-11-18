@@ -16,6 +16,7 @@
 
 #include "precomp.hpp"
 #include "net_impl.hpp"
+#include "layers/layers_common.hpp"
 
 namespace cv { namespace dnn {
 CV__DNN_INLINE_NS_BEGIN
@@ -44,9 +45,28 @@ struct ModelFusionReshapeTranspose
         return true;
     }
 
+    // A 0 in an ONNX reshape spec means "keep the input's dim here", so the Reshape depends
+    // on what feeds it and its producer cannot be dropped. An unreadable spec counts too.
+    bool shapeSpecCopiesInputDims(const Reshape2Layer* rs) const
+    {
+        MatShape spec = rs->newShapeDesc;
+        if (spec.dims < 0) {
+            if (rs->inputs.size() != 2 || !netimpl->isConstArg(rs->inputs[1]))
+                return true;
+            const Mat& t = netimpl->argTensor(rs->inputs[1]);
+            if (t.empty() || !t.isContinuous() || (t.type() != CV_32S && t.type() != CV_64S))
+                return true;
+            spec = tensorToShape(t);
+        }
+        for (int i = 0; i < spec.dims; i++)
+            if (spec[i] == 0)
+                return true;
+        return false;
+    }
+
     bool fuseGraph(Ptr<Graph>& graph)
     {
-        const vector<Ptr<Layer>>& prog = graph->prog();
+        const vector<Ptr<LayerInfo>>& prog = graph->prog();
         size_t nops = prog.size();
         bool modified = false;
 
@@ -72,7 +92,7 @@ struct ModelFusionReshapeTranspose
         vector<bool> dropped(nops, false);
 
         for (size_t i = 0; i < nops; i++) {
-            const Ptr<Layer>& layer = prog[i];
+            const Ptr<LayerInfo>& layer = prog[i];
             if (!layer || dropped[i]) continue;
             if (layer->inputs.empty() || layer->outputs.empty()) continue;
 
@@ -84,6 +104,11 @@ struct ModelFusionReshapeTranspose
                     redirectConsumers(prog, dropped, i + 1, out, layer->inputs[0]);
                     dropped[i] = true;
                     usecounts[out.idx] = 0;
+                    // The bypassed Transpose no longer reads its input. Without this the
+                    // producer's count never reaches 0 and it survives as a dead layer.
+                    for (Arg a : layer->inputs)
+                        if (a.idx > 0)
+                            usecounts[a.idx]--;
                     modified = true;
                     continue;
                 }
@@ -95,12 +120,9 @@ struct ModelFusionReshapeTranspose
                 if (it != producer.end()) {
                     int prod_idx = it->second;
                     if (prod_idx >= 0 && !dropped[prod_idx]) {
-                        const Ptr<Layer>& pl = prog[prod_idx];
+                        const Ptr<LayerInfo>& pl = prog[prod_idx];
                         TransposeLayer* prevTr = dynamic_cast<TransposeLayer*>(pl.get());
-                        Arg prevOut = layer->inputs[0];
-                        bool single_consumer = usecounts[prevOut.idx] == 1
-                                            && externalArgs.count(prevOut.idx) == 0;
-                        if (prevTr && pl->outputs.size() == 1 && single_consumer
+                        if (prevTr && pl->outputs.size() == 1
                             && !prevTr->perm.empty()
                             && prevTr->perm.size() == tr->perm.size())
                         {
@@ -116,9 +138,7 @@ struct ModelFusionReshapeTranspose
                             }
                             if (ok) {
                                 tr->perm = composed;
-                                layer->inputs[0] = pl->inputs[0];
-                                dropped[prod_idx] = true;
-                                usecounts[prevOut.idx] = 0;
+                                bypassProducer(layer, pl, prod_idx, dropped);
                                 producer[layer->outputs[0].idx] = (int)i;
                                 modified = true;
                                 continue;
@@ -130,21 +150,16 @@ struct ModelFusionReshapeTranspose
 
             //Reshape + Reshape -> Reshape (drop the inner reshape).
             Reshape2Layer* rs = dynamic_cast<Reshape2Layer*>(layer.get());
-            if (rs && layer->outputs.size() == 1) {
+            if (rs && layer->outputs.size() == 1 && !shapeSpecCopiesInputDims(rs)) {
                 auto it = producer.find(layer->inputs[0].idx);
                 if (it != producer.end()) {
                     int prod_idx = it->second;
                     if (prod_idx >= 0 && !dropped[prod_idx]) {
-                        const Ptr<Layer>& pl = prog[prod_idx];
+                        const Ptr<LayerInfo>& pl = prog[prod_idx];
                         Reshape2Layer* prevRs = dynamic_cast<Reshape2Layer*>(pl.get());
-                        Arg prevOut = layer->inputs[0];
-                        bool single_consumer = usecounts[prevOut.idx] == 1
-                                            && externalArgs.count(prevOut.idx) == 0;
-                        if (prevRs && pl->outputs.size() == 1 && single_consumer)
+                        if (prevRs && pl->outputs.size() == 1)
                         {
-                            layer->inputs[0] = pl->inputs[0];
-                            dropped[prod_idx] = true;
-                            usecounts[prevOut.idx] = 0;
+                            bypassProducer(layer, pl, prod_idx, dropped);
                             modified = true;
                             continue;
                         }
@@ -154,7 +169,7 @@ struct ModelFusionReshapeTranspose
         }
 
         if (modified) {
-            vector<Ptr<Layer>> newprog;
+            vector<Ptr<LayerInfo>> newprog;
             newprog.reserve(nops);
             for (size_t i = 0; i < nops; i++) {
                 if (!dropped[i] && prog[i])
@@ -166,7 +181,22 @@ struct ModelFusionReshapeTranspose
         return modified;
     }
 
-    void redirectConsumers(const vector<Ptr<Layer>>& prog,
+    // Feed the consumer from the producer's input; the producer goes once nothing else reads it.
+    void bypassProducer(const Ptr<LayerInfo>& consumer, const Ptr<LayerInfo>& pl,
+                        int prod_idx, vector<bool>& dropped)
+    {
+        Arg out = consumer->inputs[0], src = pl->inputs[0];
+        consumer->inputs[0] = src;
+        usecounts[src.idx]++;
+        if (--usecounts[out.idx] == 0) {
+            dropped[prod_idx] = true;
+            for (Arg a : pl->inputs)
+                if (a.idx > 0)
+                    usecounts[a.idx]--;
+        }
+    }
+
+    void redirectConsumers(const vector<Ptr<LayerInfo>>& prog,
                            const vector<bool>& dropped,
                            size_t start_idx, Arg from, Arg to)
     {

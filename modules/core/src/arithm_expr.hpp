@@ -181,7 +181,7 @@ CV_EXPORTS TKernel getHypotFunc(int T, int R);               // OP_HYPOT, T x T 
 CV_EXPORTS TKernel getAtan2Func(int T, int R);               // OP_ATAN2, T x T -> T (float depths)
 CV_EXPORTS TKernel getCmpFunc(TOp op, int T);                // T x T -> u8 mask (op = OP_CMP_*)
 CV_EXPORTS TKernel getBitwiseFunc(TOp op, int esz);          // OP_AND / OP_OR / OP_XOR, by element size
-CV_EXPORTS TKernel getNotFunc(int esz);                      // OP_NOT, by element size
+CV_EXPORTS TKernel getNotFunc(int depth);                    // OP_NOT, by element size (CV_Bool: logical NOT)
 CV_EXPORTS TKernel getAddWeightedFunc(int T, int R);         // OP_ADDW, a*alpha+b*beta+gamma (T x T -> R)
 CV_EXPORTS TKernel getSelectFunc(int mdepth, int T);         // OP_SELECT: 1-byte mask, a/b/dst of T
 CV_EXPORTS TKernel getClampFunc(int T);                      // OP_CLAMP: min(max(x, lo), hi), all of T
@@ -236,6 +236,12 @@ struct CV_EXPORTS TExpr
         // units. A per-channel scalar of any width is carried this way (no 4-channel Scalar limit).
         int srcdepth = EW_DEPTH_NONE;
         size_t constofs = 0;
+        // Set on a value the parser bound to a name ("t = ...;"). Such a value may be referenced
+        // any number of times later, so the two retire-the-slot manoeuvres (moveToOutput's MOVE and
+        // emitUnary's abs(x-y) peephole) must leave it alone: they reclassify the slot to NONE,
+        // which a later reference would then read as the reserved empty operand. Both take their
+        // non-destructive path (a copy / the plain absdiff form) when this is set.
+        bool pinned = false;
     };
 
     // One compiled instruction: the op + arg-table indices + a resolved kernel (TKernel: fptr +

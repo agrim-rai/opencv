@@ -1,0 +1,538 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
+#include "precomp.hpp"
+
+#ifdef HAVE_OPENCV_DNN
+
+#include <cfloat>
+#include <cmath>
+#include <numeric>
+
+namespace cv {
+
+using namespace dnn;
+
+namespace {
+
+static const int kXFeatDescriptorSize = 64;
+static const std::vector<String> kXFeatOutputNames =
+{
+    "output_feats",
+    "output_keypoints",
+    "output_heatmap"
+};
+
+struct XFeatCandidate
+{
+    Point2f ptPadded;
+    Point2f pt;
+    float score;
+};
+
+static Mat toGray(InputArray _image)
+{
+    Mat image = _image.getMat();
+    if (image.channels() == 1)
+        return image;
+
+    Mat gray;
+    if (image.channels() == 3)
+        cvtColor(image, gray, COLOR_BGR2GRAY);
+    else if (image.channels() == 4)
+        cvtColor(image, gray, COLOR_BGRA2GRAY);
+    else
+        CV_Error(Error::StsBadArg, "XFeat expects a grayscale, BGR, or BGRA image");
+    return gray;
+}
+
+static Mat toNCHW(const Mat& blob, int channelsHint)
+{
+    CV_Assert(blob.dims == 4);
+    if (blob.size[1] == channelsHint)
+        return blob;
+
+    CV_Assert(blob.size[3] == channelsHint);
+    Mat out;
+    Mat src = blob.isContinuous() ? blob : blob.clone();
+    cv::transpose(src, {0, 3, 1, 2}, out);
+    return out;
+}
+
+static float mapCoordinate(float position, int mapSize, int inputSize)
+{
+    return position * static_cast<float>(mapSize) / static_cast<float>(inputSize - 1) - 0.5f;
+}
+
+static float valueOrZero(const Mat& map, int x, int y)
+{
+    if (x < 0 || y < 0 || x >= map.cols || y >= map.rows)
+        return 0.0f;
+    return map.at<float>(y, x);
+}
+
+static float sampleNearest(const Mat& map, float x, float y, int normW, int normH)
+{
+    CV_Assert(map.type() == CV_32F);
+    if (map.empty() || normW <= 1 || normH <= 1)
+        return 0.0f;
+
+    return valueOrZero(map, cvRound(mapCoordinate(x, map.cols, normW)),
+                       cvRound(mapCoordinate(y, map.rows, normH)));
+}
+
+static float sampleBilinear(const Mat& map, float x, float y, int normW, int normH)
+{
+    CV_Assert(map.type() == CV_32F);
+    if (map.empty() || normW <= 1 || normH <= 1)
+        return 0.0f;
+
+    const float fx = mapCoordinate(x, map.cols, normW);
+    const float fy = mapCoordinate(y, map.rows, normH);
+    const int x0 = cvFloor(fx);
+    const int y0 = cvFloor(fy);
+    const float dx = fx - x0;
+    const float dy = fy - y0;
+
+    return (1.f - dx) * (1.f - dy) * valueOrZero(map, x0, y0) +
+           dx * (1.f - dy) * valueOrZero(map, x0 + 1, y0) +
+           (1.f - dx) * dy * valueOrZero(map, x0, y0 + 1) +
+           dx * dy * valueOrZero(map, x0 + 1, y0 + 1);
+}
+
+static void cubicWeights(float t, float weights[4])
+{
+    const float A = -0.75f;
+    const float t1 = t + 1.f;
+    const float t2 = 1.f - t;
+    const float t3 = 2.f - t;
+    weights[0] = ((A * t1 - 5.f * A) * t1 + 8.f * A) * t1 - 4.f * A;
+    weights[1] = ((A + 2.f) * t - (A + 3.f)) * t * t + 1.f;
+    weights[2] = ((A + 2.f) * t2 - (A + 3.f)) * t2 * t2 + 1.f;
+    weights[3] = ((A * t3 - 5.f * A) * t3 + 8.f * A) * t3 - 4.f * A;
+}
+
+// The 4x4 pixels around one bicubic sample and their separable weights: xofs is the column and
+// yofs the row start offset (row * width) within a channel plane. A pixel outside the map gets
+// offset 0 and weight 0, so sampling needs no bounds checks as long as the map is not empty.
+struct BicubicNeighborhood
+{
+    int xofs[4];
+    int yofs[4];
+    float wx[4];
+    float wy[4];
+};
+
+static BicubicNeighborhood buildBicubicNeighborhood(float x, float y, int mapW, int mapH,
+                                                    int normW, int normH)
+{
+    const float fx = mapCoordinate(x, mapW, normW);
+    const float fy = mapCoordinate(y, mapH, normH);
+    const int x0 = cvFloor(fx);
+    const int y0 = cvFloor(fy);
+    BicubicNeighborhood neighborhood;
+    cubicWeights(fx - x0, neighborhood.wx);
+    cubicWeights(fy - y0, neighborhood.wy);
+    for (int k = 0; k < 4; ++k)
+    {
+        const int col = x0 - 1 + k;
+        const int row = y0 - 1 + k;
+        const bool colInside = col >= 0 && col < mapW;
+        const bool rowInside = row >= 0 && row < mapH;
+        neighborhood.xofs[k] = colInside ? col : 0;
+        neighborhood.yofs[k] = rowInside ? row * mapW : 0;
+        if (!colInside)
+            neighborhood.wx[k] = 0.f;
+        if (!rowInside)
+            neighborhood.wy[k] = 0.f;
+    }
+    return neighborhood;
+}
+
+static float sampleBicubic(const float* plane, const BicubicNeighborhood& neighborhood)
+{
+    float value = 0.f;
+    for (int j = 0; j < 4; ++j)
+    {
+        const float* row = plane + neighborhood.yofs[j];
+        float rowSum = 0.f;
+        for (int i = 0; i < 4; ++i)
+            rowSum += neighborhood.wx[i] * row[neighborhood.xofs[i]];
+        value += neighborhood.wy[j] * rowSum;
+    }
+    return value;
+}
+
+static Mat l2NormalizeAcrossChannels(const Mat& blob)
+{
+    CV_Assert(blob.dims == 4 && blob.size[0] == 1 && blob.type() == CV_32F && blob.isContinuous());
+    const int channels = blob.size[1];
+    const int area = blob.size[2] * blob.size[3];
+    const Mat planes(channels, area, CV_32F, const_cast<float*>(blob.ptr<float>()));
+    Mat norms;
+    reduce(planes, norms, 0, REDUCE_SUM2, CV_32F);
+    sqrt(norms, norms);
+    max(norms, 1e-12, norms);
+    Mat normalized(channels, area, CV_32F);
+    for (int ch = 0; ch < channels; ++ch)
+        divide(planes.row(ch), norms, normalized.row(ch));
+    return normalized;
+}
+
+} // namespace
+
+class XFeat_Impl CV_FINAL : public XFeat
+{
+public:
+    XFeat_Impl(const String& modelPath, int maxKeypoints, float scoreThreshold,
+               const Size& inputSize, int backendId, int targetId)
+        : maxKeypoints_(maxKeypoints),
+          scoreThreshold_(scoreThreshold),
+          inputSize_(inputSize)
+    {
+        CV_Assert(inputSize_.width > 0 && inputSize_.height > 0);
+        initNet(readNetFromONNX(modelPath), backendId, targetId);
+    }
+
+    XFeat_Impl(const std::vector<uchar>& bufferModel, int maxKeypoints, float scoreThreshold,
+               const Size& inputSize, int backendId, int targetId)
+        : maxKeypoints_(maxKeypoints),
+          scoreThreshold_(scoreThreshold),
+          inputSize_(inputSize)
+    {
+        CV_Assert(inputSize_.width > 0 && inputSize_.height > 0);
+        initNet(readNetFromONNX(bufferModel), backendId, targetId);
+    }
+
+    void detectAndCompute(InputArray _image, InputArray _mask,
+                          std::vector<KeyPoint>& keypoints,
+                          OutputArray _descriptors,
+                          bool useProvidedKeypoints) CV_OVERRIDE
+    {
+        CV_Assert(!useProvidedKeypoints && "XFeat does not support providing keypoints externally");
+
+        keypoints.clear();
+
+        Mat image = _image.getMat();
+        if (image.empty())
+        {
+            if (_descriptors.needed())
+                _descriptors.release();
+            return;
+        }
+
+        Mat mask = _mask.getMat();
+        if (!mask.empty())
+        {
+            CV_Assert(mask.type() == CV_8UC1 || mask.type() == CV_BoolC1);
+            CV_Assert(mask.size() == image.size());
+        }
+
+        Mat gray = toGray(image);
+        const float scaleX = static_cast<float>(inputSize_.width) / static_cast<float>(gray.cols);
+        const float scaleY = static_cast<float>(inputSize_.height) / static_cast<float>(gray.rows);
+        const float scale = std::min(scaleX, scaleY);
+        // Mirror the DNN_PMODE_LETTERBOX arithmetic of blobFromImageWithParams (truncation, centred
+        // padding) so the inverse mapping below uses the resized size dnn actually produced.
+        const int resizedW = std::max(1, static_cast<int>(static_cast<float>(gray.cols) * scale));
+        const int resizedH = std::max(1, static_cast<int>(static_cast<float>(gray.rows) * scale));
+        const int padX = (inputSize_.width - resizedW) / 2;
+        const int padY = (inputSize_.height - resizedH) / 2;
+        // Exact per-axis inverse of that resize, rather than the nominal 1 / scale.
+        const float invScaleX = static_cast<float>(gray.cols) / static_cast<float>(resizedW);
+        const float invScaleY = static_cast<float>(gray.rows) / static_cast<float>(resizedH);
+
+        Mat blob;
+        Image2BlobParams blobParams;
+        blobParams.scalefactor = Scalar::all(1.0 / 255.0);
+        blobParams.size = inputSize_;
+        blobParams.mean = Scalar();
+        blobParams.swapRB = false;
+        blobParams.ddepth = CV_32F;
+        blobParams.datalayout = DNN_LAYOUT_NCHW;
+        blobParams.paddingmode = DNN_PMODE_LETTERBOX;
+        blobParams.borderValue = Scalar();
+        blobParams.interpolation = cv::INTER_LINEAR_EXACT;
+        blobFromImageWithParams(gray, blob, blobParams);
+        net_.setInput(blob);
+
+        std::vector<Mat> outs;
+        net_.forward(outs, kXFeatOutputNames);
+        CV_Assert(outs.size() == 3);
+
+        Mat featBlob = toNCHW(outs[0], kXFeatDescriptorSize);
+        Mat kptBlob = outs[1];
+        CV_Assert(kptBlob.dims == 4);
+        if (!(kptBlob.size[1] == 64 || kptBlob.size[1] == 65))
+        {
+            CV_Assert(kptBlob.size[3] == 64 || kptBlob.size[3] == 65);
+            Mat src = kptBlob.isContinuous() ? kptBlob : kptBlob.clone();
+            cv::transpose(src, {0, 3, 1, 2}, kptBlob);
+        }
+        Mat relBlob = toNCHW(outs[2], 1);
+        CV_Assert(featBlob.dims == 4 && kptBlob.dims == 4 && relBlob.dims == 4);
+        if (!featBlob.isContinuous())
+            featBlob = featBlob.clone();
+        if (!kptBlob.isContinuous())
+            kptBlob = kptBlob.clone();
+        if (!relBlob.isContinuous())
+            relBlob = relBlob.clone();
+
+        const int featH = featBlob.size[2];
+        const int featW = featBlob.size[3];
+        const int kptC = kptBlob.size[1];
+        const int kptH = kptBlob.size[2];
+        const int kptW = kptBlob.size[3];
+        CV_Assert(featBlob.size[1] == kXFeatDescriptorSize && (kptC == 64 || kptC == 65));
+
+        Mat reliability(relBlob.size[2], relBlob.size[3], CV_32F, relBlob.ptr<float>());
+        Mat heatmap = Mat::zeros(kptH * 8, kptW * 8, CV_32F);
+        const float* kptPtr = kptBlob.ptr<float>();
+        const int kptHW = kptH * kptW;
+
+        parallel_for_(Range(0, kptH), [&](const Range& range)
+        {
+            for (int y = range.start; y < range.end; ++y)
+            {
+                for (int x = 0; x < kptW; ++x)
+                {
+                    const int offset = y * kptW + x;
+                    float maxLogit = -FLT_MAX;
+                    for (int ch = 0; ch < kptC; ++ch)
+                        maxLogit = std::max(maxLogit, kptPtr[ch * kptHW + offset]);
+
+                    float sumExp = 0.f;
+                    float logits[64];
+                    float probs[64];
+                    for (int ch = 0; ch < 64; ++ch)
+                        logits[ch] = kptPtr[ch * kptHW + offset] - maxLogit;
+#if (defined(CV_SIMD) && CV_SIMD) || (defined(CV_SIMD_SCALABLE) && CV_SIMD_SCALABLE)
+                    const int vlanes = VTraits<v_float32>::vlanes();
+                    int ch = 0;
+                    v_float32 vSum = vx_setzero_f32();
+                    for (; ch <= 64 - vlanes; ch += vlanes)
+                    {
+                        v_float32 v = vx_load(logits + ch);
+                        v_float32 e = v_exp(v);
+                        vx_store(probs + ch, e);
+                        vSum = v_add(vSum, e);
+                    }
+                    sumExp = v_reduce_sum(vSum);
+                    for (; ch < 64; ++ch)
+                    {
+                        probs[ch] = std::exp(logits[ch]);
+                        sumExp += probs[ch];
+                    }
+#else
+                    for (int ch = 0; ch < 64; ++ch)
+                    {
+                        probs[ch] = std::exp(logits[ch]);
+                        sumExp += probs[ch];
+                    }
+#endif
+                    if (kptC == 65)
+                        sumExp += std::exp(kptPtr[64 * kptHW + offset] - maxLogit);
+                    if (sumExp <= 0.f)
+                        continue;
+
+                    for (int ch = 0; ch < 64; ++ch)
+                    {
+                        const int dy = ch / 8;
+                        const int dx = ch % 8;
+                        heatmap.at<float>(y * 8 + dy, x * 8 + dx) = probs[ch] / sumExp;
+                    }
+                }
+            }
+        });
+
+        Mat localMax;
+        dilate(heatmap, localMax, getStructuringElement(MORPH_RECT, Size(5, 5)));
+
+        std::vector<XFeatCandidate> candidates;
+        candidates.reserve(4096);
+
+        for (int y = 0; y < heatmap.rows; ++y)
+        {
+            const float* hm = heatmap.ptr<float>(y);
+            const float* mx = localMax.ptr<float>(y);
+            for (int x = 0; x < heatmap.cols; ++x)
+            {
+                const float h = hm[x];
+                if (h <= scoreThreshold_ || h != mx[x])
+                    continue;
+
+                const float xp = static_cast<float>(x);
+                const float yp = static_cast<float>(y);
+                const float score = sampleNearest(heatmap, xp, yp, inputSize_.width, inputSize_.height) *
+                                    sampleBilinear(reliability, xp, yp, inputSize_.width, inputSize_.height);
+                if (score <= 0.f)
+                    continue;
+
+                const float px = (xp - static_cast<float>(padX) + 0.5f) * invScaleX - 0.5f;
+                const float py = (yp - static_cast<float>(padY) + 0.5f) * invScaleY - 0.5f;
+                // Pixel i covers [i - 0.5, i + 0.5), so the pixel containing (px, py) is the rounded one.
+                const int ix = cvRound(px);
+                const int iy = cvRound(py);
+                if (ix < 0 || iy < 0 || ix >= image.cols || iy >= image.rows)
+                    continue;
+                if (!mask.empty() && mask.at<uchar>(iy, ix) == 0)
+                    continue;
+
+                candidates.push_back({Point2f(xp, yp), Point2f(px, py), score});
+            }
+        }
+
+        if (maxKeypoints_ > 0 && static_cast<int>(candidates.size()) > maxKeypoints_)
+        {
+            std::partial_sort(candidates.begin(), candidates.begin() + maxKeypoints_, candidates.end(),
+                [](const XFeatCandidate& a, const XFeatCandidate& b)
+                {
+                    return a.score > b.score;
+                });
+            candidates.resize(maxKeypoints_);
+        }
+
+        keypoints.reserve(candidates.size());
+        for (const XFeatCandidate& c : candidates)
+            keypoints.emplace_back(c.pt, 1.0f, -1.0f, c.score);
+
+        if (_descriptors.needed())
+        {
+            if (candidates.empty())
+            {
+                _descriptors.release();
+                return;
+            }
+
+            _descriptors.create(static_cast<int>(candidates.size()), kXFeatDescriptorSize, CV_32F);
+            Mat descriptors = _descriptors.getMat();
+            const Mat denseDescriptors = l2NormalizeAcrossChannels(featBlob);
+            const float* featPtr = denseDescriptors.ptr<float>();
+            const int featHW = featH * featW;
+
+            parallel_for_(Range(0, static_cast<int>(candidates.size())),
+                          [&](const Range& range)
+            {
+                for (int i = range.start; i < range.end; ++i)
+                {
+                    float* dst = descriptors.ptr<float>(i);
+                    const XFeatCandidate& c = candidates[i];
+                    const BicubicNeighborhood neighborhood =
+                        buildBicubicNeighborhood(c.ptPadded.x, c.ptPadded.y, featW, featH,
+                                                 inputSize_.width, inputSize_.height);
+                    for (int ch = 0; ch < kXFeatDescriptorSize; ++ch)
+                        dst[ch] = sampleBicubic(featPtr + ch * featHW, neighborhood);
+                    normalize(descriptors.row(i), descriptors.row(i), 1.0, 0.0, NORM_L2);
+                }
+            });
+        }
+    }
+
+    int descriptorSize() const CV_OVERRIDE { return kXFeatDescriptorSize; }
+    int descriptorType() const CV_OVERRIDE { return CV_32F; }
+    int defaultNorm()    const CV_OVERRIDE { return NORM_L2; }
+
+    bool empty() const CV_OVERRIDE { return net_.empty(); }
+
+    void setMaxKeypoints(int maxKeypoints) CV_OVERRIDE { maxKeypoints_ = maxKeypoints; }
+    int  getMaxKeypoints() const CV_OVERRIDE { return maxKeypoints_; }
+
+    void  setScoreThreshold(float threshold) CV_OVERRIDE { scoreThreshold_ = threshold; }
+    float getScoreThreshold() const CV_OVERRIDE { return scoreThreshold_; }
+
+    void setInputSize(const Size& inputSize) CV_OVERRIDE
+    {
+        CV_Assert(inputSize.width > 0 && inputSize.height > 0);
+        inputSize_ = inputSize;
+    }
+    Size getInputSize() const CV_OVERRIDE { return inputSize_; }
+
+    String getDefaultName() const CV_OVERRIDE { return Feature2D::getDefaultName() + ".XFeat"; }
+
+private:
+    void initNet(const Net& net, int backendId, int targetId)
+    {
+        net_ = net;
+        net_.setPreferableBackend(backendId);
+        net_.setPreferableTarget(targetId);
+
+        // Check output names once and fail early.
+        const std::vector<String> modelOutNames = net_.getUnconnectedOutLayersNames();
+        if (modelOutNames.size() != kXFeatOutputNames.size())
+        {
+            String msg = "XFeat ONNX output count mismatch: expected " +
+                         std::to_string(kXFeatOutputNames.size()) + " outputs (";
+            for (size_t i = 0; i < kXFeatOutputNames.size(); ++i)
+            {
+                msg += kXFeatOutputNames[i];
+                if (i + 1 < kXFeatOutputNames.size())
+                    msg += ", ";
+            }
+            msg += "), but model has " + std::to_string(modelOutNames.size()) + " outputs: ";
+            for (size_t i = 0; i < modelOutNames.size(); ++i)
+            {
+                msg += modelOutNames[i];
+                if (i + 1 < modelOutNames.size())
+                    msg += ", ";
+            }
+            CV_Error(Error::StsError, msg);
+        }
+
+        for (size_t i = 0; i < kXFeatOutputNames.size(); ++i)
+        {
+            bool found = false;
+            for (size_t j = 0; j < modelOutNames.size(); ++j)
+            {
+                if (modelOutNames[j] == kXFeatOutputNames[i])
+                {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found)
+            {
+                String msg = "XFeat ONNX output name mismatch: expected output '" + kXFeatOutputNames[i] +
+                             "'. Please check model outputs. Available outputs: ";
+                for (size_t j = 0; j < modelOutNames.size(); ++j)
+                {
+                    msg += modelOutNames[j];
+                    if (j + 1 < modelOutNames.size())
+                        msg += ", ";
+                }
+                CV_Error(Error::StsError, msg);
+            }
+        }
+    }
+
+    int maxKeypoints_;
+    float scoreThreshold_;
+    Size inputSize_;
+    Net net_;
+};
+
+Ptr<XFeat> XFeat::create(const String& modelPath, int maxKeypoints, float scoreThreshold,
+                         const Size& inputSize, int backendId, int targetId)
+{
+    CV_TRACE_FUNCTION();
+    return makePtr<XFeat_Impl>(modelPath, maxKeypoints, scoreThreshold,
+                               inputSize, backendId, targetId);
+}
+
+Ptr<XFeat> XFeat::create(const std::vector<uchar>& bufferModel, int maxKeypoints,
+                         float scoreThreshold, const Size& inputSize, int backendId, int targetId)
+{
+    CV_TRACE_FUNCTION();
+    return makePtr<XFeat_Impl>(bufferModel, maxKeypoints, scoreThreshold,
+                               inputSize, backendId, targetId);
+}
+
+String XFeat::getDefaultName() const
+{
+    return Feature2D::getDefaultName() + ".XFeat";
+}
+
+} // namespace cv
+
+#endif // HAVE_OPENCV_DNN

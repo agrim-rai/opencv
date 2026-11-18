@@ -41,6 +41,11 @@ TEST(Core_FP8, scalar_roundtrip_exact)
     }
     // round-to-nearest-even onto the grid
     EXPECT_EQ((float)cv::fp8_t(1.234f), 1.25f);   // 3 mantissa bits
+    // exact ties go to the even code, not away from zero
+    EXPECT_EQ((float)cv::fp8_t(1.0625f), 1.f);       // between 1.0 (even) and 1.125
+    EXPECT_EQ((float)cv::fp8_t(1.1875f), 1.25f);     // between 1.125 and 1.25 (even)
+    EXPECT_EQ((float)cv::fp8_t(-1.0625f), -1.f);
+    EXPECT_EQ((float)cv::fp8_t(0.0009765625f), 0.f); // subnormal tie -> even
 }
 
 TEST(Core_FP8, format_specific_limits)
@@ -49,14 +54,24 @@ TEST(Core_FP8, format_specific_limits)
     EXPECT_EQ((float)cv::fp8_t(448.f),   448.f);
     EXPECT_EQ((float)cv::fp8a_t(240.f), 240.f);
 
-    // overflow: these formats have no inf -> overflow to NaN
-    EXPECT_TRUE(cvIsNaN((float)cv::fp8_t(1e6f)));
-    EXPECT_TRUE(cvIsNaN((float)cv::fp8a_t(1e6f)));
-    // 448 exceeds the FNUZ E4M3 range (max 240) -> NaN
-    EXPECT_TRUE(cvIsNaN((float)cv::fp8a_t(448.f)));
+    // overflow: these formats have no inf, so out-of-range magnitudes clamp to max finite
+    EXPECT_EQ((float)cv::fp8_t(1e6f),   448.f);
+    EXPECT_EQ((float)cv::fp8a_t(1e6f), 240.f);
+    EXPECT_EQ((float)cv::fp8_t(-1e6f), -448.f);
+    // 448 exceeds the FNUZ E4M3 range (max 240)
+    EXPECT_EQ((float)cv::fp8a_t(448.f), 240.f);
+    const float inf = std::numeric_limits<float>::infinity();
+    EXPECT_EQ((float)cv::fp8_t(inf),   448.f);
+    EXPECT_EQ((float)cv::fp8a_t(-inf), -240.f);
 
-    // NaN propagates
+    // saturate=false keeps the old overflow-to-NaN behaviour (ONNX saturate=0)
+    EXPECT_TRUE(cvIsNaN((float)cv::fp8_t(1e6f, false)));
+    EXPECT_TRUE(cvIsNaN((float)cv::fp8a_t(1e6f, false)));
+    EXPECT_TRUE(cvIsNaN((float)cv::fp8_t(inf, false)));
+
+    // NaN propagates regardless
     EXPECT_TRUE(cvIsNaN((float)cv::fp8_t(std::numeric_limits<float>::quiet_NaN())));
+    EXPECT_TRUE(cvIsNaN((float)cv::fp8_t(std::numeric_limits<float>::quiet_NaN(), false)));
 
     // smallest E4M3FN subnormal is 2^-9
     EXPECT_EQ((float)cv::fp8_t(0.001953125f), 0.001953125f);
@@ -119,7 +134,7 @@ TEST(Core_FP8, cross_fp8_conversion)
 
 TEST(Core_FP8, convert_scale)
 {
-    Mat f = (Mat_<float>(1, 4) << 1.f, 2.f, 3.f, 4.f);
+    Mat f = Mat_<float>({1, 4}, {1.f, 2.f, 3.f, 4.f});
     Mat q, back;
     f.convertTo(q, CV_8F_E4M3FN, 2.0, 1.0);   // 2x+1 -> {3,5,7,9}
     q.convertTo(back, CV_32F);
@@ -163,6 +178,118 @@ TEST(Core_FP8, convert_all_depths)
                 EXPECT_EQ(back2.at<float>(i), vals[i]) << o << " -> fp8 " << d << " idx " << i;
             }
         }
+}
+
+// Wide stress buffer to exercise the SIMD encode path and its scalar tail.
+static std::vector<float> fp8EncodeStressValues()
+{
+    std::vector<float> vals;
+
+    // every representable FP8 value in both formats, round-tripped through float32
+    for (int b = 0; b < 256; b++) vals.push_back(fp8_t::decodeLUT()[b]);
+    for (int b = 0; b < 256; b++) vals.push_back(fp8a_t::decodeLUT()[b]);
+
+    // dense sweep across the normal range, both signs, crossing every rounding boundary
+    for (int i = -20000; i <= 20000; i++)
+        vals.push_back(i * 0.031f);
+
+    // geometric sweep from subnormal-FP8 through overflow-to-NaN
+    for (int e = -30; e <= 30; e++)
+        for (int m = 0; m < 8; m++)
+            vals.push_back((float)(std::ldexp(1.0 + m / 8.0, e)));
+
+    float specials[] = {
+        0.f, -0.f,
+        std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::denorm_min(), -std::numeric_limits<float>::denorm_min(),
+        std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::min(), 1e-40f, -1e-40f,
+    };
+    vals.insert(vals.end(), std::begin(specials), std::end(specials));
+    return vals;
+}
+
+template<typename FP8>
+static void checkFp8EncodeMatchesScalar(const std::vector<float>& vals)
+{
+    Mat f(1, (int)vals.size(), CV_32F, (void*)vals.data());
+    Mat q;
+    f.convertTo(q, DataType<FP8>::depth);
+    ASSERT_EQ(q.total(), vals.size());
+    const uchar* qd = q.ptr<uchar>();
+    for (size_t i = 0; i < vals.size(); i++)
+    {
+        FP8 ref(vals[i]);
+        uchar refByte = *reinterpret_cast<const uchar*>(&ref);
+        ASSERT_EQ(qd[i], refByte) << "value " << vals[i] << " (idx " << i << ")";
+    }
+}
+
+TEST(Core_FP8, simd_encode_matches_scalar)
+{
+    std::vector<float> vals = fp8EncodeStressValues();
+    checkFp8EncodeMatchesScalar<fp8_t>(vals);
+    checkFp8EncodeMatchesScalar<fp8a_t>(vals);
+}
+
+// Scale path uses a different kernel than the identity path above; check separately.
+template<typename FP8>
+static void checkFp8ScaleEncodeMatchesScalar(const std::vector<float>& vals, double alpha, double beta)
+{
+    Mat f(1, (int)vals.size(), CV_32F, (void*)vals.data());
+    Mat q;
+    f.convertTo(q, DataType<FP8>::depth, alpha, beta);
+    ASSERT_EQ(q.total(), vals.size());
+    const uchar* qd = q.ptr<uchar>();
+    for (size_t i = 0; i < vals.size(); i++)
+    {
+        float scaled = (float)((double)vals[i]*alpha + beta);
+        FP8 ref(scaled);
+        uchar refByte = *reinterpret_cast<const uchar*>(&ref);
+        ASSERT_EQ(qd[i], refByte) << "value " << vals[i] << " * " << alpha << " + " << beta
+                                   << " = " << scaled << " (idx " << i << ")";
+    }
+}
+
+TEST(Core_FP8, simd_scale_encode_matches_scalar)
+{
+    std::vector<float> vals = fp8EncodeStressValues();
+    // representative quantization scales: shrink, grow, shift-only, negate
+    double alphas[] = { 1.0, 0.015625, 64.0, -1.0 };
+    double betas[]  = { 0.0, 0.5, -3.25 };
+    for (double alpha : alphas)
+        for (double beta : betas)
+        {
+            // alpha=1,beta=0 is convertTo's noScale case; skips the scale kernel entirely.
+            if (alpha == 1.0 && beta == 0.0)
+                continue;
+            checkFp8ScaleEncodeMatchesScalar<fp8_t>(vals, alpha, beta);
+            checkFp8ScaleEncodeMatchesScalar<fp8a_t>(vals, alpha, beta);
+        }
+}
+
+TEST(Core_FP8, print)
+{
+    const int depths[] = { CV_8F_E4M3FN, CV_8F_E4M3FNUZ };
+    const char* numpyNames[] = { "float8_e4m3fn", "float8_e4m3fnuz" };
+    for (int i = 0; i < 2; i++)
+    {
+        Mat m;
+        Mat(Matx13d(1, 0.5, -2)).convertTo(m, depths[i]);
+
+        std::ostringstream text;
+        text << m;
+        EXPECT_EQ("[1, 0.5, -2]", text.str());
+
+        std::ostringstream numpy;
+        numpy << format(m, Formatter::FMT_NUMPY);
+        EXPECT_EQ(cv::format("array([[1, 0.5, -2]], dtype='%s')", numpyNames[i]), numpy.str());
+
+        std::ostringstream pretty;
+        pprint(pretty, m);
+        EXPECT_EQ("1, 0.5, -2", pretty.str());
+    }
 }
 
 }} // namespace

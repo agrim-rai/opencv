@@ -87,6 +87,189 @@ void testReshape(const MatShape& inputShape, const MatShape& targetShape,
     EXPECT_EQ(shape, targetShape);
 }
 
+typedef testing::TestWithParam<tuple<int, int, int, bool, bool, float, float> > Layer_Gemm_Kernels;
+
+TEST_P(Layer_Gemm_Kernels, Accuracy)
+{
+    const int M = get<0>(GetParam()), N = get<1>(GetParam()), K = get<2>(GetParam());
+    const bool transA = get<3>(GetParam()), transB = get<4>(GetParam());
+    const float alpha = get<5>(GetParam()), beta = get<6>(GetParam());
+    Mat a(transA ? K : M, transA ? M : K, CV_32F);
+    Mat b(transB ? N : K, transB ? K : N, CV_32F);
+    Mat c(M, N, CV_32F);
+    RNG& rng = theRNG();
+    rng.fill(a, RNG::UNIFORM, -1.f, 1.f);
+    rng.fill(b, RNG::UNIFORM, -1.f, 1.f);
+    rng.fill(c, RNG::UNIFORM, -1.f, 1.f);
+
+    LayerParams params;
+    params.set("transA", transA);
+    params.set("transB", transB);
+    params.set("alpha", alpha);
+    params.set("beta", beta);
+    params.set("have_bias", true);
+    Ptr<Layer> layer = GemmLayer::create(params);
+    std::vector<Mat> inputs{a, b, c}, outputs;
+    runLayer(layer, inputs, outputs);
+
+    Mat expected;
+    cv::gemm(a, b, alpha, c, beta, expected,
+             (transA ? GEMM_1_T : 0) | (transB ? GEMM_2_T : 0));
+    ASSERT_EQ(1u, outputs.size());
+    ASSERT_EQ(expected.size(), outputs[0].size());
+    EXPECT_LE(cv::norm(expected, outputs[0], NORM_INF), 1e-4);
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Layer_Gemm_Kernels, testing::Combine(
+    testing::Values(1, 5), testing::Values(1, 7, 17, 65),
+    testing::Values(1, 5, 19), testing::Bool(), testing::Bool(),
+    testing::Values(1.f, 0.75f), testing::Values(0.f, 1.f)));
+
+typedef testing::TestWithParam<tuple<int, int, int> > Layer_SDPA_Kernels;
+
+TEST_P(Layer_SDPA_Kernels, Accuracy)
+{
+    const int M = get<0>(GetParam()), K = get<1>(GetParam()), N = get<2>(GetParam());
+    const int D = 19;
+    const int qShape[] = {1, 1, M, D}, ktShape[] = {1, 1, D, K}, vShape[] = {1, 1, K, N};
+    Mat q(4, qShape, CV_32F), kt(4, ktShape, CV_32F), v(4, vShape, CV_32F);
+    RNG& rng = theRNG();
+    rng.fill(q, RNG::UNIFORM, -1.f, 1.f);
+    rng.fill(kt, RNG::UNIFORM, -1.f, 1.f);
+    rng.fill(v, RNG::UNIFORM, -1.f, 1.f);
+    LayerParams params;
+    params.set("scale", 2.f);
+    Ptr<Layer> layer = SDPALayer::create(params);
+    std::vector<Mat> inputs{q, kt, v}, outputs;
+    runLayer(layer, inputs, outputs);
+
+    Mat scores;
+    cv::gemm(q.reshape(1, M), kt.reshape(1, D), 0.5, Mat(), 0., scores);
+    for (int i = 0; i < M; ++i)
+    {
+        Mat row = scores.row(i);
+        double maximum;
+        minMaxLoc(row, nullptr, &maximum);
+        row -= maximum;
+        cv::exp(row, row);
+        row /= cv::sum(row)[0];
+    }
+    Mat expected;
+    cv::gemm(scores, v.reshape(1, K), 1., Mat(), 0., expected);
+    ASSERT_EQ(1u, outputs.size());
+    ASSERT_EQ(MatShape({1, M, N}), shape(outputs[0]));
+    EXPECT_LE(cv::norm(expected, outputs[0].reshape(1, M), NORM_INF), 1e-4);
+}
+
+// M=1 enters MLAS's SGEMV fast path; K=259 crosses the FlashAttention block
+// boundary, exercising both zero and accumulate modes with odd-sized tails.
+INSTANTIATE_TEST_CASE_P(/**/, Layer_SDPA_Kernels, testing::Combine(
+    testing::Values(1, 5), testing::Values(1, 7, 259), testing::Values(1, 17, 65)));
+
+// QuantizeLinear requires exactly one output, which the shared runLayer() does not request.
+static Mat runQuantizeLinear(LayerParams& lp, std::vector<Mat>& inputs)
+{
+    Ptr<Layer> layer = LayerFactory::createLayerInstance("QuantizeLinear", lp);
+    std::vector<MatShape> inShapes, outShapes, internals;
+    std::vector<cv::dnn::MatType> inTypes, outTypes, internalTypes;
+    for (const Mat& m : inputs) { inShapes.push_back(shape(m)); inTypes.push_back(cv::dnn::MatType(m.type())); }
+    layer->getMemoryShapes(inShapes, 1, outShapes, internals);
+    layer->getTypes(inTypes, 1, 0, outTypes, internalTypes);
+    std::vector<Mat> outputs{Mat(outShapes[0], outTypes[0])}, intp;
+    layer->finalize(inputs, outputs);
+    layer->forward(inputs, outputs, intp);
+    return outputs[0];
+}
+
+// Per-tensor INT4/UINT4 output has to saturate to the 4-bit range on every path,
+// including the x86 AVX2 per-tensor one, so the input is long enough for its
+// 8-lane loop and its scalar tail.
+TEST(Layer_Test_QuantizeLinear, int4_per_tensor_saturates)
+{
+    const int n = 35;
+    const float vals[6] = {-100.f, -7.f, 0.f, 6.f, 40.f, 1000.f};
+    Mat x(1, n, CV_32F);
+    for (int i = 0; i < n; i++)
+        x.at<float>(0, i) = vals[i % 6];
+    const int one = 1;
+    Mat scale(1, &one, CV_32F, Scalar(1.f));  // rank-1 per-tensor scale, as ONNX exports it
+
+    {
+        LayerParams lp;
+        lp.set("axis", 1);
+        lp.set("output_onnx_dtype", 22);  // ONNX INT4, stored as CV_8S
+        Mat zp(1, &one, CV_8S, Scalar(1));
+        std::vector<Mat> inputs{x, scale, zp};
+        Mat out = runQuantizeLinear(lp, inputs);
+        ASSERT_EQ(CV_8S, out.type());
+        const int expected[6] = {-8, -6, 1, 7, 7, 7};
+        for (int i = 0; i < n; i++)
+            EXPECT_EQ(expected[i % 6], (int)out.at<schar>(0, i)) << "i=" << i;
+    }
+    {
+        LayerParams lp;
+        lp.set("axis", 1);
+        lp.set("output_onnx_dtype", 21);  // ONNX UINT4, stored as CV_8U
+        Mat zp(1, &one, CV_8U, Scalar(2));
+        std::vector<Mat> inputs{x, scale, zp};
+        Mat out = runQuantizeLinear(lp, inputs);
+        ASSERT_EQ(CV_8U, out.type());
+        const int expected[6] = {0, 0, 2, 8, 15, 15};
+        for (int i = 0; i < n; i++)
+            EXPECT_EQ(expected[i % 6], (int)out.at<uchar>(0, i)) << "i=" << i;
+    }
+}
+
+typedef testing::TestWithParam<tuple<Backend, Target> > Layer_Test_LogSoftmax;
+TEST_P(Layer_Test_LogSoftmax, DoesNotUnderflow)
+{
+    const int backendId = get<0>(GetParam());
+    const int targetId = get<1>(GetParam());
+
+    // log(softmax(x)) is -inf once x is about 104 below the maximum, where exp underflows.
+    // The 17-element row also goes through the SIMD loops.
+    std::vector<float> data = {1000.f, 1001.f, 1002.f, -1000.f, 0.f, 1000.f};
+    for (int i = 0; i < 17; i++)
+        data.push_back(100.f * i - 800.f);
+
+    for (int len : {3, 17})
+    {
+        SCOPED_TRACE(len);
+        const int rows = len == 3 ? 2 : 1;
+        Mat input(rows, len, CV_32F, data.data() + (len == 3 ? 0 : 6));
+
+        LayerParams lp;
+        lp.type = "Softmax";
+        lp.name = "logSoftmax";
+        lp.set("axis", 1);
+        lp.set("log_softmax", true);
+        Net net;
+        net.addLayerToPrev(lp.name, lp.type, lp);
+        net.setPreferableBackend(backendId);
+        net.setPreferableTarget(targetId);
+        net.setInput(input);
+        Mat out = net.forward();
+
+        Mat ref(rows, len, CV_32F);
+        for (int r = 0; r < rows; r++)
+        {
+            const float* x = input.ptr<float>(r);
+            double maxVal = *std::max_element(x, x + len), sum = 0;
+            for (int c = 0; c < len; c++)
+                sum += std::exp(x[c] - maxVal);
+            for (int c = 0; c < len; c++)
+                ref.at<float>(r, c) = static_cast<float>(x[c] - maxVal - std::log(sum));
+        }
+        double l1 = 1e-4, lInf = 1e-4;
+        if (targetId == DNN_TARGET_OPENCL_FP16 || targetId == DNN_TARGET_CPU_FP16)
+            DNNTestLayer::getDefaultThresholds(backendId, targetId, &l1, &lInf);
+        normAssert(ref, out.reshape(1, rows), "", l1, lInf);
+    }
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Layer_Test_LogSoftmax,
+    dnnBackendsAndTargets(false, false, true, false, false, false, false, false));
+
 TEST(Layer_Test_Reshape, Accuracy)
 {
     {
@@ -108,6 +291,30 @@ TEST(Layer_Test_Reshape, Accuracy)
         testReshape(MatShape(inp, inp + 3), MatShape(out, out + 3), 0, -1,
                     MatShape(mask, mask + 3));
     }
+}
+
+// Legacy models spell a flatten-to-(1, total) as a 2D shape whose second element is wrong.
+static MatShape reshape2OutShape(const MatShape& inpShape, const std::vector<int>& spec)
+{
+    LayerParams params;
+    params.set("shape", DictValue::arrayInt<const int*>(spec.data(), spec.size()));
+    Ptr<Layer> layer = LayerFactory::createLayerInstance("Reshape2", params);
+
+    std::vector<MatShape> outputs, internals;
+    layer->getMemoryShapes(std::vector<MatShape>(1, inpShape), 1, outputs, internals);
+    return outputs[0];
+}
+
+TEST(Layer_Test_Reshape2, legacy_shape_spec)
+{
+    EXPECT_EQ(MatShape({1, 7}), reshape2OutShape(MatShape({1, 7}), {1, 5}));
+    EXPECT_EQ(MatShape({1, 7}), reshape2OutShape(MatShape({1, 7}), {0, 5}));
+    EXPECT_EQ(MatShape({1, 24}), reshape2OutShape(MatShape({1, 2, 3, 4}), {0, 5}));
+
+    // a spec that already matches is not the legacy case
+    EXPECT_EQ(MatShape({1, 7}), reshape2OutShape(MatShape({7}), {1, 7}));
+    EXPECT_EQ(MatShape({1, 24}), reshape2OutShape(MatShape({1, 2, 3, 4}), {0, -1}));
+    EXPECT_EQ(MatShape({2, 12}), reshape2OutShape(MatShape({2, 3, 4}), {0, -1}));
 }
 
 class Layer_LSTM_Test : public ::testing::Test
@@ -265,6 +472,141 @@ TEST(Layer_LSTM_Test_Accuracy_with_, HiddenParams)
     normAssert(h_t_reference, outputs[0]);
 }
 
+// Reference LSTM from the ONNX definition (gates [i; o; f; c]); Y is [T, D, N, H], Y_h and Y_c are [D, N, H].
+static void lstmReference(const Mat& X, const Mat& W, const Mat& R, const Mat& B,
+                          const Mat& h0, const Mat& c0, bool reverse,
+                          Mat& expectedY, Mat& expectedYh, Mat& expectedYc)
+{
+    const int T = X.size[0], N = X.size[1], I = X.size[2];
+    const int D = W.size[0], H = W.size[1] / 4;
+    const auto sigmoid = [](double v) { return 1. / (1. + std::exp(-v)); };
+
+    expectedY.create(shape(T, D, N, H), CV_32F);
+    expectedYh.create(shape(D, N, H), CV_32F);
+    expectedYc.create(shape(D, N, H), CV_32F);
+
+    std::vector<double> h(H), c(H), gates(4 * H);
+    for (int d = 0; d < D; d++)
+    {
+        const float* wData = W.ptr<float>(d);
+        const float* rData = R.ptr<float>(d);
+        const float* bData = B.ptr<float>(d);
+        const bool rev = reverse || d == 1;
+        for (int s = 0; s < N; s++)
+        {
+            for (int j = 0; j < H; j++)
+            {
+                h[j] = h0.ptr<float>(d, s)[j];
+                c[j] = c0.ptr<float>(d, s)[j];
+            }
+            for (int step = 0; step < T; step++)
+            {
+                const int t = rev ? (T - 1 - step) : step;
+                const float* x = X.ptr<float>(t, s);
+                for (int g = 0; g < 4 * H; g++)
+                {
+                    double p = bData[g] + bData[4 * H + g];
+                    for (int i = 0; i < I; i++)
+                        p += x[i] * wData[g * I + i];
+                    for (int k = 0; k < H; k++)
+                        p += h[k] * rData[g * H + k];
+                    gates[g] = p;
+                }
+                float* y = expectedY.ptr<float>(t, d, s);
+                for (int j = 0; j < H; j++)
+                {
+                    const double ig = sigmoid(gates[j]), og = sigmoid(gates[H + j]);
+                    const double fg = sigmoid(gates[2 * H + j]), cg = std::tanh(gates[3 * H + j]);
+                    c[j] = fg * c[j] + ig * cg;
+                    h[j] = og * std::tanh(c[j]);
+                    y[j] = (float)h[j];
+                }
+            }
+            for (int j = 0; j < H; j++)
+            {
+                expectedYh.ptr<float>(d, s)[j] = (float)h[j];
+                expectedYc.ptr<float>(d, s)[j] = (float)c[j];
+            }
+        }
+    }
+}
+
+// Batch 1 with hidden_size >= 128 splits each direction's hidden units across threads at every timestep.
+static void testLSTM2BatchOneParallel(bool bidirectional, bool reverse, int H)
+{
+    const int T = 5, N = 1, I = 16, D = bidirectional ? 2 : 1;
+    const float k = 1.f / std::sqrt((float)H);   // PyTorch-style init keeps the gates out of saturation
+
+    Mat X({T, N, I}, CV_32F);
+    Mat W({D, 4 * H, I}, CV_32F);   // ONNX W: [Wi; Wo; Wf; Wc]
+    Mat R({D, 4 * H, H}, CV_32F);   // ONNX R: [Ri; Ro; Rf; Rc]
+    Mat B({D, 8 * H}, CV_32F);      // ONNX B: [Wb; Rb]
+    Mat h0({D, N, H}, CV_32F), c0({D, N, H}, CV_32F);
+    randu(X, -1.f, 1.f);
+    randu(W, -k, k);
+    randu(R, -k, k);
+    randu(B, -k, k);
+    randu(h0, -1.f, 1.f);
+    randu(c0, -1.f, 1.f);
+
+    LayerParams lp;
+    lp.type = "LSTM2";
+    lp.name = "lstm2_batch1";
+    lp.set("hidden_size", H);
+    lp.set("bidirectional", bidirectional);
+    lp.set("reverse", reverse);
+    lp.set("produce_output_yh", true);
+    lp.set("produce_cell_output", true);
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+    // ONNX input order X, W, R, B, sequence_lens, initial_h, initial_c; sequence_lens stays empty
+    std::vector<Mat> inputs = {X, W, R, B, Mat(), h0, c0};
+
+    std::vector<MatShape> inShapes, outShapes, internalShapes;
+    std::vector<cv::dnn::MatType> inTypes, outTypes, internalTypes;
+    for (size_t i = 0; i < inputs.size(); i++)
+    {
+        inShapes.push_back(shape(inputs[i]));
+        inTypes.push_back(inputs[i].type());
+    }
+
+    layer->getMemoryShapes(inShapes, 3, outShapes, internalShapes);
+    ASSERT_EQ(outShapes.size(), (size_t)3);
+    EXPECT_EQ(outShapes[0], shape(T, D, N, H));
+    layer->getTypes(inTypes, 3, (int)internalShapes.size(), outTypes, internalTypes);
+
+    std::vector<Mat> outputs, internals;
+    for (size_t i = 0; i < outShapes.size(); i++)
+        outputs.push_back(Mat(outShapes[i], outTypes[i]));
+    for (size_t i = 0; i < internalShapes.size(); i++)
+        internals.push_back(Mat(internalShapes[i], internalTypes[i]));
+
+    // 4 threads give every direction at least two hidden-unit chunks
+    const int prevThreads = getNumThreads();
+    setNumThreads(4);
+    layer->finalize(inputs, outputs);
+    layer->forward(inputs, outputs, internals);
+    setNumThreads(prevThreads);
+
+    Mat expectedY, expectedYh, expectedYc;
+    lstmReference(X, W, R, B, h0, c0, reverse, expectedY, expectedYh, expectedYc);
+
+    normAssert(outputs[0], expectedY, "LSTM2 Y", 1e-4, 1e-4);
+    normAssert(outputs[1], expectedYh, "LSTM2 Y_h", 1e-4, 1e-4);
+    normAssert(outputs[2], expectedYc, "LSTM2 Y_c", 1e-4, 1e-4);
+}
+
+// With 2 chunks per direction, 136 rounds up to 72-unit chunks, so the second chunk is partial.
+TEST(Layer_LSTM2_Test_Accuracy_, BatchOneBidirectionalParallel)
+{
+    testLSTM2BatchOneParallel(true, false, 136);
+}
+
+TEST(Layer_LSTM2_Test_Accuracy_, BatchOneReverseParallel)
+{
+    testLSTM2BatchOneParallel(false, true, 128);
+}
+
 TEST(Layer_GRU_Test_Accuracy_with_, Pytorch)
 {
     Mat Wx = blobFromNPY(_tf("gru.W.npy"));
@@ -292,6 +634,372 @@ TEST(Layer_GRU_Test_Accuracy_with_, Pytorch)
 
     Mat h_t_reference = blobFromNPY(_tf("gru.output.npy"));
     normAssert(h_t_reference, outputs[0]);
+}
+
+// Reference GRU from the ONNX definition (linear_before_reset = 0):
+//   z = sigmoid(x*Wz^T + h*Rz^T + Wbz + Rbz),   r = sigmoid(x*Wr^T + h*Rr^T + Wbr + Rbr)
+//   n = tanh(x*Wh^T + (r (*) h)*Rh^T + Wbh + Rbh),   h = z (*) h + (1 - z) (*) n
+// `reverse` walks backwards, `lens` limits a sample to t < lens[s], `clip` > 0 bounds each gate.
+// expectedY is [T, 1, N, H], expectedYh is [1, N, H].
+static void gruReference(const Mat& X, const Mat& W, const Mat& R, const Mat& B,
+                         const std::vector<int>& lens, bool reverse, float clip,
+                         Mat& expectedY, Mat& expectedYh)
+{
+    const int T = X.size[0], N = X.size[1], I = X.size[2];
+    const int H = W.size[1] / 3;
+    const auto clamped = [clip](double v) {
+        if (clip <= 0.f)
+            return v;
+        return std::max(-(double)clip, std::min(v, (double)clip));
+    };
+
+    const float* xData = X.ptr<float>();
+    const float* wData = W.ptr<float>();
+    const float* rData = R.ptr<float>();
+    const float* bData = B.ptr<float>();
+
+    expectedY.create(shape(T, 1, N, H), CV_32F);
+    expectedYh.create(shape(1, N, H), CV_32F);
+
+    std::vector<double> z(H), r(H), n(H), h(H);
+    for (int s = 0; s < N; s++)
+    {
+        std::fill(h.begin(), h.end(), 0.);   // initial_h defaults to zero
+        const int len = lens.empty() ? T : lens[s];
+        for (int step = 0; step < T; step++)
+        {
+            const int t = reverse ? (T - 1 - step) : step;
+            if (t < len)
+            {
+                const float* x = xData + (t * N + s) * I;
+                for (int j = 0; j < H; j++)
+                {
+                    double pz = bData[j] + bData[3 * H + j];
+                    double pr = bData[H + j] + bData[3 * H + H + j];
+                    for (int i = 0; i < I; i++)
+                    {
+                        pz += x[i] * wData[j * I + i];
+                        pr += x[i] * wData[(H + j) * I + i];
+                    }
+                    for (int k = 0; k < H; k++)
+                    {
+                        pz += h[k] * rData[j * H + k];
+                        pr += h[k] * rData[(H + j) * H + k];
+                    }
+                    z[j] = 1. / (1. + std::exp(-clamped(pz)));
+                    r[j] = 1. / (1. + std::exp(-clamped(pr)));
+                }
+                for (int j = 0; j < H; j++)
+                {
+                    double pn = bData[2 * H + j] + bData[3 * H + 2 * H + j];
+                    for (int i = 0; i < I; i++)
+                        pn += x[i] * wData[(2 * H + j) * I + i];
+                    for (int k = 0; k < H; k++)
+                        pn += (r[k] * h[k]) * rData[(2 * H + j) * H + k];
+                    n[j] = std::tanh(clamped(pn));
+                }
+                for (int j = 0; j < H; j++)
+                    h[j] = z[j] * h[j] + (1. - z[j]) * n[j];
+            }
+            for (int j = 0; j < H; j++)
+                expectedY.ptr<float>()[(t * N + s) * H + j] = (t < len) ? (float)h[j] : 0.f;
+        }
+        for (int j = 0; j < H; j++)
+            expectedYh.ptr<float>()[s * H + j] = (float)h[j];
+    }
+}
+
+// Output #0 of a recurrent op is Y, #1 is Y_h; a lone declared output can only mean Y.
+TEST(Layer_GRU_Test_Accuracy_, SingleOutputIsSequenceY)
+{
+    const int T = 3, N = 2, I = 4, H = 5;
+
+    Mat X({T, N, I}, CV_32F);
+    Mat W({1, 3 * H, I}, CV_32F);   // ONNX W: [Wz; Wr; Wh]
+    Mat R({1, 3 * H, H}, CV_32F);   // ONNX R: [Rz; Rr; Rh]
+    Mat B({1, 6 * H}, CV_32F);      // ONNX B: [Wbz; Wbr; Wbh; Rbz; Rbr; Rbh]
+    randu(X, -1.f, 1.f);
+    randu(W, -1.f, 1.f);
+    randu(R, -1.f, 1.f);
+    randu(B, -1.f, 1.f);
+
+    // W/R/B are passed as inputs, exactly like the ONNX importer does.
+    LayerParams lp;
+    lp.type = "GRU";
+    lp.name = "gru_single_output";
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+    std::vector<Mat> inputs = {X, W, R, B};
+
+    std::vector<MatShape> inShapes, outShapes, internalShapes;
+    std::vector<cv::dnn::MatType> inTypes, outTypes, internalTypes;
+    for (size_t i = 0; i < inputs.size(); i++)
+    {
+        inShapes.push_back(shape(inputs[i]));
+        inTypes.push_back(inputs[i].type());
+    }
+
+    // A single declared output => requiredOutputs == 1.
+    layer->getMemoryShapes(inShapes, 1, outShapes, internalShapes);
+    ASSERT_EQ(outShapes.size(), (size_t)1);
+    EXPECT_EQ(outShapes[0], shape(T, 1, N, H));  // Y, not Y_h
+    layer->getTypes(inTypes, 1, (int)internalShapes.size(), outTypes, internalTypes);
+
+    std::vector<Mat> outputs, internals;
+    for (size_t i = 0; i < outShapes.size(); i++)
+        outputs.push_back(Mat(outShapes[i], outTypes[i]));
+    for (size_t i = 0; i < internalShapes.size(); i++)
+        internals.push_back(Mat(internalShapes[i], internalTypes[i]));
+    layer->finalize(inputs, outputs);
+    layer->forward(inputs, outputs, internals);
+
+    Mat expected, expectedYh;
+    gruReference(X, W, R, B, std::vector<int>(), false, 0.f, expected, expectedYh);
+
+    normAssert(outputs[0], expected, "GRU single output must be Y", 1e-4, 1e-4);
+}
+
+// direction == "reverse": Y[t] is the state after seeing x[t..T-1], Y_h the one after the last step.
+TEST(Layer_GRU_Test_Accuracy_, ReverseDirection)
+{
+    const int T = 3, N = 2, I = 4, H = 5;
+
+    Mat X({T, N, I}, CV_32F);
+    Mat W({1, 3 * H, I}, CV_32F);
+    Mat R({1, 3 * H, H}, CV_32F);
+    Mat B({1, 6 * H}, CV_32F);
+    randu(X, -1.f, 1.f);
+    randu(W, -1.f, 1.f);
+    randu(R, -1.f, 1.f);
+    randu(B, -1.f, 1.f);
+
+    LayerParams lp;
+    lp.type = "GRU";
+    lp.name = "gru_reverse";
+    lp.set("direction", "reverse");
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+    std::vector<Mat> inputs = {X, W, R, B};
+
+    std::vector<MatShape> inShapes, outShapes, internalShapes;
+    std::vector<cv::dnn::MatType> inTypes, outTypes, internalTypes;
+    for (size_t i = 0; i < inputs.size(); i++)
+    {
+        inShapes.push_back(shape(inputs[i]));
+        inTypes.push_back(inputs[i].type());
+    }
+
+    layer->getMemoryShapes(inShapes, 2, outShapes, internalShapes);
+    ASSERT_EQ(outShapes.size(), (size_t)2);
+    EXPECT_EQ(outShapes[0], shape(T, 1, N, H));
+    EXPECT_EQ(outShapes[1], shape(1, N, H));
+    layer->getTypes(inTypes, 2, (int)internalShapes.size(), outTypes, internalTypes);
+
+    std::vector<Mat> outputs, internals;
+    for (size_t i = 0; i < outShapes.size(); i++)
+        outputs.push_back(Mat(outShapes[i], outTypes[i]));
+    for (size_t i = 0; i < internalShapes.size(); i++)
+        internals.push_back(Mat(internalShapes[i], internalTypes[i]));
+    layer->finalize(inputs, outputs);
+    layer->forward(inputs, outputs, internals);
+
+    Mat expectedY, expectedYh;
+    gruReference(X, W, R, B, std::vector<int>(), true, 0.f, expectedY, expectedYh);
+
+    normAssert(outputs[0], expectedY, "GRU(reverse) Y", 1e-4, 1e-4);
+    normAssert(outputs[1], expectedYh, "GRU(reverse) Y_h", 1e-4, 1e-4);
+}
+
+// direction == "reverse" is a single backward sweep, so two-direction weights are rejected.
+TEST(Layer_GRU_Test_Accuracy_, ReverseWithTwoDirectionWeightsIsRejected)
+{
+    const int T = 3, N = 2, I = 4, H = 5;
+
+    Mat X({T, N, I}, CV_32F);
+    Mat W({2, 3 * H, I}, CV_32F);   // two directions
+    Mat R({2, 3 * H, H}, CV_32F);
+    Mat B({2, 6 * H}, CV_32F);
+    randu(X, -1.f, 1.f);
+    randu(W, -1.f, 1.f);
+    randu(R, -1.f, 1.f);
+    randu(B, -1.f, 1.f);
+
+    LayerParams lp;
+    lp.type = "GRU";
+    lp.name = "gru_reverse_two_directions";
+    lp.set("direction", "reverse");
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+    std::vector<Mat> inputs = {X, W, R, B};
+
+    std::vector<MatShape> inShapes, outShapes, internalShapes;
+    for (size_t i = 0; i < inputs.size(); i++)
+        inShapes.push_back(shape(inputs[i]));
+
+    // The mix must be rejected here in shape inference, not later in forward().
+    EXPECT_THROW(layer->getMemoryShapes(inShapes, 2, outShapes, internalShapes), cv::Exception);
+}
+
+// ONNX sequence_lens: each entry stops after its own length, so Y is zero-padded past it.
+TEST(Layer_GRU_Test_Accuracy_, SequenceLens)
+{
+    const int T = 4, N = 3, I = 4, H = 5;
+    // one sample of each interesting kind: full length, truncated, and empty
+    const int lens[N] = {4, 2, 0};
+
+    Mat X({T, N, I}, CV_32F);
+    Mat W({1, 3 * H, I}, CV_32F);
+    Mat R({1, 3 * H, H}, CV_32F);
+    Mat B({1, 6 * H}, CV_32F);
+    randu(X, -1.f, 1.f);
+    randu(W, -1.f, 1.f);
+    randu(R, -1.f, 1.f);
+    randu(B, -1.f, 1.f);
+
+    Mat lensMat(1, N, CV_32S);
+    for (int n = 0; n < N; n++)
+        lensMat.at<int>(0, n) = lens[n];
+
+    LayerParams lp;
+    lp.type = "GRU";
+    lp.name = "gru_seq_lens";
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+    std::vector<Mat> inputs = {X, W, R, B, lensMat};
+
+    std::vector<MatShape> inShapes, outShapes, internalShapes;
+    std::vector<cv::dnn::MatType> inTypes, outTypes, internalTypes;
+    for (size_t i = 0; i < inputs.size(); i++)
+    {
+        inShapes.push_back(shape(inputs[i]));
+        inTypes.push_back(inputs[i].type());
+    }
+
+    layer->getMemoryShapes(inShapes, 2, outShapes, internalShapes);
+    ASSERT_EQ(outShapes.size(), (size_t)2);
+    EXPECT_EQ(outShapes[0], shape(T, 1, N, H));
+    EXPECT_EQ(outShapes[1], shape(1, N, H));
+    layer->getTypes(inTypes, 2, (int)internalShapes.size(), outTypes, internalTypes);
+
+    std::vector<Mat> outputs, internals;
+    for (size_t i = 0; i < outShapes.size(); i++)
+        outputs.push_back(Mat(outShapes[i], outTypes[i]));
+    for (size_t i = 0; i < internalShapes.size(); i++)
+        internals.push_back(Mat(internalShapes[i], internalTypes[i]));
+    layer->finalize(inputs, outputs);
+    layer->forward(inputs, outputs, internals);
+
+    Mat expectedY, expectedYh;
+    gruReference(X, W, R, B, std::vector<int>(lens, lens + N), false, 0.f, expectedY, expectedYh);
+
+    normAssert(outputs[0], expectedY, "GRU(sequence_lens) Y", 1e-4, 1e-4);
+    normAssert(outputs[1], expectedYh, "GRU(sequence_lens) Y_h", 1e-4, 1e-4);
+}
+
+// sequence_lens with reverse: the sweep starts at lens[s] - 1, so Y is zero on the padding.
+TEST(Layer_GRU_Test_Accuracy_, ReverseSequenceLens)
+{
+    const int T = 4, N = 3, I = 4, H = 5;
+    const int lens[N] = {4, 2, 0};
+
+    Mat X({T, N, I}, CV_32F);
+    Mat W({1, 3 * H, I}, CV_32F);
+    Mat R({1, 3 * H, H}, CV_32F);
+    Mat B({1, 6 * H}, CV_32F);
+    randu(X, -1.f, 1.f);
+    randu(W, -1.f, 1.f);
+    randu(R, -1.f, 1.f);
+    randu(B, -1.f, 1.f);
+
+    Mat lensMat(1, N, CV_32S);
+    for (int n = 0; n < N; n++)
+        lensMat.at<int>(0, n) = lens[n];
+
+    LayerParams lp;
+    lp.type = "GRU";
+    lp.name = "gru_reverse_seq_lens";
+    lp.set("direction", "reverse");
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+    std::vector<Mat> inputs = {X, W, R, B, lensMat};
+
+    std::vector<MatShape> inShapes, outShapes, internalShapes;
+    std::vector<cv::dnn::MatType> inTypes, outTypes, internalTypes;
+    for (size_t i = 0; i < inputs.size(); i++)
+    {
+        inShapes.push_back(shape(inputs[i]));
+        inTypes.push_back(inputs[i].type());
+    }
+
+    layer->getMemoryShapes(inShapes, 2, outShapes, internalShapes);
+    ASSERT_EQ(outShapes.size(), (size_t)2);
+    EXPECT_EQ(outShapes[0], shape(T, 1, N, H));
+    EXPECT_EQ(outShapes[1], shape(1, N, H));
+    layer->getTypes(inTypes, 2, (int)internalShapes.size(), outTypes, internalTypes);
+
+    std::vector<Mat> outputs, internals;
+    for (size_t i = 0; i < outShapes.size(); i++)
+        outputs.push_back(Mat(outShapes[i], outTypes[i]));
+    for (size_t i = 0; i < internalShapes.size(); i++)
+        internals.push_back(Mat(internalShapes[i], internalTypes[i]));
+    layer->finalize(inputs, outputs);
+    layer->forward(inputs, outputs, internals);
+
+    Mat expectedY, expectedYh;
+    gruReference(X, W, R, B, std::vector<int>(lens, lens + N), true, 0.f, expectedY, expectedYh);
+
+    normAssert(outputs[0], expectedY, "GRU(reverse, sequence_lens) Y", 1e-4, 1e-4);
+    normAssert(outputs[1], expectedYh, "GRU(reverse, sequence_lens) Y_h", 1e-4, 1e-4);
+}
+
+// The ONNX `clip` attribute bounds the activation input (the gates before sigmoid/tanh), not their output.
+TEST(Layer_GRU_Test_Accuracy_, Clip)
+{
+    const int T = 3, N = 2, I = 4, H = 5;
+    const float clip = 0.3f;   // small enough that it binds for the weights below
+
+    Mat X({T, N, I}, CV_32F);
+    Mat W({1, 3 * H, I}, CV_32F);
+    Mat R({1, 3 * H, H}, CV_32F);
+    Mat B({1, 6 * H}, CV_32F);
+    randu(X, -1.f, 1.f);
+    randu(W, -1.f, 1.f);
+    randu(R, -1.f, 1.f);
+    randu(B, -1.f, 1.f);
+
+    LayerParams lp;
+    lp.type = "GRU";
+    lp.name = "gru_clip";
+    lp.set("clip", clip);
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+    std::vector<Mat> inputs = {X, W, R, B};
+
+    std::vector<MatShape> inShapes, outShapes, internalShapes;
+    std::vector<cv::dnn::MatType> inTypes, outTypes, internalTypes;
+    for (size_t i = 0; i < inputs.size(); i++)
+    {
+        inShapes.push_back(shape(inputs[i]));
+        inTypes.push_back(inputs[i].type());
+    }
+
+    layer->getMemoryShapes(inShapes, 2, outShapes, internalShapes);
+    ASSERT_EQ(outShapes.size(), (size_t)2);
+    layer->getTypes(inTypes, 2, (int)internalShapes.size(), outTypes, internalTypes);
+
+    std::vector<Mat> outputs, internals;
+    for (size_t i = 0; i < outShapes.size(); i++)
+        outputs.push_back(Mat(outShapes[i], outTypes[i]));
+    for (size_t i = 0; i < internalShapes.size(); i++)
+        internals.push_back(Mat(internalShapes[i], internalTypes[i]));
+    layer->finalize(inputs, outputs);
+    layer->forward(inputs, outputs, internals);
+
+    Mat expectedY, expectedYh;
+    gruReference(X, W, R, B, std::vector<int>(), false, clip, expectedY, expectedYh);
+
+    normAssert(outputs[0], expectedY, "GRU(clip) Y", 1e-4, 1e-4);
+    normAssert(outputs[1], expectedYh, "GRU(clip) Y_h", 1e-4, 1e-4);
 }
 
 TEST(Layer_RNN_Test_Accuracy_with_, CaffeRecurrent)
@@ -432,6 +1140,126 @@ TEST(Layer_MHARoPe_Test_Accuracy_with_, Pytorch)
     Mat h_t_reference = blobFromNPY(_tf("mha_rope.output.npy"));
     normAssert(h_t_reference, outputs[0]);
 }
+
+TEST(Layer_Attention, rank4_input_matches_rank3)
+{
+    const int B0 = 2, B1 = 3, S = 17, C = 64, NH = 4;
+    std::vector<int> qkv_hidden_sizes = { C, C, C };
+    Mat W(std::vector<int>{C, 3 * C}, CV_32F), bias(std::vector<int>{3 * C}, CV_32F);
+    randu(W, -1.f, 1.f);
+    randu(bias, -1.f, 1.f);
+    LayerParams lp;
+    lp.blobs.push_back(W);
+    lp.blobs.push_back(bias);
+    lp.set("num_heads", NH);
+    lp.set("qkv_hidden_sizes", DictValue::arrayInt(&qkv_hidden_sizes[0], qkv_hidden_sizes.size()));
+
+    Mat x4(std::vector<int>{B0, B1, S, C}, CV_32F);
+    randu(x4, -1.f, 1.f);
+    Mat x3 = x4.reshape(1, std::vector<int>{B0 * B1, S, C});
+    std::vector<Mat> in4(1, x4), in3(1, x3), out4, out3;
+    // As recorded by the fusion for a QKV reshape to [B0 * B1, S, H, D].
+    LayerParams lp4 = lp;
+    int batch_dims[] = {1, 0, 1}, inferred[] = {-1};
+    lp4.set("qkv_batch", DictValue::arrayInt(batch_dims, 3));
+    lp4.set("qkv_seq", DictValue::arrayInt(inferred, 1));
+    runLayer(AttentionLayer::create(lp4), in4, out4);
+    runLayer(AttentionLayer::create(lp), in3, out3);
+
+    EXPECT_EQ(shape(out4[0]), shape(x4));
+    normAssert(out3[0].reshape(1, std::vector<int>{B0, B1, S, C}), out4[0]);
+}
+
+// The fusion records how the replaced QKV reshape grouped the tokens, as {factor, input dims...} or
+// {-1} for inferred. Any grouping is a view of the same tokens; without a record the input is 3D.
+TEST(Layer_Attention, groups_tokens_like_the_qkv_reshape)
+{
+    // C divides the 48 tokens, so a grouping by the hidden dim is not caught by the count alone.
+    const int B0 = 2, B1 = 3, S = 8, C = 16, NH = 4;
+    std::vector<int> qkv_hidden_sizes = { C, C, C };
+    Mat W(std::vector<int>{C, 3 * C}, CV_32F), bias(std::vector<int>{3 * C}, CV_32F);
+    randu(W, -1.f, 1.f);
+    randu(bias, -1.f, 1.f);
+    LayerParams lp;
+    lp.blobs.push_back(W);
+    lp.blobs.push_back(bias);
+    lp.set("num_heads", NH);
+    lp.set("qkv_hidden_sizes", DictValue::arrayInt(&qkv_hidden_sizes[0], qkv_hidden_sizes.size()));
+
+    auto grouped = [&](std::vector<int> batch, std::vector<int> seq) {
+        LayerParams p = lp;
+        p.set("qkv_batch", DictValue::arrayInt(batch.data(), (int)batch.size()));
+        p.set("qkv_seq", DictValue::arrayInt(seq.data(), (int)seq.size()));
+        return p;
+    };
+    auto run = [](const LayerParams& p, const Mat& x) {
+        std::vector<Mat> in(1, x), out;
+        runLayer(AttentionLayer::create(p), in, out);
+        return out[0];
+    };
+    auto rejects = [](const LayerParams& p, const MatShape& inp) {
+        std::vector<MatShape> outs, internals;
+        EXPECT_ANY_THROW(AttentionLayer::create(p)->getMemoryShapes({inp}, 1, outs, internals));
+    };
+
+    Mat x4(std::vector<int>{B0, B1, S, C}, CV_32F);
+    randu(x4, -1.f, 1.f);
+    // A QKV reshape to [B0, B1 * S, H, D]: each B0 item attends over all of its B1 * S tokens.
+    Mat ref = run(lp, x4.reshape(1, std::vector<int>{B0, B1 * S, C}));
+    ref = ref.reshape(1, std::vector<int>{B0, B1, S, C});
+    normAssert(ref, run(grouped({1, 0}, {1, 1, 2}), x4));
+    normAssert(ref, run(grouped({B0}, {-1}), x4));
+    normAssert(ref, run(grouped({-1}, {1, 1, 2}), x4));
+    normAssert(ref, run(grouped({1, -4}, {1, -3, -2}), x4));
+
+    rejects(lp, shape(x4));
+    rejects(grouped({5}, {-1}), shape(x4));
+    rejects(grouped({1, 3}, {-1}), shape(x4));
+}
+
+typedef testing::TestWithParam<tuple<int, int> > Layer_Attention_v_hidden;
+TEST_P(Layer_Attention_v_hidden, qk_v_head_sizes_differ)
+{
+    // The output width is Hv, which may be smaller or larger than the input width C.
+    const int Hv = get<0>(GetParam()), output_ndims = get<1>(GetParam());
+    const int B = 2, S = 9, C = 32, NH = 2, Hqk = C / 2, N = 2 * Hqk + Hv;
+    const int dqk = Hqk / NH, dv = Hv / NH;
+    std::vector<int> qkv_hidden_sizes = { Hqk, Hqk, Hv };
+    Mat W(C, N, CV_32F), bias(std::vector<int>{N}, CV_32F), x(std::vector<int>{B, S, C}, CV_32F);
+    randu(W, -1.f, 1.f); randu(bias, -1.f, 1.f); randu(x, -1.f, 1.f);
+    LayerParams lp;
+    lp.blobs.push_back(W);
+    lp.blobs.push_back(bias);
+    lp.set("num_heads", NH);
+    lp.set("qkv_hidden_sizes", DictValue::arrayInt(&qkv_hidden_sizes[0], qkv_hidden_sizes.size()));
+    lp.set("output_ndims", output_ndims);
+    std::vector<Mat> in(1, x), out;
+    runLayer(AttentionLayer::create(lp), in, out);
+
+    Mat P = x.reshape(1, B * S) * W + repeat(Mat(1, N, CV_32F, bias.ptr<float>()), B * S, 1);
+    Mat ref(B * S, Hv, CV_32F);
+    for (int b = 0; b < B; b++)
+        for (int h = 0; h < NH; h++) {
+            Mat rows = P.rowRange(b * S, (b + 1) * S);
+            Mat q = rows.colRange(h * dqk, (h + 1) * dqk);
+            Mat k = rows.colRange(Hqk + h * dqk, Hqk + (h + 1) * dqk);
+            Mat v = rows.colRange(2 * Hqk + h * dv, 2 * Hqk + (h + 1) * dv);
+            Mat s = q * k.t() * (1.0 / std::sqrt((double)dqk));
+            for (int r = 0; r < S; r++) {
+                double mx; minMaxLoc(s.row(r), nullptr, &mx);
+                Mat e; exp(s.row(r) - mx, e);
+                Mat(e / sum(e)[0]).copyTo(s.row(r));
+            }
+            Mat(s * v).copyTo(ref(Range(b * S, (b + 1) * S), Range(h * dv, (h + 1) * dv)));
+        }
+    std::vector<int> ref_shape = output_ndims == 3 ? std::vector<int>{B, S, Hv} : std::vector<int>{B * S, Hv};
+    ASSERT_EQ(MatShape(ref_shape), out[0].shape());
+    normAssert(ref.reshape(1, ref_shape), out[0]);
+}
+INSTANTIATE_TEST_CASE_P(/**/, Layer_Attention_v_hidden, Combine(
+    Values(16, 32, 48),  // Hv < C, Hv == C, Hv > C
+    Values(3, 2)         // output_ndims
+));
 
 typedef testing::TestWithParam<tuple<Vec4i, Vec2i, bool> > Scale_untrainable;
 TEST_P(Scale_untrainable, Accuracy)
@@ -614,8 +1442,8 @@ TEST_P(Test_Caffe_layers, Average_pooling_kernel_area)
     // 4 5 | 6
     // ----+--
     // 7 8 | 9
-    Mat inp = (Mat_<float>(3, 3) << 1, 2, 3, 4, 5, 6, 7, 8, 9);
-    Mat ref = (Mat_<float>(2, 2) << (1 + 2 + 4 + 5) / 4.f, (3 + 6) / 2.f, (7 + 8) / 2.f, 9);
+    Mat inp = Mat_<float>({3, 3}, {1, 2, 3, 4, 5, 6, 7, 8, 9});
+    Mat ref = Mat_<float>({2, 2}, {(1 + 2 + 4 + 5) / 4.f, (3 + 6) / 2.f, (7 + 8) / 2.f, 9});
     Mat tmp = blobFromImage(inp);
     net.setInput(blobFromImage(inp));
     net.setPreferableBackend(backend);
@@ -652,10 +1480,12 @@ TEST_P(Test_Caffe_layers, PriorBox_squares)
     net.setPreferableTarget(target);
     Mat out = net.forward();
 
-    Mat ref = (Mat_<float>(4, 4) << 0.0, 0.0, 0.75, 1.0,
-                                       0.25, 0.0, 1.0, 1.0,
-                                       0.1f, 0.1f, 0.2f, 0.2f,
-                                       0.1f, 0.1f, 0.2f, 0.2f);
+    Mat ref = Mat_<float>({4, 4}, {
+            0.0, 0.0, 0.75, 1.0,
+            0.25, 0.0, 1.0, 1.0,
+            0.1f, 0.1f, 0.2f, 0.2f,
+            0.1f, 0.1f, 0.2f, 0.2f
+    });
     double l1 = 1e-5;
     if (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD || target == DNN_TARGET_CUDA_FP16)
         l1 = 2e-5;
@@ -992,6 +1822,86 @@ INSTANTIATE_TEST_CASE_P(/*nothing*/, Test_DLDT_layers, dnnBackendsAndTargets());
 
 #endif  // HAVE_INF_ENGINE
 
+typedef DNNTestLayer Layer_Test_SharedBuffers;
+
+static LayerParams sharedBuffersLayer(const std::string& name, const std::string& type)
+{
+    LayerParams lp;
+    lp.name = name;
+    lp.type = type;
+    return lp;
+}
+
+static LayerParams sharedBuffersConv(const std::string& name, int inC, int outC, int kernel, int pad)
+{
+    LayerParams lp = sharedBuffersLayer(name, "Convolution");
+    lp.set("kernel_size", kernel);
+    lp.set("num_output", outC);
+    lp.set("pad", pad);
+    lp.set("bias_term", true);
+    Mat weights({outC, inC, kernel, kernel}, CV_32F);
+    theRNG().fill(weights, RNG::UNIFORM, -0.2f, 0.2f);
+    Mat bias(1, outC, CV_32F);
+    theRNG().fill(bias, RNG::UNIFORM, -0.1f, 0.1f);
+    lp.blobs.push_back(weights);
+    lp.blobs.push_back(bias);
+    return lp;
+}
+
+static Mat runSharedBuffersNet(std::vector<LayerParams> layers, const Mat& input, int backend, int target)
+{
+    Net net;
+    for (LayerParams& lp : layers)
+        net.addLayerToPrev(lp.name, lp.type, lp);
+    net.setPreferableBackend(backend);
+    net.setPreferableTarget(target);
+    net.setInput(input);
+    return net.forward().clone();
+}
+
+TEST_P(Layer_Test_SharedBuffers, reused_buffer_with_new_shape)
+{
+    std::vector<LayerParams> layers;
+    layers.push_back(sharedBuffersConv("conv1", 3, 16, 3, 1));
+    layers.push_back(sharedBuffersLayer("relu1", "ReLU"));
+    layers.push_back(sharedBuffersConv("conv2", 16, 8, 3, 1));
+    LayerParams pool = sharedBuffersLayer("pool1", "Pooling");
+    pool.set("pool", "max");
+    pool.set("kernel_size", 2);
+    pool.set("stride", 2);
+    layers.push_back(pool);
+    layers.push_back(sharedBuffersConv("conv3", 8, 32, 1, 0));
+    layers.push_back(sharedBuffersLayer("relu2", "ReLU"));
+    layers.push_back(sharedBuffersConv("conv4", 32, 4, 3, 1));
+
+    Mat input({2, 3, 32, 32}, CV_32F);
+    theRNG().fill(input, RNG::UNIFORM, 0.f, 1.f);
+
+    Mat ref = runSharedBuffersNet(layers, input, DNN_BACKEND_OPENCV, DNN_TARGET_CPU);
+    Mat out = runSharedBuffersNet(layers, input, backend, target);
+    normAssert(ref, out, "", default_l1, default_lInf);
+}
+
+TEST_P(Layer_Test_SharedBuffers, inplace_flatten_then_softmax)
+{
+    std::vector<LayerParams> layers;
+    layers.push_back(sharedBuffersConv("conv1", 3, 6, 3, 1));
+    layers.push_back(sharedBuffersLayer("flatten", "Flatten"));
+    LayerParams softmax = sharedBuffersLayer("softmax", "Softmax");
+    softmax.set("axis", 1);
+    layers.push_back(softmax);
+
+    Mat input({2, 3, 8, 8}, CV_32F);
+    theRNG().fill(input, RNG::UNIFORM, 0.f, 1.f);
+
+    Mat ref = runSharedBuffersNet(layers, input, DNN_BACKEND_OPENCV, DNN_TARGET_CPU);
+    Mat out = runSharedBuffersNet(layers, input, backend, target);
+    ASSERT_EQ(shape(ref), shape(out));
+    normAssert(ref, out, "", default_l1, default_lInf);
+}
+
+INSTANTIATE_TEST_CASE_P(/*nothing*/, Layer_Test_SharedBuffers, dnnBackendsAndTargets());
+
 // Test a custom layer.
 class CustomInterpLayer CV_FINAL : public Layer
 {
@@ -1144,6 +2054,144 @@ TEST(Layer_Test_PoolingIndices, Accuracy)
     normAssert(indices, outputs[1].reshape(1, 5));
 }
 
+// The input shape and the pool type are test parameters, so a failing case names the
+// configuration it belongs to.
+typedef testing::TestWithParam<tuple<MatShape, bool> > Layer_Test_GlobalPooling;
+
+struct GlobalPoolingParamName
+{
+    std::string operator()(const testing::TestParamInfo<Layer_Test_GlobalPooling::ParamType>& info) const
+    {
+        const MatShape sizes = std::get<0>(info.param);
+        std::string name = cv::format("N%d", sizes[0]);
+        for (size_t i = 1; i < sizes.size(); i++)
+            name += cv::format("x%d", sizes[i]);
+        return name + (std::get<1>(info.param) ? "_max" : "_ave");
+    }
+};
+
+TEST_P(Layer_Test_GlobalPooling, NDSpatialDimensions)
+{
+    const MatShape sizes = std::get<0>(GetParam());
+    const bool useMax = std::get<1>(GetParam());
+    Mat inp((int)sizes.size(), sizes.data(), CV_32F);
+    randu(inp, -1, 1);
+
+    // One row per (batch, channel) plane; the planes are contiguous in memory.
+    const int nplanes = sizes[0] * sizes[1];
+    Mat planes = inp.reshape(1, nplanes);
+    Mat ref(nplanes, 1, CV_32F);
+    for (int i = 0; i < nplanes; i++)
+    {
+        double maxVal;
+        cv::minMaxIdx(planes.row(i), NULL, &maxVal);
+        const double sum = cv::sum(planes.row(i))[0];
+        ref.at<float>(i) = useMax ? (float)maxVal : (float)(sum / planes.cols);
+    }
+
+    LayerParams lp;
+    lp.name = "testGlobalPooling";
+    lp.type = "Pooling";
+    lp.set("pool", useMax ? "MAX" : "AVE");
+    lp.set("global_pooling", true);
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+
+    std::vector<Mat> input(1, inp), output;
+    runLayer(layer, input, output);
+
+    // Expected output shape is N x C x 1 x ... x 1.
+    ASSERT_EQ(output[0].dims, (int)sizes.size());
+    for (int d = 2; d < output[0].dims; d++)
+        ASSERT_EQ(output[0].size[d], 1) << "d = " << d;
+
+    normAssert(ref, output[0].reshape(1, nplanes), "", 1e-6, 1e-6);
+}
+
+TEST_P(Layer_Test_GlobalPooling, QuantizedNDSpatialDimensions)
+{
+    const MatShape sizes = std::get<0>(GetParam());
+    const bool useMax = std::get<1>(GetParam());
+    const int nplanes = sizes[0] * sizes[1];
+    Mat inp((int)sizes.size(), sizes.data(), CV_8S);
+    randu(inp, -100, 100);
+
+    Mat planes = inp.reshape(1, nplanes);
+    Mat ref(nplanes, 1, CV_8S);
+    for (int i = 0; i < nplanes; i++)
+    {
+        double maxVal;
+        cv::minMaxIdx(planes.row(i), NULL, &maxVal);
+        const double sum = cv::sum(planes.row(i))[0];
+        ref.at<int8_t>(i) = useMax ? saturate_cast<int8_t>(maxVal)
+                                   : saturate_cast<int8_t>(std::round(sum / planes.cols));
+    }
+
+    LayerParams lp;
+    lp.name = "testGlobalPoolingInt8";
+    lp.type = "PoolingInt8";
+    lp.set("pool", useMax ? "max" : "ave");
+    lp.set("global_pooling", true);
+    lp.set("zeropoints", 0);
+    lp.set("scales", 1.f);
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+
+    std::vector<MatShape> inputs(1, shape(inp)), outputs, internals;
+    layer->getMemoryShapes(inputs, 1, outputs, internals);
+    ASSERT_EQ(outputs[0].size(), sizes.size());
+    for (int d = 2; d < (int)outputs[0].size(); d++)
+        ASSERT_EQ(outputs[0][d], 1) << "d = " << d;
+
+    std::vector<Mat> input(1, inp), output(1, Mat(outputs[0], CV_8S));
+    layer->finalize(input, output);
+    layer->forward(input, output, std::vector<Mat>());
+
+    const Mat got = output[0].reshape(1, nplanes);
+    for (int j = 0; j < nplanes; j++)
+        EXPECT_EQ((int)got.at<int8_t>(j), (int)ref.at<int8_t>(j)) << "j = " << j;
+}
+
+// The quantized layer shares the parameters of the float one, so both are checked on two
+// spatial dimensions (4-D input) and on the three the layer can describe (5-D input).
+INSTANTIATE_TEST_CASE_P(/**/, Layer_Test_GlobalPooling, testing::Combine(
+    testing::Values(MatShape{2, 3, 4, 5}, MatShape{2, 3, 4, 5, 6}),
+    testing::Bool()),
+    GlobalPoolingParamName());
+
+typedef testing::TestWithParam<tuple<MatShape, bool> > Layer_Test_GlobalPoolingBlock;
+TEST_P(Layer_Test_GlobalPoolingBlock, EmptyBatch)
+{
+    const MatShape sizes = std::get<0>(GetParam());
+    const bool useMax = std::get<1>(GetParam());
+    const int C0 = 8;
+    std::vector<int> blockSizes(sizes.begin(), sizes.end());
+    blockSizes[1] = (sizes[1] + C0 - 1) / C0;
+    blockSizes.push_back(C0);
+    Mat inp(MatShape(blockSizes, DATA_LAYOUT_BLOCK, sizes[1]), CV_32F);
+
+    LayerParams lp;
+    lp.name = "testGlobalPoolingBlock";
+    lp.type = "Pooling";
+    lp.set("pool", useMax ? "MAX" : "AVE");
+    lp.set("global_pooling", true);
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+
+    std::vector<MatShape> inputs(1, inp.shape()), outputs, internals;
+    layer->getMemoryShapes(inputs, 1, outputs, internals);
+    std::vector<Mat> input(1, inp), output(1, Mat(outputs[0], CV_32F));
+    layer->finalize(input, output);
+    layer->forward(input, output, std::vector<Mat>());
+
+    MatShape expected = inp.shape();
+    for (int d = 2; d < expected.dims - 1; d++)
+        expected[d] = 1;
+    EXPECT_EQ(expected, output[0].shape());
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Layer_Test_GlobalPoolingBlock, testing::Combine(
+    testing::Values(MatShape{0, 16, 4, 5}),
+    testing::Bool()),
+    GlobalPoolingParamName());
+
 typedef testing::TestWithParam<tuple<Vec4i, int, tuple<Backend, Target> > > Layer_Test_ShuffleChannel;
 TEST_P(Layer_Test_ShuffleChannel, Accuracy)
 {
@@ -1237,6 +2285,74 @@ TEST(Layer_Test_ReduceMean, accuracy_input_0)
     }
 }
 
+
+// A Reduce over more than two axes carries the odometer index into the next
+// reduced axis; doing so used to drop the steps of the axes above it.
+TEST(Layer_Test_Reduce, NonContiguousAxes)
+{
+    const int sizes[] = {3, 3, 3, 3};
+    const int ndims = 4;
+    Mat inp(ndims, sizes, CV_32F);
+    randu(inp, -1, 1);
+
+    const std::vector<std::vector<int> > axesSets = { {0, 2, 3}, {0, 1, 3} };
+    const char* ops[] = {"MEAN", "SUM"};
+
+    for (int a = 0; a < (int)axesSets.size(); a++)
+    {
+        for (int o = 0; o < 2; o++)
+        {
+            const std::vector<int>& axes = axesSets[a];
+            const bool useMean = o == 0;
+
+            // keepdims=true, so the reduced dimensions are 1 in the reference.
+            std::vector<int> outShape(ndims, 1);
+            int reduceCount = 1;
+            for (int i = 0; i < ndims; i++)
+            {
+                if (std::find(axes.begin(), axes.end(), i) == axes.end())
+                    outShape[i] = sizes[i];
+                else
+                    reduceCount *= sizes[i];
+            }
+
+            Mat ref(outShape, CV_32F, Scalar(0));
+            Mat refFlat = ref.reshape(1, 1);
+            const float* src = inp.ptr<float>();
+            for (int i = 0; i < (int)inp.total(); i++)
+            {
+                int idx[ndims], offset = i, dst = 0;
+                for (int d = ndims - 1; d >= 0; d--)
+                {
+                    idx[d] = offset % sizes[d];
+                    offset /= sizes[d];
+                }
+                for (int d = 0; d < ndims; d++)
+                {
+                    const bool reduced = std::find(axes.begin(), axes.end(), d) != axes.end();
+                    dst = dst * outShape[d] + (reduced ? 0 : idx[d]);
+                }
+                refFlat.at<float>(dst) += src[i];
+            }
+            if (useMean)
+                ref *= 1.f / reduceCount;
+
+            LayerParams lp;
+            lp.name = "testReduce";
+            lp.type = "Reduce2";
+            lp.set("reduce", ops[o]);
+            lp.set("keepdims", true);
+            lp.set("axes", DictValue::arrayInt(&axes[0], (int)axes.size()));
+            Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+
+            std::vector<Mat> input(1, inp), output;
+            runLayer(layer, input, output);
+
+            EXPECT_EQ(shape(output[0]), shape(ref)) << "axes #" << a << ", op " << ops[o];
+            normAssert(ref.reshape(1, 1), output[0].reshape(1, 1), "", 1e-6, 1e-6);
+        }
+    }
+}
 
 // Check if relu is not fused to convolution if we requested it's output
 TEST(Layer_Test_Convolution, relu_fusion)
@@ -1549,6 +2665,229 @@ TEST_P(Layer_Test_Resize, change_input)
         Mat out = net.forward();
         normAssert(out, ref);
     }
+}
+
+// ONNX folds a constant "scales" input of Resize into zoom_factor_x/y.  The sampling
+// step along an axis is then 1/scale, which is not the same as in/out whenever in*scale
+// is not integral: a 4x5 input with scales=0.5 gives a 2x2 output, so the step is 2 and
+// not 5/2.  Resize2Layer used to derive the step from the shapes and produced different
+// pixels from onnxruntime for that case.
+TEST_P(Layer_Test_Resize, downscale_uses_given_scales)
+{
+    int backendId = get<0>(GetParam());
+    int targetId = get<1>(GetParam());
+    if (backendId != DNN_BACKEND_OPENCV)
+        throw SkipTestException("Resize2 layer is implemented for the OpenCV backend only");
+
+    const int inH = 4, inW = 5;
+    const float scale = 0.5f;
+    Mat inp(inH, inW, CV_32F);
+    for (int y = 0; y < inH; ++y)
+        for (int x = 0; x < inW; ++x)
+            inp.at<float>(y, x) = (float)(y * inW + x);
+
+    LayerParams lp;
+    lp.type = "Resize2";
+    lp.name = "testLayer";
+    lp.set("zoom_factor_y", (double)scale);
+    lp.set("zoom_factor_x", (double)scale);
+    lp.set("interpolation", "opencv_linear");
+    lp.set("coordinate_transformation_mode", "half_pixel");
+
+    Net net;
+    net.addLayerToPrev(lp.name, lp.type, lp);
+    net.setInput(blobFromImage(inp));
+    net.setPreferableBackend(backendId);
+    net.setPreferableTarget(targetId);
+    Mat out = net.forward();
+
+    const int outH = cvFloor(inH * scale), outW = cvFloor(inW * scale);
+    ASSERT_EQ(outH, out.size[2]);
+    ASSERT_EQ(outW, out.size[3]);
+
+    // ONNX half_pixel: src = (dst + 0.5) / scale - 0.5, bilinear with edge clamping.
+    const float step = 1.f / scale;
+    Mat ref(outH, outW, CV_32F);
+    for (int i = 0; i < outH; ++i)
+    {
+        float sy = std::min(std::max((i + 0.5f) * step - 0.5f, 0.f), (float)(inH - 1));
+        int y0 = cvFloor(sy), y1 = std::min(y0 + 1, inH - 1);
+        float fy = sy - y0;
+        for (int j = 0; j < outW; ++j)
+        {
+            float sx = std::min(std::max((j + 0.5f) * step - 0.5f, 0.f), (float)(inW - 1));
+            int x0 = cvFloor(sx), x1 = std::min(x0 + 1, inW - 1);
+            float fx = sx - x0;
+            ref.at<float>(i, j) = (1 - fy) * ((1 - fx) * inp.at<float>(y0, x0) + fx * inp.at<float>(y0, x1))
+                                + fy * ((1 - fx) * inp.at<float>(y1, x0) + fx * inp.at<float>(y1, x1));
+        }
+    }
+
+    normAssert(out.reshape(1, std::vector<int>{outH, outW}), ref);
+}
+
+// ONNX antialias filter taps for one axis: a triangle of support 1/scale, stretched
+// when downscaling, sampled at (dst + 0.5)/scale - 0.5 and edge-clamped.
+static void resizeAAReferenceWeights(int inS, int outS, float scale,
+                                     std::vector<std::vector<int> >& idx,
+                                     std::vector<std::vector<float> >& wgt)
+{
+    const float step = 1.f / scale;
+    const float support = step >= 1.f ? step : 1.f;
+    const float inv = step >= 1.f ? 1.f / step : 1.f;
+    idx.assign(outS, std::vector<int>());
+    wgt.assign(outS, std::vector<float>());
+    for (int o = 0; o < outS; ++o)
+    {
+        const float center = (o + 0.5f) * step - 0.5f;
+        const int lo = cvFloor(center - support + 0.5f);
+        const int hi = cvFloor(center + support + 0.5f);
+        std::vector<float> acc(inS, 0.f);
+        float total = 0.f;
+        for (int x = lo; x <= hi; ++x)
+        {
+            const float t = std::abs((x - center) * inv);
+            const float w = t < 1.f ? 1.f - t : 0.f;
+            acc[std::min(std::max(x, 0), inS - 1)] += w;
+            total += w;
+        }
+        for (int x = 0; x < inS; ++x)
+        {
+            if (acc[x] != 0.f)
+            {
+                idx[o].push_back(x);
+                wgt[o].push_back(total != 0.f ? acc[x] / total : 0.f);
+            }
+        }
+    }
+}
+
+// The antialias filter support is 1/scale as well, so the same folded-scale case
+// must not stretch the filter by the in/out ratio instead.
+TEST_P(Layer_Test_Resize, antialias_downscale_uses_given_scales)
+{
+    int backendId = get<0>(GetParam());
+    int targetId = get<1>(GetParam());
+    if (backendId != DNN_BACKEND_OPENCV)
+        throw SkipTestException("Resize2 layer is implemented for the OpenCV backend only");
+
+    const int inH = 4, inW = 5;
+    const float scale = 0.5f;
+    Mat inp(inH, inW, CV_32F);
+    for (int y = 0; y < inH; ++y)
+        for (int x = 0; x < inW; ++x)
+            inp.at<float>(y, x) = (float)(y * inW + x);
+
+    LayerParams lp;
+    lp.type = "Resize2";
+    lp.name = "testLayer";
+    lp.set("zoom_factor_y", (double)scale);
+    lp.set("zoom_factor_x", (double)scale);
+    lp.set("interpolation", "opencv_linear");
+    lp.set("coordinate_transformation_mode", "half_pixel");
+    lp.set("antialias", 1);
+
+    Net net;
+    net.addLayerToPrev(lp.name, lp.type, lp);
+    net.setInput(blobFromImage(inp));
+    net.setPreferableBackend(backendId);
+    net.setPreferableTarget(targetId);
+    Mat out = net.forward();
+
+    const int outH = cvFloor(inH * scale), outW = cvFloor(inW * scale);
+    ASSERT_EQ(outH, out.size[2]);
+    ASSERT_EQ(outW, out.size[3]);
+
+    std::vector<std::vector<int> > xi, yi;
+    std::vector<std::vector<float> > xw, yw;
+    resizeAAReferenceWeights(inW, outW, scale, xi, xw);
+    resizeAAReferenceWeights(inH, outH, scale, yi, yw);
+
+    Mat tmp(inH, outW, CV_32F, Scalar(0));
+    for (int y = 0; y < inH; ++y)
+        for (int ox = 0; ox < outW; ++ox)
+        {
+            float acc = 0.f;
+            for (size_t k = 0; k < xi[ox].size(); ++k)
+                acc += xw[ox][k] * inp.at<float>(y, xi[ox][k]);
+            tmp.at<float>(y, ox) = acc;
+        }
+
+    Mat ref(outH, outW, CV_32F);
+    for (int oy = 0; oy < outH; ++oy)
+        for (int ox = 0; ox < outW; ++ox)
+        {
+            float acc = 0.f;
+            for (size_t k = 0; k < yi[oy].size(); ++k)
+                acc += yw[oy][k] * tmp.at<float>(yi[oy][k], ox);
+            ref.at<float>(oy, ox) = acc;
+        }
+
+    normAssert(out.reshape(1, std::vector<int>{outH, outW}), ref);
+}
+
+// align_corners lines up the corners of the input and the output, so its step is
+// (in - 1) / (out - 1) with the integer output length, not (in - 1) / (in * scale - 1).
+TEST_P(Layer_Test_Resize, align_corners_downscale)
+{
+    int backendId = get<0>(GetParam());
+    int targetId = get<1>(GetParam());
+    if (backendId != DNN_BACKEND_OPENCV)
+        throw SkipTestException("Resize2 layer is implemented for the OpenCV backend only");
+
+    const int inH = 5, inW = 7;
+    const float scale = 0.5f;
+    Mat inp(inH, inW, CV_32F);
+    for (int y = 0; y < inH; ++y)
+        for (int x = 0; x < inW; ++x)
+            inp.at<float>(y, x) = 3.f * (y * inW + x);
+
+    LayerParams lp;
+    lp.type = "Resize2";
+    lp.name = "testLayer";
+    lp.set("zoom_factor_y", (double)scale);
+    lp.set("zoom_factor_x", (double)scale);
+    lp.set("interpolation", "bilinear");
+    lp.set("align_corners", true);
+    lp.set("coordinate_transformation_mode", "align_corners");
+
+    Net net;
+    net.addLayerToPrev(lp.name, lp.type, lp);
+    net.setInput(blobFromImage(inp));
+    net.setPreferableBackend(backendId);
+    net.setPreferableTarget(targetId);
+    Mat out = net.forward();
+
+    const int outH = cvFloor(inH * scale), outW = cvFloor(inW * scale);
+    ASSERT_EQ(outH, out.size[2]);
+    ASSERT_EQ(outW, out.size[3]);
+
+    // src = dst * (in - 1) / (out - 1), bilinear with edge clamping.
+    const float stepY = outH > 1 ? float(inH - 1) / (outH - 1) : 0.f;
+    const float stepX = outW > 1 ? float(inW - 1) / (outW - 1) : 0.f;
+    Mat ref(outH, outW, CV_32F);
+    for (int i = 0; i < outH; ++i)
+    {
+        const float sy = std::min(std::max(i * stepY, 0.f), (float)(inH - 1));
+        const int y0 = cvFloor(sy), y1 = std::min(y0 + 1, inH - 1);
+        const float fy = sy - y0;
+        for (int j = 0; j < outW; ++j)
+        {
+            const float sx = std::min(std::max(j * stepX, 0.f), (float)(inW - 1));
+            const int x0 = cvFloor(sx), x1 = std::min(x0 + 1, inW - 1);
+            const float fx = sx - x0;
+            ref.at<float>(i, j) = (1 - fy) * ((1 - fx) * inp.at<float>(y0, x0) + fx * inp.at<float>(y0, x1))
+                                + fy * ((1 - fx) * inp.at<float>(y1, x0) + fx * inp.at<float>(y1, x1));
+        }
+    }
+
+    // the corners match exactly, and the interior step is (in - 1) / (out - 1)
+    const Mat out2d = out.reshape(1, std::vector<int>{outH, outW});
+    EXPECT_FLOAT_EQ(inp.at<float>(0, 0), out2d.at<float>(0, 0));
+    EXPECT_FLOAT_EQ(inp.at<float>(0, inW - 1), out2d.at<float>(0, outW - 1));
+    EXPECT_FLOAT_EQ(3.f * stepX, out2d.at<float>(0, 1));
+    // the kernel samples the last row and column 1e-6 short of the edge
+    normAssert(out2d, ref, "", 5e-5, 1e-4);
 }
 
 INSTANTIATE_TEST_CASE_P(/**/, Layer_Test_Resize, dnnBackendsAndTargets());
@@ -2249,21 +3588,10 @@ TEST(Layer_LSTM, repeatedInference)
 
 TEST(Layer_If, resize)
 {
-    // Skip this test when the classic DNN engine is explicitly requested. The
-    // "if" layer is supported only by the new engine.
-    auto engine_forced = static_cast<cv::dnn::EngineType>(
-            cv::utils::getConfigurationParameterSizeT("OPENCV_FORCE_DNN_ENGINE", cv::dnn::ENGINE_AUTO));
-    if (engine_forced == cv::dnn::ENGINE_CLASSIC)
-    {
-        // Mark the test as skipped and exit early.
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_PARSER);
-        return;
-    }
-
     const std::string imgname   = findDataFile("cv/shared/lena.png", true);
     const std::string modelname = findDataFile("dnn/onnx/models/if_layer.onnx", true);
 
-    dnn::Net net = dnn::readNetFromONNX(modelname, ENGINE_NEW);
+    dnn::Net net = dnn::readNetFromONNX(modelname, ENGINE_OPENCV);
     Mat src = imread(imgname), blob;
     dnn::blobFromImage(src, blob, 1.0, cv::Size(), cv::Scalar(), false, false);
 
@@ -2286,16 +3614,8 @@ TEST(Layer_If, resize)
 
 TEST(Layer_If, subgraph_name_scoping)
 {
-    auto engine_forced = static_cast<cv::dnn::EngineType>(
-            cv::utils::getConfigurationParameterSizeT("OPENCV_FORCE_DNN_ENGINE", cv::dnn::ENGINE_AUTO));
-    if (engine_forced == cv::dnn::ENGINE_CLASSIC)
-    {
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_PARSER);
-        return;
-    }
-
     const std::string modelname = findDataFile("dnn/onnx/models/subgraph_name_scoping.onnx", true);
-    dnn::Net net = dnn::readNetFromONNX(modelname, ENGINE_NEW);
+    dnn::Net net = dnn::readNetFromONNX(modelname, ENGINE_OPENCV);
 
     int xshape[1] = {2};
     Mat x(1, xshape, CV_32F);
@@ -2331,16 +3651,8 @@ TEST(Layer_If, subgraph_name_scoping)
 
 TEST(Layer_Size, onnx_1d)
 {
-    auto engine_forced = static_cast<cv::dnn::EngineType>(
-        cv::utils::getConfigurationParameterSizeT("OPENCV_FORCE_DNN_ENGINE", cv::dnn::ENGINE_AUTO));
-    if (engine_forced == cv::dnn::ENGINE_CLASSIC)
-    {
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_PARSER);
-        return;
-    }
-
     const std::string modelname = findDataFile("dnn/onnx/models/test_size_1d_model.onnx", true);
-    cv::dnn::Net net = cv::dnn::readNetFromONNX(modelname, ENGINE_NEW);
+    cv::dnn::Net net = cv::dnn::readNetFromONNX(modelname, ENGINE_OPENCV);
 
     int sz1d[1] = {7};
     cv::Mat x(1, sz1d, CV_32F);
@@ -2358,16 +3670,8 @@ TEST(Layer_Size, onnx_1d)
 
 TEST(Layer_Size, onnx_0d_scalar)
 {
-    auto engine_forced = static_cast<cv::dnn::EngineType>(
-        cv::utils::getConfigurationParameterSizeT("OPENCV_FORCE_DNN_ENGINE", cv::dnn::ENGINE_AUTO));
-    if (engine_forced == cv::dnn::ENGINE_CLASSIC)
-    {
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_PARSER);
-        return;
-    }
-
     const std::string modelname = findDataFile("dnn/onnx/models/test_size_0d_model.onnx", true);
-    cv::dnn::Net net = cv::dnn::readNetFromONNX(modelname, ENGINE_NEW);
+    cv::dnn::Net net = cv::dnn::readNetFromONNX(modelname, ENGINE_OPENCV);
 
     cv::Mat x(1, 1, CV_32F);
     x.at<float>(0, 0) = 3.14f;
@@ -2380,6 +3684,47 @@ TEST(Layer_Size, onnx_0d_scalar)
     EXPECT_EQ(outs[0].total(), (size_t)1);
     EXPECT_EQ(outs[0].type(), CV_64S);
     EXPECT_EQ(outs[0].at<int64_t>(0), 1);
+}
+
+TEST(Layer_GatherCast, preserves_float_cast)
+{
+    const std::string modelname = findDataFile("dnn/onnx/models/gather_cast_float.onnx", true);
+    Net net = readNetFromONNX(modelname, ENGINE_OPENCV);
+    ASSERT_FALSE(net.empty());
+    ASSERT_TRUE(net.getMainGraph());
+
+    int inputShape[] = {2, 3};
+    Mat input(2, inputShape, CV_32F, Scalar(0));
+    net.setInput(input, "input");
+
+    std::vector<Mat> outputs;
+    net.forward(outputs, std::vector<String>{"output"});
+
+    ASSERT_EQ(outputs.size(), 1u);
+    EXPECT_EQ(outputs[0].total(), (size_t)1);
+    EXPECT_EQ(outputs[0].type(), CV_32F);
+    EXPECT_FLOAT_EQ(outputs[0].ptr<float>()[0], 2.f);
+}
+
+TEST(Layer_MulCast, preserves_float_cast)
+{
+    const std::string modelname = findDataFile("dnn/onnx/models/mul_cast_float.onnx", true);
+    Net net = readNetFromONNX(modelname, ENGINE_OPENCV);
+    ASSERT_FALSE(net.empty());
+    ASSERT_TRUE(net.getMainGraph());
+
+    int inputShape[] = {2, 3};
+    Mat input(2, inputShape, CV_32F, Scalar(0));
+    net.setInput(input, "input");
+
+    std::vector<Mat> outputs;
+    net.forward(outputs, std::vector<String>{"output"});
+
+    ASSERT_EQ(outputs.size(), 1u);
+    EXPECT_EQ(outputs[0].total(), (size_t)2);
+    EXPECT_EQ(outputs[0].type(), CV_32F);
+    EXPECT_FLOAT_EQ(outputs[0].ptr<float>()[0], 2.f);
+    EXPECT_FLOAT_EQ(outputs[0].ptr<float>()[1], 2.f);
 }
 
 TEST(ConvolutionWinograd, Accuracy)
@@ -2430,20 +3775,11 @@ class TESTKVCache : public testing::TestWithParam<std::string>
 public:
     void testKVCache(const std::string& layout)
     {
-        auto engine_forced = static_cast<cv::dnn::EngineType>(
-                cv::utils::getConfigurationParameterSizeT("OPENCV_FORCE_DNN_ENGINE", cv::dnn::ENGINE_AUTO));
-        if (engine_forced == cv::dnn::ENGINE_CLASSIC)
-        {
-            // Mark the test as skipped and exit early.
-            applyTestTag(CV_TEST_TAG_DNN_SKIP_PARSER);
-            return;
-        }
-
         std::string model_path = "dnn/onnx/models/test_attention_kv_cache_" + layout + ".onnx";
 
-        Net netWithKVCache = readNetFromONNX(findDataFile(model_path, true), cv::dnn::ENGINE_NEW);
+        Net netWithKVCache = readNetFromONNX(findDataFile(model_path, true), cv::dnn::ENGINE_OPENCV);
         netWithKVCache.enableKVCache();
-        Net netWithoutKVCache = readNetFromONNX(findDataFile(model_path, true), cv::dnn::ENGINE_NEW);
+        Net netWithoutKVCache = readNetFromONNX(findDataFile(model_path, true), cv::dnn::ENGINE_OPENCV);
 
         int T = 523, Nq = 8, Nkv = 4, D = 256;
         // Keep the prefill larger than one cache page, then exercise generation
@@ -2498,12 +3834,9 @@ public:
         }
         Y.setTo(0);
 
-        std::vector<Range> ranges_pref;
-        if (layout == "3d") {
-            ranges_pref = {Range::all(), Range(0, T_pref), Range::all()};
-        } else {
-            ranges_pref = {Range::all(), Range::all(), Range(0, T_pref), Range::all()};
-        }
+        std::vector<Range> ranges_pref = (layout == "3d")
+                         ? std::vector<Range>{Range::all(), Range(0, T_pref), Range::all()}
+                         : std::vector<Range>{Range::all(), Range::all(), Range(0, T_pref), Range::all()};
 
         Mat Q_pref = Q_all(ranges_pref);
         Mat K_pref = K_all(ranges_pref);
@@ -2518,12 +3851,9 @@ public:
         // 2. Generate
         for(int t = T_pref; t < T; t++)
         {
-            std::vector<Range> ranges_gen;
-            if (layout == "3d") {
-                ranges_gen = {Range::all(), Range(t, t + 1), Range::all()};
-            } else {
-                ranges_gen = {Range::all(), Range::all(), Range(t, t + 1), Range::all()};
-            }
+            std::vector<Range> ranges_gen = (layout == "3d")
+                                          ? std::vector<Range>{Range::all(), Range(t, t + 1), Range::all()}
+                                          : std::vector<Range>{Range::all(), Range::all(), Range(t, t + 1), Range::all()};
 
             netWithKVCache.setInput(Q_all(ranges_gen), "Q");
             netWithKVCache.setInput(K_all(ranges_gen), "K");
@@ -2544,11 +3874,100 @@ public:
         std::string msg = "Attention generate " + layout + ": KV vs standard";
         normAssert(Y, Yref, msg.c_str(), 1e-3, 1e-3);
     }
+
+    // Generate in multi-token chunks (chunked prefill / speculative decode) with the page pool
+    // pre-reserved. Must match the non-cached full run; reserveTokens below the full length
+    // exercises reservation as a hint rather than a limit.
+    void testKVCacheChunkedReserve(const std::string& layout, int reserveTokens)
+    {
+        std::string model_path = "dnn/onnx/models/test_attention_kv_cache_" + layout + ".onnx";
+
+        Net netWithKVCache = readNetFromONNX(findDataFile(model_path, true), cv::dnn::ENGINE_OPENCV);
+        netWithKVCache.enableKVCache();
+        Net netWithoutKVCache = readNetFromONNX(findDataFile(model_path, true), cv::dnn::ENGINE_OPENCV);
+
+        int T = 523, Nq = 8, Nkv = 4, D = 256;
+        int T_pref = T - 37;    // generate the tail in chunks, incl. a partial last chunk
+        int chunk = 5;
+
+        netWithKVCache.reserveKVCache(reserveTokens);   // static pre-allocation
+
+        std::vector<int> q_sz, k_sz, v_sz;
+        if (layout == "3d") { q_sz = {1, T, Nq * D}; k_sz = {1, T, Nkv * D}; v_sz = {1, T, Nkv * D}; }
+        else                { q_sz = {1, Nq, T, D}; k_sz = {1, Nkv, T, D}; v_sz = {1, Nkv, T, D}; }
+
+        Mat Q_all(q_sz, CV_32F), K_all(k_sz, CV_32F), V_all(v_sz, CV_32F);
+        cv::randn(Q_all, 0.0, 1.0); cv::randn(K_all, 0.0, 1.0); cv::randn(V_all, 0.0, 1.0);
+
+        std::vector<int> mask_sz = {1, Nq, T, T};
+        Mat mask(mask_sz, CV_32S, cv::Scalar(0));
+        int* mask_ptr = (int*)mask.data;
+        for (int n = 0; n < Nq; n++)
+            for (int i = 0; i < T; i++)
+                for (int j = 0; j < T; j++) {
+                    int idx = n * T * T + i * T + j;
+                    if (i < T_pref) { if (j < T_pref) mask_ptr[idx] = 1; }
+                    else            { if (j <= i)      mask_ptr[idx] = 1; }
+                }
+
+        Mat Y(q_sz, CV_32F); Y.setTo(0);
+
+        // Prefill (lo=0) then generate in multi-token chunks. A chunk needs within-chunk
+        // causality supplied explicitly (this model is not is_causal), so feed the reference
+        // mask restricted to queries [lo,hi) against the cache [0,hi).
+        for (int lo = 0; lo < T; )
+        {
+            int hi = (lo == 0) ? T_pref : std::min(lo + chunk, T);
+            std::vector<Range> qr = (layout == "3d")
+                                    ? std::vector<Range>{ Range::all(), Range(lo, hi), Range::all() }
+                                    : std::vector<Range>{ Range::all(), Range::all(), Range(lo, hi), Range::all() };
+            std::vector<Range> mr = { Range::all(), Range::all(), Range(lo, hi), Range(0, hi) };
+
+            netWithKVCache.setInput(Q_all(qr), "Q");
+            netWithKVCache.setInput(K_all(qr), "K");
+            netWithKVCache.setInput(V_all(qr), "V");
+            netWithKVCache.setInput(mask(mr).clone(), "Mask");
+            netWithKVCache.forward().copyTo(Y(qr));
+            lo = hi;
+        }
+
+        // 3. Reference: full sequence, no cache
+        netWithoutKVCache.setInput(Q_all, "Q");
+        netWithoutKVCache.setInput(K_all, "K");
+        netWithoutKVCache.setInput(V_all, "V");
+        netWithoutKVCache.setInput(mask, "Mask");
+        Mat Yref = netWithoutKVCache.forward();
+
+        std::string msg = "Attention chunked+reserve " + layout + ": KV vs standard";
+        normAssert(Y, Yref, msg.c_str(), 1e-3, 1e-3);
+    }
 };
 
 TEST_P(TESTKVCache, layouts)
 {
     testKVCache(GetParam());
+}
+
+TEST_P(TESTKVCache, chunked_reserve)
+{
+    testKVCacheChunkedReserve(GetParam(), 523);
+}
+
+// Reservation is a hint, not a cap: the pool still grows past it.
+TEST_P(TESTKVCache, reserve_underrun)
+{
+    testKVCacheChunkedReserve(GetParam(), 100);
+}
+
+TEST_P(TESTKVCache, reserve_requires_enable)
+{
+    std::string model_path = "dnn/onnx/models/test_attention_kv_cache_" + GetParam() + ".onnx";
+    Net net = readNetFromONNX(findDataFile(model_path, true), cv::dnn::ENGINE_OPENCV);
+    EXPECT_THROW(net.reserveKVCache(128), cv::Exception);
+
+    net.enableKVCache();
+    EXPECT_NO_THROW(net.reserveKVCache(128));
+    EXPECT_THROW(net.reserveKVCache(-1), cv::Exception);
 }
 
 INSTANTIATE_TEST_CASE_P(KV_Cache, TESTKVCache, testing::Values("3d", "4d"));
@@ -2582,6 +4001,78 @@ TEST(Layer_Test_GeluApprox, NoNaN_LargeInput)
     EXPECT_NEAR(out.ptr<float>()[9], 20.f, 0.01f);
     EXPECT_NEAR(out.ptr<float>()[0], 0.f, 1e-6f);
     EXPECT_NEAR(out.ptr<float>()[4], 0.f, 1e-6f);
+}
+
+TEST(Layer_Test_TanH, NoNaN_LargeInput)
+{
+    LayerParams lp;
+    lp.type = "TanH";
+    lp.name = "test_tanh";
+    Ptr<Layer> layer = LayerFactory::createLayerInstance("TanH", lp);
+    ASSERT_TRUE(layer != nullptr);
+
+    // Overflowing values go first; in the scalar tail tanhf() would mask the NaN.
+    const int len = 64;
+    float data[len];
+    for (int i = 0; i < len / 2; i++)
+        data[i] = (i % 2 == 0 ? 1.f : -1.f) * (45.f + i);
+    for (int i = len / 2; i < len; i++)
+        data[i] = -4.f + 0.25f * (i - len / 2);
+
+    int dims[] = {1, 1, len};
+    Mat inp(3, dims, CV_32F, data);
+    std::vector<Mat> inpVec = {inp};
+    std::vector<Mat> outVec;
+
+    runLayer(layer, inpVec, outVec);
+    ASSERT_EQ(outVec.size(), (size_t)1);
+
+    Mat& out = outVec[0];
+    for (int i = 0; i < len; i++) {
+        float val = out.ptr<float>()[i];
+        EXPECT_FALSE(cvIsNaN(val)) << "NaN at index " << i << " (input=" << data[i] << ")";
+        EXPECT_FALSE(cvIsInf(val)) << "Inf at index " << i << " (input=" << data[i] << ")";
+        EXPECT_NEAR(val, std::tanh(data[i]), 1e-6f) << "index " << i;
+    }
+}
+
+// Softmax/LogSoftmax before ONNX opset 13 coerce the input to the 2D tensor
+// [a_0*...*a_{axis-1}, a_axis*...*a_{n-1}], so axis=1 on a 2x3x4 input normalises the 12
+// values of the flattened tail per sample instead of the 3 values of the axis.
+TEST(Layer_Test_Softmax, Coerced2dReducesFlattenedTail)
+{
+    LayerParams lp;
+    lp.type = "Softmax";
+    lp.name = "test_softmax";
+    lp.set("axis", 1);
+    lp.set("coerced_2d", true);
+    Ptr<Layer> layer = LayerFactory::createLayerInstance("Softmax", lp);
+    ASSERT_TRUE(layer != nullptr);
+
+    const int rows = 2, tail = 12;
+    int dims[] = {rows, 3, 4};
+    Mat inp(3, dims, CV_32F);
+    randu(inp, -2.f, 2.f);
+    std::vector<Mat> inpVec = {inp};
+    std::vector<Mat> outVec;
+
+    runLayer(layer, inpVec, outVec);
+    ASSERT_EQ(outVec.size(), (size_t)1);
+    const Mat& out = outVec[0];
+
+    for (int n = 0; n < rows; n++)
+    {
+        const float* inRow = inp.ptr<float>(n);
+        const float* outRow = out.ptr<float>(n);
+        float maxVal = inRow[0];
+        for (int i = 1; i < tail; i++)
+            maxVal = std::max(maxVal, inRow[i]);
+        double sum = 0;
+        for (int i = 0; i < tail; i++)
+            sum += std::exp(inRow[i] - maxVal);
+        for (int i = 0; i < tail; i++)
+            EXPECT_NEAR(outRow[i], std::exp(inRow[i] - maxVal) / sum, 1e-6f) << "row " << n << " index " << i;
+    }
 }
 
 TEST(Layer_Test_Softmax, NoNaN_AllNegInf)
@@ -2694,6 +4185,80 @@ TEST(Test_Gemm, FastGemmDynamicTransposeAlphaBeta)
     }
 }
 
+// fuseMatMulConstBToGemm() rewrites MatMul(A, const B) into a Gemm with flatten_a=false so
+// that A keeps its leading dims. ONNX MatMul accepts a rank-1 A - it is promoted to (1, K) and
+// the leading 1 is squeezed from Y again, so Y is (N,) - and the rewrite inherits that. The
+// Gemm has to accept it too, otherwise such a model only runs when B is a runtime input.
+TEST(Test_Gemm, Rank1AFromMatMulRewrite)
+{
+    const int K = 4, N = 6;
+    Mat B(K, N, CV_32F);
+    randu(B, -1.f, 1.f);
+
+    for (int withBias = 0; withBias <= 1; withBias++)
+    {
+        for (int depth = CV_32F; depth <= CV_64F; depth++)
+        {
+            Mat Bd = (depth == CV_32F) ? B : Mat();
+            if (depth != CV_32F)
+                B.convertTo(Bd, depth);
+            Mat bias;
+            if (withBias)
+            {
+                bias = Mat::zeros(1, N, depth);
+                randu(bias, -1.f, 1.f);
+            }
+
+            LayerParams lp;
+            lp.type = "Gemm";
+            lp.name = "gemm_rank1_a";
+            lp.set("transA", false);
+            lp.set("transB", false);
+            lp.set("alpha", 1.f);
+            lp.set("beta", withBias ? 1.f : 0.f);
+            lp.set("constB", true);
+            lp.set("const_C", (bool)withBias);
+            lp.set("have_bias", (bool)withBias);
+            if (withBias)
+                lp.set("real_ndims_C", 1);
+            lp.set("flatten_a", false);   // the mode the MatMul -> Gemm rewrite uses
+            lp.blobs.push_back(Bd);
+            if (withBias)
+                lp.blobs.push_back(bias);
+
+            Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+            ASSERT_TRUE(layer);
+
+            Mat A(std::vector<int>{K}, depth);
+            randu(A, -1.f, 1.f);
+            std::vector<Mat> inputs = {A}, outputs;
+            runLayer(layer, inputs, outputs);
+            ASSERT_EQ(outputs.size(), (size_t)1);
+            EXPECT_EQ(shape(outputs[0]), shape(N));   // (N,), as MatMul would produce
+
+            Mat expected(1, N, depth);
+            Mat a2d = A.reshape(1, 1);
+            if (withBias)
+                gemm(a2d, Bd, 1., bias, 1., expected);
+            else
+                gemm(a2d, Bd, 1., noArray(), 0., expected);
+            normAssert(outputs[0].reshape(1, 1), expected, "Gemm rank-1 A mismatch", 1e-4, 1e-4);
+        }
+    }
+
+    // A plain ONNX Gemm (flatten_a defaults to true) still requires a 2-D A.
+    LayerParams plain;
+    plain.type = "Gemm";
+    plain.name = "gemm_plain_rank1_a";
+    plain.set("transA", false);
+    plain.set("transB", false);
+    plain.blobs.push_back(B);
+    Ptr<Layer> plainLayer = LayerFactory::createLayerInstance(plain.type, plain);
+    ASSERT_TRUE(plainLayer);
+    std::vector<MatShape> inShapes(1, shape(K)), outShapes, internals;
+    EXPECT_THROW(plainLayer->getMemoryShapes(inShapes, 1, outShapes, internals), cv::Exception);
+}
+
 TEST(Test_MatMul, FastGemmBatchDynamicAndPackedBroadcast)
 {
     const int batch = 3, M = 11, N = 19, K = 67;
@@ -2744,6 +4309,571 @@ TEST(Test_MatMul, FastGemmBatchDynamicAndPackedBroadcast)
     ASSERT_EQ(packedOutputs.size(), (size_t)1);
     Mat packedExpected = reference(packedB, false, true);
     normAssert(packedOutputs[0], packedExpected, "fastGemm packed broadcast batch mismatch", 1e-4, 1e-4);
+}
+
+TEST(Test_MatMul, ConstantRank1WeightPacking)
+{
+    // [M, K] @ [K] -> [M] with a constant rank-1 weight, as seen in DEIMv2-style graphs.
+    const int M = 4960, K = 33;
+    Mat A(M, K, CV_32F);
+    Mat B(std::vector<int>{K}, CV_32F);  // genuinely rank-1, not [K, 1]
+    randu(A, -1.f, 1.f);
+    randu(B, -1.f, 1.f);
+
+    LayerParams lp;
+    lp.type = "MatMul";
+    lp.name = "matmul_constant_rank1_B";
+    lp.set("transA", false);
+    lp.set("transB", false);
+    lp.blobs.push_back(B);
+
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+    std::vector<Mat> inputs = {A}, outputs;
+    runLayer(layer, inputs, outputs);
+    ASSERT_EQ(outputs.size(), (size_t)1);
+
+    Mat b2d = B.reshape(1, std::vector<int>{K, 1});
+    Mat expected2d;
+    gemm(A, b2d, 1., noArray(), 0., expected2d);
+    Mat expected = expected2d.reshape(1, std::vector<int>{M});
+    normAssert(outputs[0], expected, "MatMul constant rank-1 weight packing mismatch", 1e-4, 1e-4);
+}
+
+// A constant weight whose leading dims broadcast against the activations: B has more than
+// one batch slice, but fewer than the output batch. The packed-B stride has to be derived
+// from the number of slices actually stored in B, not from the (broadcast) output batch.
+TEST(Test_MatMul, PackedBroadcastMultipleSlices)
+{
+    const int A0 = 2, A1 = 1, M = 3, K = 4;
+    const int B0 = 1, B1 = 5, N = 6;
+    Mat A({A0, A1, M, K}, CV_32F);
+    Mat B({B0, B1, K, N}, CV_32F);
+    randu(A, -1.f, 1.f);
+    randu(B, -1.f, 1.f);
+
+    LayerParams lp;
+    lp.type = "MatMul";
+    lp.name = "matmul_packed_broadcast_multi_slice";
+    lp.set("transA", false);
+    lp.set("transB", false);
+    lp.blobs.push_back(B);
+
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+    std::vector<Mat> inputs = {A}, outputs;
+    runLayer(layer, inputs, outputs);
+    ASSERT_EQ(outputs.size(), (size_t)1);
+
+    Mat expected({A0, B1, M, N}, CV_32F);
+    for (int i = 0; i < A0; i++)
+    {
+        for (int j = 0; j < B1; j++)
+        {
+            Mat a2d(M, K, CV_32F, A.ptr<float>(i, 0));
+            Mat b2d(K, N, CV_32F, B.ptr<float>(0, j));
+            Mat c2d(M, N, CV_32F, expected.ptr<float>(i, j));
+            gemm(a2d, b2d, 1., noArray(), 0., c2d);
+        }
+    }
+    normAssert(outputs[0], expected, "MatMul packed broadcast multi-slice mismatch", 1e-4, 1e-4);
+}
+
+// M, N or K == 0 used to divide by zero or read out of bounds.
+TEST(Test_MatMul, EmptyDimsDoNotCrash)
+{
+    const int dims[][3] = {  // {M, K, N}
+        {0, 4, 5},  // empty A (no rows)
+        {3, 4, 0},  // empty B (no columns)
+        {3, 0, 4},  // empty contraction dim
+    };
+    for (const auto &d : dims)
+    {
+        const int M = d[0], K = d[1], N = d[2];
+        for (bool constB : {false, true})
+        {
+            Mat A(M, K, CV_32F);
+            Mat B(K, N, CV_32F);
+
+            LayerParams lp;
+            lp.type = "MatMul";
+            lp.name = "matmul_empty_dims";
+            if (constB)
+                lp.blobs.push_back(B);
+
+            Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+            ASSERT_TRUE(layer);
+            std::vector<Mat> inputs = constB ? std::vector<Mat>{A} : std::vector<Mat>{A, B};
+            std::vector<Mat> outputs;
+            runLayer(layer, inputs, outputs);
+            ASSERT_EQ(outputs.size(), (size_t)1);
+            ASSERT_EQ(shape(outputs[0]), MatShape({M, N}));
+
+            Mat expected = Mat::zeros(M, N, CV_32F);
+            normAssert(outputs[0], expected, "MatMul empty-dims output mismatch", 1e-4, 1e-4);
+        }
+    }
+}
+
+// K == 0 skips the gemm entirely, so beta must be applied to the bias explicitly instead of
+// relying on the (never-called) gemm's own beta. Rank-2 bias, both as a constant blob
+// (finalize()'s broadcast_bias path) and as a dynamic input (forward()'s own broadcast path).
+TEST(Test_MatMul, EmptyKDimAppliesBetaToBias)
+{
+    const int M = 3, N = 4;
+    Mat bias(M, N, CV_32F);
+    randu(bias, -1.f, 1.f);
+    const float beta = 2.0f;
+
+    for (bool constB : {false, true})
+    {
+        Mat A(M, 0, CV_32F), B(0, N, CV_32F);
+
+        LayerParams lp;
+        lp.type = "MatMul";
+        lp.name = "matmul_empty_k_bias";
+        lp.set("beta", beta);
+        lp.set("real_ndims_C", 2);
+        if (constB) {
+            lp.blobs.push_back(B);
+            lp.blobs.push_back(bias);
+        }
+
+        Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+        ASSERT_TRUE(layer);
+        std::vector<Mat> inputs = constB ? std::vector<Mat>{A} : std::vector<Mat>{A, B, bias};
+        std::vector<Mat> outputs;
+        runLayer(layer, inputs, outputs);
+
+        Mat expected = beta * bias;
+        normAssert(outputs[0], expected, "MatMul empty-K bias/beta mismatch", 1e-4, 1e-4);
+    }
+}
+
+// Backends add the bias themselves, so each must apply beta for every bias rank, both when
+// B and the bias are constant blobs and when they are network inputs.
+typedef DNNTestLayer Test_MatMul_BiasBeta;
+TEST_P(Test_MatMul_BiasBeta, Accuracy)
+{
+    const int M = 4, K = 8, N = 6;
+    const float beta = 2.f;
+    Mat A(M, K, CV_32F), B(K, N, CV_32F);
+    randu(A, -1.f, 1.f);
+    randu(B, -1.f, 1.f);
+
+    Mat biasScalar(1, 1, CV_32F, Scalar(0.75f));
+    Mat biasRow(1, N, CV_32F), biasFull(M, N, CV_32F);
+    randu(biasRow, -1.f, 1.f);
+    randu(biasFull, -1.f, 1.f);
+
+    struct BiasCase { Mat bias, broadcasted; int ndimsC; };
+    const BiasCase cases[] = {
+        { biasScalar, Mat(M, N, CV_32F, Scalar(0.75f)), 2 },
+        { biasRow.reshape(1, std::vector<int>{N}), repeat(biasRow, M, 1), 1 },
+        { biasFull, biasFull, 2 },
+    };
+    for (bool constInputs : {true, false})
+    for (const BiasCase& c : cases)
+    {
+        LayerParams lp;
+        lp.type = "MatMul";
+        lp.name = "matmul_bias_beta";
+        lp.set("beta", beta);
+        lp.set("real_ndims_C", c.ndimsC);
+
+        Net net;
+        if (constInputs)
+        {
+            lp.blobs.push_back(B);
+            lp.blobs.push_back(c.bias);
+            net.addLayerToPrev(lp.name, lp.type, lp);
+            net.setInput(A);
+        }
+        else
+        {
+            int id = net.addLayerToPrev(lp.name, lp.type, lp);
+            net.connect(0, 1, id, 1);
+            net.connect(0, 2, id, 2);
+            net.setInputsNames({"A", "B", "bias"});
+            net.setInput(A, "A");
+            net.setInput(B, "B");
+            net.setInput(c.bias, "bias");
+        }
+        net.setPreferableBackend(backend);
+        net.setPreferableTarget(target);
+        Mat out = net.forward();
+
+        Mat ref = A * B + beta * c.broadcasted;
+        normAssert(out.reshape(1, M), ref, constInputs ? "constant B and bias" : "B and bias as inputs",
+                   default_l1, default_lInf);
+    }
+}
+INSTANTIATE_TEST_CASE_P(/**/, Test_MatMul_BiasBeta, dnnBackendsAndTargets());
+
+// Without a bias the gemm runs with beta = 0 and must never read Y: poison it with NaN.
+// M = 2 with constant B takes fastGemmThin, M = 37 the packed fastGemmBatch path; dynamic
+// B (constB = false) takes the MLAS/fastGemmBatch "truly dynamic B" path in both cases.
+TEST(Test_MatMul, NoBiasIgnoresOutputContents)
+{
+    const int K = 53, N = 67;
+    for (int M : {2, 37})
+    for (bool constB : {false, true})
+    {
+        Mat A(M, K, CV_32F), B(K, N, CV_32F);
+        randu(A, -1.f, 1.f);
+        randu(B, -1.f, 1.f);
+
+        LayerParams lp;
+        lp.type = "MatMul";
+        lp.name = "matmul_no_bias";
+        if (constB)
+            lp.blobs.push_back(B);
+        Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+        ASSERT_TRUE(layer);
+
+        std::vector<Mat> inputs = constB ? std::vector<Mat>{A} : std::vector<Mat>{A, B};
+        std::vector<Mat> outputs(1, Mat(M, N, CV_32F, Scalar(std::numeric_limits<float>::quiet_NaN())));
+        std::vector<Mat> internals;
+        layer->finalize(inputs, outputs);
+        layer->forward(inputs, outputs, internals);
+
+        Mat expected;
+        gemm(A, B, 1., noArray(), 0., expected);
+        normAssert(outputs[0], expected, "MatMul no-bias output mismatch", 1e-4, 1e-4);
+    }
+}
+
+TEST(Test_SoftmaxCrossEntropyLoss, RejectMismatchedWeightsAndLabels)
+{
+    const int N = 2, C = 64;
+    Mat scores(std::vector<int>{N, C}, CV_32F);
+    randu(scores, -1, 1);
+    Mat labels(std::vector<int>{N}, CV_32S);
+    labels.at<int>(0) = C - 1;
+    labels.at<int>(1) = 3;
+
+    LayerParams lp;
+    lp.type = "SoftmaxCrossEntropyLoss";
+    lp.name = "sce_weights";
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+
+    // weights must hold one value per class
+    std::vector<Mat> inputs{scores, labels, Mat(std::vector<int>{1}, CV_32F, Scalar(1))};
+    std::vector<Mat> outputs;
+    EXPECT_ANY_THROW(runLayer(layer, inputs, outputs));
+
+    // probability labels must cover every sample of the scores
+    Mat probs(std::vector<int>{1, C}, CV_32F, Scalar(1.f / C));
+    inputs = {scores, probs};
+    EXPECT_ANY_THROW(runLayer(layer, inputs, outputs));
+
+    // valid weights give the weighted mean loss, for both float32 and float16 weights
+    Mat weights(std::vector<int>{C}, CV_32F);
+    for (int c = 0; c < C; c++)
+        weights.at<float>(c) = 0.25f * (c % 8 + 1);
+
+    double num = 0, den = 0;
+    for (int n = 0; n < N; n++)
+    {
+        const float* x = scores.ptr<float>(n);
+        double maxv = x[0];
+        for (int c = 1; c < C; c++)
+            maxv = std::max(maxv, (double)x[c]);
+        double sumExp = 0;
+        for (int c = 0; c < C; c++)
+            sumExp += std::exp(x[c] - maxv);
+        const int y = labels.at<int>(n);
+        const double wy = weights.at<float>(y);
+        num += wy * (std::log(sumExp) + maxv - x[y]);
+        den += wy;
+    }
+    const double ref = num / den;
+
+    for (int wtype : {CV_32F, CV_16F})
+    {
+        Mat w;
+        weights.convertTo(w, wtype);
+        inputs = {scores, labels, w};
+        ASSERT_NO_THROW(runLayer(layer, inputs, outputs)) << typeToString(wtype);
+        ASSERT_EQ(outputs.size(), (size_t)1);
+        ASSERT_EQ(outputs[0].total(), (size_t)1);
+        EXPECT_NEAR(outputs[0].ptr<float>()[0], ref, 1e-5) << typeToString(wtype);
+    }
+}
+
+TEST(Test_GatherND, EmptyIndicesDoNotCrash)
+{
+    for (int indicesType : {CV_32S, CV_64S})
+    {
+        Mat data(4, 5, CV_32F);
+        randu(data, -1, 1);
+        Mat indices(std::vector<int>{0, 1}, indicesType);
+
+        LayerParams lp;
+        lp.type = "GatherND";
+        lp.name = "gathernd_empty_indices";
+
+        Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+        ASSERT_TRUE(layer);
+        std::vector<Mat> inputs{data, indices};
+        std::vector<Mat> outputs;
+        runLayer(layer, inputs, outputs);
+        ASSERT_EQ(outputs.size(), (size_t)1);
+        ASSERT_EQ(shape(outputs[0]), MatShape({0, 5}));
+    }
+}
+
+static Ptr<Layer> createCropAndResize(int width, int height)
+{
+    LayerParams lp;
+    lp.type = "CropAndResize";
+    lp.name = "test_crop_and_resize";
+    lp.set("width", width);
+    lp.set("height", height);
+    return LayerFactory::createLayerInstance(lp.type, lp);
+}
+
+static Mat cropAndResizeInput()
+{
+    // 1x1x4x4 image with values 1..16 in row-major order.
+    Mat inp({1, 1, 4, 4}, CV_32F);
+    for (int i = 0; i < 16; i++)
+        inp.ptr<float>()[i] = (float)(i + 1);
+    return inp;
+}
+
+TEST(Layer_Test_CropAndResize, BoxOutsideImageAndBoxCount)
+{
+    Ptr<Layer> layer = createCropAndResize(2, 2);
+    ASSERT_TRUE(layer != nullptr);
+    Mat inp = cropAndResizeInput();
+
+    float boxData[] = {0, 0, 0, 0.f, 0.f, 1.f, 1.f,       // whole image
+                       0, 0, 0, 0.f, 50.f, 1.f, 60.f,     // rows far below the image
+                       0, 0, 0, 0.f, -0.1f, 1.f, 0.9f,    // first row just above the image
+                       0, 0, 0, 0.1f, 0.f, 1.1f, 1.f};    // last column just right of the image
+    Mat boxes({1, 1, 4, 7}, CV_32F, boxData);
+
+    std::vector<Mat> inputs = {inp, boxes}, outputs;
+    runLayer(layer, inputs, outputs);
+    ASSERT_EQ(outputs.size(), (size_t)1);
+    ASSERT_EQ(shape(outputs[0]), MatShape({4, 1, 2, 2}));
+    const float* out = outputs[0].ptr<float>();
+    const float expected[] = {1.f, 4.f, 13.f, 16.f,
+                              0.f, 0.f, 0.f, 0.f,
+                              0.f, 0.f, 11.8f, 14.8f,
+                              1.3f, 0.f, 13.3f, 0.f};
+    for (int i = 0; i < 16; i++)
+        EXPECT_NEAR(out[i], expected[i], 1e-5) << i;
+
+    // Boxes must have [1, 1, N, 7] shape, which the output size is derived from.
+    for (const MatShape& badShape : {MatShape({1, 2, 1, 7}), MatShape({1, 2, 7}), MatShape({1, 1, 2, 14})})
+    {
+        Mat bad(badShape, CV_32F, boxData);
+        inputs = {inp, bad};
+        EXPECT_THROW(runLayer(layer, inputs, outputs), cv::Exception) << badShape;
+    }
+}
+
+TEST(Layer_Test_CropAndResize, SingletonCrop)
+{
+    Mat inp = cropAndResizeInput();
+    float boxData[] = {0, 0, 0, 0.f, 0.f, 1.f, 1.f,
+                       0, 0, 0, 0.f, 0.f, 1.f / 3, 2.f / 3};
+    Mat boxes({1, 1, 2, 7}, CV_32F, boxData);
+
+    // 1x1 crop samples the box center: (1.5, 1.5) and (1, 0.5).
+    {
+        Ptr<Layer> layer = createCropAndResize(1, 1);
+        std::vector<Mat> inputs = {inp, boxes}, outputs;
+        runLayer(layer, inputs, outputs);
+        ASSERT_EQ(shape(outputs[0]), MatShape({2, 1, 1, 1}));
+        EXPECT_NEAR(outputs[0].ptr<float>()[0], 8.5f, 1e-5);
+        EXPECT_NEAR(outputs[0].ptr<float>()[1], 5.5f, 1e-5);
+    }
+    // Width 1, height 2 on the whole image: rows 0 and 3 at column 1.5.
+    {
+        Ptr<Layer> layer = createCropAndResize(1, 2);
+        std::vector<Mat> inputs = {inp, Mat({1, 1, 1, 7}, CV_32F, boxData)}, outputs;
+        runLayer(layer, inputs, outputs);
+        ASSERT_EQ(shape(outputs[0]), MatShape({1, 1, 2, 1}));
+        EXPECT_NEAR(outputs[0].ptr<float>()[0], 2.5f, 1e-5);
+        EXPECT_NEAR(outputs[0].ptr<float>()[1], 14.5f, 1e-5);
+    }
+}
+
+typedef testing::TestWithParam<tuple<Backend, Target> > Layer_Test_CropAndResize_Backends;
+TEST_P(Layer_Test_CropAndResize_Backends, BoxOutsideImage)
+{
+    const int backendId = get<0>(GetParam());
+    const int targetId = get<1>(GetParam());
+    if (backendId != DNN_BACKEND_OPENCV && backendId != DNN_BACKEND_CUDA)
+        throw SkipTestException("Only OpenCV and CUDA backends implement CropAndResize extrapolation");
+
+    Mat inp({1, 8, 6, 5}, CV_32F);
+    randu(inp, -1.f, 1.f);
+    float boxData[] = {0, 0, 0, 0.f, 0.f, 1.f, 1.f,
+                       0, 0, 0, 0.f, 50.f, 1.f, 60.f,
+                       0, 0, 0, -0.2f, -0.1f, 0.9f, 1.3f,
+                       0, 0, 0, 0.25f, 0.3f, 0.75f, 0.6f};
+    Mat boxes({1, 1, 4, 7}, CV_32F, boxData);
+
+    for (int size : {1, 3})
+    {
+        Ptr<Layer> layer = createCropAndResize(size, size);
+        std::vector<Mat> inputs = {inp, boxes}, refs;
+        runLayer(layer, inputs, refs);
+
+        LayerParams lp;
+        lp.type = "CropAndResize";
+        lp.name = "crop_and_resize";
+        lp.set("width", size);
+        lp.set("height", size);
+        Net net;
+        int id = net.addLayer(lp.name, lp.type, lp);
+        net.connect(0, 0, id, 0);
+        net.connect(0, 1, id, 1);
+        net.setInputsNames({"image", "boxes"});
+        net.setInput(inp, "image");
+        net.setInput(boxes, "boxes");
+        net.setPreferableBackend(backendId);
+        net.setPreferableTarget(targetId);
+        Mat out = net.forward();
+
+        const bool fp16 = targetId == DNN_TARGET_CUDA_FP16 || targetId == DNN_TARGET_OPENCL_FP16 ||
+                          targetId == DNN_TARGET_CPU_FP16;
+        double l1 = fp16 ? 2e-3 : 1e-5;
+        double lInf = fp16 ? 1e-2 : 1e-4;
+        normAssert(refs[0], out, format("size=%d", size).c_str(), l1, lInf);
+    }
+}
+
+INSTANTIATE_TEST_CASE_P(/*nothing*/, Layer_Test_CropAndResize_Backends, dnnBackendsAndTargets());
+
+
+TEST(Test_Compress, AllFalse_WithAxis)
+{
+    Mat data(3, 4, CV_32F);
+    randu(data, -1.0f, 1.0f);
+    Mat condition(1, 4, CV_Bool, Scalar::all(0));
+
+    LayerParams lp;
+    lp.type = "Compress";
+    lp.name = "test_compress_all_false_axis";
+    lp.set("axis", 1);
+
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+    std::vector<Mat> inputs{data, condition};
+    std::vector<Mat> outputs;
+    runLayer(layer, inputs, outputs);
+    ASSERT_EQ(outputs.size(), (size_t)1);
+    ASSERT_EQ(shape(outputs[0]), MatShape({3, 0}));
+}
+
+TEST(Test_Compress, AllFalse_WithoutAxis)
+{
+    Mat data(3, 4, CV_32F);
+    randu(data, -1.0f, 1.0f);
+    Mat condition(1, 12, CV_Bool, Scalar::all(0));
+
+    LayerParams lp;
+    lp.type = "Compress";
+    lp.name = "test_compress_all_false_no_axis";
+
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+    std::vector<Mat> inputs{data, condition};
+    std::vector<Mat> outputs;
+    runLayer(layer, inputs, outputs);
+    ASSERT_EQ(outputs.size(), (size_t)1);
+    ASSERT_EQ(shape(outputs[0]), MatShape({0}));
+}
+
+TEST(Layer_Test_CausalConvWithState, RejectMismatchedWeightBiasAndState)
+{
+    const int B = 2, C = 64, T = 8, K = 4;
+    Mat x(std::vector<int>{B, C, T}, CV_32F);
+    randu(x, -1, 1);
+    Mat w(std::vector<int>{C, 1, K}, CV_32F);
+    randu(w, -1, 1);
+    Mat bias(std::vector<int>{C}, CV_32F);
+    randu(bias, -1, 1);
+    Mat past(std::vector<int>{B, C, K - 1}, CV_32F);
+    randu(past, -1, 1);
+
+    LayerParams lp;
+    lp.type = "CausalConvWithState";
+    lp.name = "causal_conv_with_state";
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+
+    // weight must be [C, 1, K]
+    std::vector<Mat> inputs{x, Mat(std::vector<int>{1, 1, K}, CV_32F, Scalar(1))};
+    std::vector<Mat> outputs;
+    EXPECT_THROW(runLayer(layer, inputs, outputs), cv::Exception);
+    inputs = {x, Mat(std::vector<int>{C, 2, K}, CV_32F, Scalar(1))};
+    EXPECT_THROW(runLayer(layer, inputs, outputs), cv::Exception);
+
+    // bias must be [C]
+    inputs = {x, w, Mat(std::vector<int>{1}, CV_32F, Scalar(1))};
+    EXPECT_THROW(runLayer(layer, inputs, outputs), cv::Exception);
+    inputs = {x, w, Mat(std::vector<int>{1, C}, CV_32F, Scalar(1))};
+    EXPECT_THROW(runLayer(layer, inputs, outputs), cv::Exception);
+
+    // past_state must be [B, C, K - 1]
+    inputs = {x, w, bias, Mat(std::vector<int>{B, 1, K - 1}, CV_32F, Scalar(1))};
+    EXPECT_THROW(runLayer(layer, inputs, outputs), cv::Exception);
+    inputs = {x, w, bias, Mat(std::vector<int>{1, C, K - 1}, CV_32F, Scalar(1))};
+    EXPECT_THROW(runLayer(layer, inputs, outputs), cv::Exception);
+    inputs = {x, w, bias, Mat(std::vector<int>{B, C, K}, CV_32F, Scalar(1))};
+    EXPECT_THROW(runLayer(layer, inputs, outputs), cv::Exception);
+
+    // weight, bias and past_state must have the input type, on both the fp32 and the fp16 path
+    Mat x16, w16, bias16, past16;
+    x.convertTo(x16, CV_16F);
+    w.convertTo(w16, CV_16F);
+    bias.convertTo(bias16, CV_16F);
+    past.convertTo(past16, CV_16F);
+    inputs = {x, w16};
+    EXPECT_THROW(runLayer(layer, inputs, outputs), cv::Exception);
+    inputs = {x16, w};
+    EXPECT_THROW(runLayer(layer, inputs, outputs), cv::Exception);
+    inputs = {x16, w16, bias};
+    EXPECT_THROW(runLayer(layer, inputs, outputs), cv::Exception);
+    inputs = {x16, w16, bias16, past};
+    EXPECT_THROW(runLayer(layer, inputs, outputs), cv::Exception);
+    inputs = {x16, w16, bias16, past16};
+    EXPECT_NO_THROW(runLayer(layer, inputs, outputs));
+
+    // valid inputs give the depthwise causal convolution, with past_state read per batch
+    Mat ref(std::vector<int>{B, C, T}, CV_32F), refState(std::vector<int>{B, C, K - 1}, CV_32F);
+    for (int b = 0; b < B; b++)
+    {
+        for (int c = 0; c < C; c++)
+        {
+            std::vector<float> pad(K - 1 + T);
+            for (int j = 0; j < K - 1; j++)
+                pad[j] = past.ptr<float>(b, c)[j];
+            for (int t = 0; t < T; t++)
+                pad[K - 1 + t] = x.ptr<float>(b, c)[t];
+            for (int t = 0; t < T; t++)
+            {
+                float acc = bias.at<float>(c);
+                for (int k = 0; k < K; k++)
+                    acc += w.ptr<float>(c)[k] * pad[t + k];
+                ref.ptr<float>(b, c)[t] = acc;
+            }
+            for (int j = 0; j < K - 1; j++)
+                refState.ptr<float>(b, c)[j] = pad[T + j];
+        }
+    }
+    inputs = {x, w, bias, past};
+    ASSERT_NO_THROW(runLayer(layer, inputs, outputs));
+    ASSERT_EQ(outputs.size(), (size_t)2);
+    normAssert(ref, outputs[0], "output");
+    normAssert(refState, outputs[1], "present_state");
 }
 
 }} // namespace

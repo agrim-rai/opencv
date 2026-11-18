@@ -545,6 +545,76 @@ TEST( Features2d_DescriptorMatcher_FlannBased, regression )
 }
 #endif
 
+TEST(Features2d_DescriptorMatcher_BruteForce, knnMatch_replaces_output)
+{
+    float queryData[] = {0, 10};
+    float trainData[] = {1, 11};
+    Mat query(2, 1, CV_32F, queryData);
+    Mat train(2, 1, CV_32F, trainData);
+    Ptr<DescriptorMatcher> matcher = BFMatcher::create(NORM_L2);
+    vector<vector<DMatch> > matches;
+
+    for (int call = 0; call < 2; call++)
+    {
+        SCOPED_TRACE(call);
+        matcher->knnMatch(query, train, matches, 1);
+        ASSERT_EQ((size_t)2, matches.size());
+        for (size_t i = 0; i < matches.size(); i++)
+        {
+            ASSERT_EQ((size_t)1, matches[i].size());
+            EXPECT_EQ((int)i, matches[i][0].queryIdx);
+            EXPECT_EQ((int)i, matches[i][0].trainIdx);
+            EXPECT_EQ(1.f, matches[i][0].distance);
+        }
+    }
+}
+
+#ifdef HAVE_OPENCV_FLANN
+TEST(Features2d_DescriptorMatcher_FlannBased, knnMatch_replaces_output)
+{
+    float queryData[] = {0, 10};
+    float trainData[] = {1, 11};
+    Mat query(2, 1, CV_32F, queryData);
+    Mat train(2, 1, CV_32F, trainData);
+    Ptr<DescriptorMatcher> matcher = FlannBasedMatcher::create();
+    vector<vector<DMatch> > matches;
+
+    for (int call = 0; call < 2; call++)
+    {
+        SCOPED_TRACE(call);
+        matcher->knnMatch(query, train, matches, 1);
+        ASSERT_EQ((size_t)2, matches.size());
+        for (size_t i = 0; i < matches.size(); i++)
+        {
+            ASSERT_EQ((size_t)1, matches[i].size());
+            EXPECT_EQ((int)i, matches[i][0].queryIdx);
+            EXPECT_EQ((int)i, matches[i][0].trainIdx);
+            EXPECT_EQ(1.f, matches[i][0].distance);
+        }
+    }
+}
+#endif
+
+TEST(Features2d_DescriptorMatcher, knnMatch_empty_clears_output)
+{
+    float queryData[] = {0, 10};
+    float trainData[] = {1, 11};
+    Mat query(2, 1, CV_32F, queryData);
+    Mat train(2, 1, CV_32F, trainData);
+    Ptr<DescriptorMatcher> matcher = BFMatcher::create(NORM_L2);
+    vector<vector<DMatch> > matches;
+
+    matcher->knnMatch(query, train, matches, 1);
+    ASSERT_FALSE(matches.empty());
+    matcher->knnMatch(Mat(), train, matches, 1);
+    EXPECT_TRUE(matches.empty());
+
+    matcher->knnMatch(query, train, matches, 1);
+    ASSERT_FALSE(matches.empty());
+    matcher->knnMatch(query, matches, 1);
+    EXPECT_TRUE(matches.empty());
+}
+
 TEST( Features2d_DMatch, read_write )
 {
     FileStorage fs(".xml", FileStorage::WRITE + FileStorage::MEMORY);
@@ -600,10 +670,14 @@ TEST( Features2d_FlannBasedMatcher, read_write )
 
 TEST(Features2d_DMatch, issue_11855)
 {
-    Mat sources = (Mat_<uchar>(2, 3) << 1, 1, 0,
-                                        1, 1, 1);
-    Mat targets = (Mat_<uchar>(2, 3) << 1, 1, 1,
-                                        0, 0, 0);
+    Mat sources = Mat_<uchar>({2, 3}, {
+            1, 1, 0,
+            1, 1, 1
+    });
+    Mat targets = Mat_<uchar>({2, 3}, {
+            1, 1, 1,
+            0, 0, 0
+    });
     Ptr<BFMatcher> bf = BFMatcher::create(NORM_HAMMING, true);
     vector<vector<DMatch> > match;
     bf->knnMatch(sources, targets, match, 1, noArray(), true);
@@ -617,15 +691,19 @@ TEST(Features2d_DMatch, issue_11855)
 
 TEST(Features2d_DMatch, issue_17771)
 {
-    Mat sources = (Mat_<uchar>(2, 3) << 1, 1, 0,
-                                        1, 1, 1);
-    Mat targets = (Mat_<uchar>(2, 3) << 1, 1, 1,
-                                        0, 0, 0);
+    Mat sources = Mat_<uchar>({2, 3}, {
+            1, 1, 0,
+            1, 1, 1
+    });
+    Mat targets = Mat_<uchar>({2, 3}, {
+            1, 1, 1,
+            0, 0, 0
+    });
     UMat usources = sources.getUMat(ACCESS_READ);
     UMat utargets = targets.getUMat(ACCESS_READ);
     vector<vector<DMatch> > match;
     Ptr<BFMatcher> ubf = BFMatcher::create(NORM_HAMMING);
-    Mat mask = (Mat_<uchar>(2, 2) << 1, 0, 0, 1);
+    Mat mask = Mat_<uchar>({2, 2}, {1, 0, 0, 1});
     EXPECT_NO_THROW(ubf->knnMatch(usources, utargets, match, 1, mask, true));
 }
 

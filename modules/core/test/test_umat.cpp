@@ -978,7 +978,7 @@ TEST(UMat, setOpenCL)
     // save the current state
     bool useOCL = cv::ocl::useOpenCL();
 
-    Mat m = (Mat_<uchar>(3,3)<<0,1,2,3,4,5,6,7,8);
+    Mat m = Mat_<uchar>({3, 3}, {0,1,2,3,4,5,6,7,8});
 
     cv::ocl::setUseOpenCL(true);
     UMat um1;
@@ -1470,6 +1470,25 @@ TEST(UMat, copy_scalar)
     EXPECT_EQ(0, m2.dims);
     EXPECT_EQ(1, m2.cols);
     EXPECT_EQ(5.f, m2.at<float>(0));
+}
+
+// a host UMat copied into a UMat of another allocator is uploaded into it
+TEST(UMat, copyTo_across_allocators)
+{
+    Mat src(20, 30, CV_32FC3);
+    randu(src, 0, 10);
+
+    UMat host;
+    host.allocator = Mat::getDefaultAllocator();
+    src.copyTo(host);
+
+    UMat dev;
+    dev.fitSameSize(host, host.type());
+    host.copyTo(dev);
+
+    Mat back;
+    dev.copyTo(back);
+    EXPECT_EQ(0, cvtest::norm(src, back, NORM_INF));
 }
 
 } } // namespace opencv_test::ocl

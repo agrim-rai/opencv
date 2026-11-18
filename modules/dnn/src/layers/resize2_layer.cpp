@@ -55,15 +55,7 @@ enum class NearestMode {
     ROUND_PREFER_FLOOR
 };
 
-#if __cplusplus < 201703L
-template<typename T>
-static T clamp(T d, T min, T max)
-{
-    return std::min(std::max(d, min), max);
-}
-#else
-#define clamp std::clamp
-#endif
+using std::clamp;
 
 static inline NearestMode parseNearestMode(const String& s)
 {
@@ -1049,6 +1041,14 @@ public:
         size_t ninputs = inputs.size();
         CV_Assert(ninputs == 1 || ninputs == 2 || ninputs >= 4);
         outputs.resize(1, inputs[0]);
+
+        // Rank-3 (N,C,W): 1-D resize of the W axis; width baked into params, stays rank-3.
+        if (inputs[0].dims == 3) {
+            CV_CheckEQ(ninputs, (size_t)1, "1-D Resize2 expects sizes baked as width param");
+            outputs[0][2] = zoomFactorWidth > 0 ? cvFloor(inputs[0][2] * zoomFactorWidth) : outWidth0;
+            return outputs[0][2] == inputs[0][2];
+        }
+
         // New ONNX importer may provide "sizes" or "scales" via constant blobs
         // (blobs[0] = roi, blobs[1] = scales, blobs[2] = sizes, blobs[3] = axes).
         if (ninputs == 1 && !this->blobs.empty()) {
@@ -1067,8 +1067,8 @@ public:
         }
 
         if (ninputs == 1) {
-            outputs[0][2] = zoomFactorHeight > 0 ? (int)(inputs[0][2] * zoomFactorHeight) : outHeight0;
-            outputs[0][3] = zoomFactorWidth > 0 ? (int)(inputs[0][3] * zoomFactorWidth) : outWidth0;
+            outputs[0][2] = zoomFactorHeight > 0 ? cvFloor(inputs[0][2] * zoomFactorHeight) : outHeight0;
+            outputs[0][3] = zoomFactorWidth > 0 ? cvFloor(inputs[0][3] * zoomFactorWidth) : outWidth0;
         } else if (ninputs == 2 && inputs[1].dims == 4) {
             outputs[0][2] = inputs[1][2];
             outputs[0][3] = inputs[1][3];
@@ -1087,6 +1087,22 @@ public:
         }
         // We can work in-place (do nothing) if input shape == output shape.
         return (outputs[0][2] == inputs[0][2]) && (outputs[0][3] == inputs[0][3]);
+    }
+
+    // Only resizeNearest has a genuine CV_32S path; other modes reject it below.
+    void getTypes(const std::vector<MatType>& inputs,
+                  const int requiredOutputs,
+                  const int requiredInternals,
+                  std::vector<MatType>& outputs,
+                  std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        CV_Assert(inputs.size());
+        for (auto input : inputs)
+            CV_CheckType(input, input == CV_32F || input == CV_64F || input == CV_8S || input == CV_8U ||
+                                input == CV_64S || input == CV_32S, "");
+
+        outputs.assign(requiredOutputs, inputs[0]);
+        internals.assign(requiredInternals, inputs[0]);
     }
 
     virtual bool supportBackend(int backendId) CV_OVERRIDE
@@ -1141,10 +1157,21 @@ public:
         MatShape inpShape = inp_.shape();
         MatShape outShape;
 
+        // Rank-3 (N,C,W): fold a unit H axis so the rank-4 kernels run, unfold on output.
+        const bool fold1d = (inp_.dims == 3);
+        MatShape outShape1d;
+        if (fold1d) {
+            int outW = zoomFactorWidth > 0 ? cvFloor(inpShape[2] * zoomFactorWidth) : outWidth0;
+            outShape1d = inpShape;
+            outShape1d[2] = outW;
+            inp_ = inp_.reshape(1, MatShape({inpShape[0], inpShape[1], 1, inpShape[2]}));
+            inpShape = inp_.shape();
+        }
+
         if (ninputs == 1) {
             outShape = inpShape;
-            outShape[2] = zoomFactorHeight > 0 ? (int)(inpShape[2] * zoomFactorHeight) : outHeight0;
-            outShape[3] = zoomFactorWidth > 0 ? (int)(inpShape[3] * zoomFactorWidth) : outWidth0;
+            outShape[2] = zoomFactorHeight > 0 ? cvFloor(inpShape[2] * zoomFactorHeight) : outHeight0;
+            outShape[3] = zoomFactorWidth > 0 ? cvFloor(inpShape[3] * zoomFactorWidth) : outWidth0;
         } else if (ninputs == 2 && inputs[0].dims == 4 && inputs[1].dims == 4) {
             outShape = inpShape;
             outShape[2] = inputs[1].size[2];
@@ -1203,21 +1230,31 @@ public:
             }
         }
 
-        if (sizes.empty() && !scales.empty() && halfPixelCenters)
+        // Constant "scales" are folded into zoom_factor_* by the importer; resolve either
+        // source once so the step and the antialias filter use the same value.
+        float onnxScaleH = 0.f, onnxScaleW = 0.f;
+        if (!scales.empty())
         {
             int hIdx, wIdx;
             spatialIndices(scales.size(), hIdx, wIdx);
-            scaleHeight = 1.f / scales[hIdx];
-            scaleWidth  = 1.f / scales[wIdx];
+            onnxScaleH = scales[hIdx];
+            onnxScaleW = scales[wIdx];
         }
-        else if (sizes.empty() && !scales.empty() && alignCorners)
+        else if (zoomFactorHeight > 0 && zoomFactorWidth > 0)
         {
-            int hIdx, wIdx;
-            spatialIndices(scales.size(), hIdx, wIdx);
-            float lenH = inpShape[2] * scales[hIdx];
-            float lenW = inpShape[3] * scales[wIdx];
-            if (lenH > 1.f) scaleHeight = float(inpShape[2] - 1) / (lenH - 1.f);
-            if (lenW > 1.f) scaleWidth  = float(inpShape[3] - 1) / (lenW - 1.f);
+            onnxScaleH = zoomFactorHeight;
+            onnxScaleW = zoomFactorWidth;
+        }
+
+        // The step is 1/scale, not in/out: they differ whenever in*scale is not integral.
+        // align_corners maps the output corners onto the input corners, so it keeps the
+        // shape-derived (in - 1) / (out - 1) set by updateOutSizeAndScale(); "sizes" and
+        // tf_crop_and_resize do not use the scale either.
+        if (sizes.empty() && !alignCorners && onnxScaleH > 0 && onnxScaleW > 0 &&
+            coordTransModeE != CoordTransMode::TF_CROP_AND_RESIZE)
+        {
+            scaleHeight = 1.f / onnxScaleH;
+            scaleWidth  = 1.f / onnxScaleW;
         }
 
         auto kind = outputs_arr.kind();
@@ -1225,8 +1262,8 @@ public:
         UMat uout_;
         if (kind == _InputArray::STD_VECTOR_MAT) {
             std::vector<Mat>& outputs = outputs_arr.getMatVecRef();
-            outputs[0].fit(outShape, inp_.type());
-            out_ = outputs[0];
+            outputs[0].fit(fold1d ? outShape1d : outShape, inp_.type());
+            out_ = fold1d ? outputs[0].reshape(1, outShape) : outputs[0];
 
             if (outShape == inpShape)
             {
@@ -1237,8 +1274,8 @@ public:
         else {
             CV_Assert(kind == _InputArray::STD_VECTOR_UMAT);
             std::vector<UMat>& u_outputs = outputs_arr.getUMatVecRef();
-            u_outputs[0].fit(outShape, inp_.type());
-            uout_ = u_outputs[0];
+            u_outputs[0].fit(fold1d ? outShape1d : outShape, inp_.type());
+            uout_ = fold1d ? u_outputs[0].reshape(1, outShape) : u_outputs[0];
             if (outShape == inpShape)
             {
                 inp_.copyTo(uout_);
@@ -1249,8 +1286,17 @@ public:
 
         int depth = inp_.type(), orig_depth = depth;
 
+        // Bilinear/cubic/antialias have no fixed-point CV_32S path yet.
+        if (depth == CV_32S && interpolation != "nearest") {
+            CV_Error(Error::StsNotImplemented,
+                     "Resize2: CV_32S is currently only supported with nearest-neighbor "
+                     "interpolation; bilinear/cubic/antialias would need a fixed-point "
+                     "implementation to preserve int32 precision");
+        }
+
         Mat inp, out;
-        if (depth != CV_32F && depth != CV_8S && depth != CV_8U && depth != CV_16F && depth != CV_16BF) {
+        if (depth != CV_32F && depth != CV_8S && depth != CV_8U && depth != CV_16F && depth != CV_16BF &&
+            depth != CV_32S) {
             inp_.convertTo(inp, CV_32F);
             out.fit(outShape, CV_32F);
             depth = CV_32F;
@@ -1263,15 +1309,9 @@ public:
             (interpolation == "bilinear" || interpolation == "opencv_linear" || interpolation == "cubic"))
         {
             const bool cubic = (interpolation == "cubic");
-            float xsH, xsW;
-            if (!scales.empty()) {
-                int hIdx, wIdx;
-                spatialIndices(scales.size(), hIdx, wIdx);
-                xsH = scales[hIdx]; xsW = scales[wIdx];
-            } else {
-                xsH = float(outShape[2]) / inpShape[2];
-                xsW = float(outShape[3]) / inpShape[3];
-            }
+            // Filter support, from the same scales; in/out only stands in for them with "sizes".
+            const float xsH = onnxScaleH > 0.f ? onnxScaleH : float(outShape[2]) / inpShape[2];
+            const float xsW = onnxScaleW > 0.f ? onnxScaleW : float(outShape[3]) / inpShape[3];
             switch (depth) {
             case CV_8S:  resizeAntialias<int8_t>(inp, out, xsH, xsW, cubic, cubicCoeffA, coordTransModeE); break;
             case CV_8U:  resizeAntialias<uint8_t>(inp, out, xsH, xsW, cubic, cubicCoeffA, coordTransModeE); break;
@@ -1297,6 +1337,9 @@ public:
                 break;
             case CV_32F:
                 resizeNearest<float>(inp,out,scaleHeight,scaleWidth,length_resized_y,length_resized_x,nearestModeE,coordTransMode,halfPixelCenters,roi_start_y,roi_end_y,roi_start_x,roi_end_x,extrapolation_value);
+                break;
+            case CV_32S:
+                resizeNearest<int32_t>(inp,out,scaleHeight,scaleWidth,length_resized_y,length_resized_x,nearestModeE,coordTransMode,halfPixelCenters,roi_start_y,roi_end_y,roi_start_x,roi_end_x,extrapolation_value);
                 break;
             default: CV_Error(Error::StsUnsupportedFormat,"Unsupported depth");
             }

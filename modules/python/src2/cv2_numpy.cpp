@@ -34,13 +34,35 @@ UMatData* NumpyAllocator::allocate(int dims0, const int* sizes, int type, void* 
 
     int depth = CV_MAT_DEPTH(type);
     int cn = CV_MAT_CN(type);
-    int typenum = cvDepthToNumpyType(depth);
     int i, dims = dims0;
     cv::AutoBuffer<npy_intp> _sizes(dims + 1);
     for( i = 0; i < dims; i++ )
         _sizes[i] = sizes[i];
     if( cn > 1 )
         _sizes[dims++] = cn;
+
+    // bfloat16 / float8 need their exact NumPy descriptor: cvDepthToNumpyType()'s float32
+    // fallback would pair a narrow element step with wide NumPy strides and corrupt the buffer.
+    PyArray_Descr* exotic = nonConventionalDescrForCvDepth(depth);
+    if( exotic )
+    {
+        Py_INCREF(exotic);  // PyArray_NewFromDescr steals the reference
+        PyObject* eo = PyArray_NewFromDescr(&PyArray_Type, exotic, dims, _sizes.data(),
+                                            nullptr, nullptr, 0, nullptr);
+        if(!eo)
+            CV_Error_(Error::StsError, ("The numpy array of depth=%d, ndims=%d can not be created", depth, dims));
+        return allocate(eo, dims0, sizes, type, step);
+    }
+    // Mat::create() falls back to the default allocator on this error;
+    // pyopencv_from() then widens the result to float32.
+    if( isNonConventionalDepth(depth) )
+        CV_Error(Error::StsNotImplemented, useExactNumpyDtypes()
+                 ? "bfloat16 / float8 arrays cannot be allocated through the NumPy allocator: "
+                   "import ml_dtypes first"
+                 : "bfloat16 / float8 arrays cannot be allocated through the NumPy allocator: "
+                   "call cv.setUseExactNumpyDtypes(True) first");
+
+    int typenum = cvDepthToNumpyType(depth);
     PyObject* o = PyArray_SimpleNew(dims, _sizes.data(), typenum);
     if(!o)
         CV_Error_(Error::StsError, ("The numpy array of typenum=%d, ndims=%d can not be created", typenum, dims));

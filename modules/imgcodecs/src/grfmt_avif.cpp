@@ -28,6 +28,23 @@
 namespace cv {
 namespace {
 
+static bool isSupportedBitDepth16U(int requestDepth)
+{
+  if (requestDepth == 10 || requestDepth == 12)
+  {
+    return true;
+  }
+
+#ifdef OPENCV_IMGCODECS_AVIF_SUPPORT_16BIT
+  if (requestDepth == 16)
+  {
+    return true;
+  }
+#endif
+
+  return false;
+}
+
 struct AvifImageDeleter {
   void operator()(avifImage *image) { avifImageDestroy(image); }
 };
@@ -216,6 +233,11 @@ bool AvifDecoder::readHeader() {
     return false;
   }
   decoder_->strictFlags = AVIF_STRICT_DISABLED;
+
+#ifdef OPENCV_IMGCODECS_AVIF_SUPPORT_16BIT
+  decoder_->imageContentToDecode |= AVIF_IMAGE_CONTENT_SAMPLE_TRANSFORMS;
+#endif
+
   if (!m_buf.empty()) {
     CV_Assert(m_buf.type() == CV_8UC1);
     CV_Assert(m_buf.rows == 1);
@@ -241,7 +263,7 @@ bool AvifDecoder::readHeader() {
   channels_ = (decoder_->image->yuvFormat == AVIF_PIXEL_FORMAT_YUV400) ? 1 : 3;
   if (decoder_->alphaPresent) ++channels_;
   bit_depth_ = decoder_->image->depth;
-  CV_Assert(bit_depth_ == 8 || bit_depth_ == 10 || bit_depth_ == 12);
+  CV_Assert(bit_depth_ == 8 || isSupportedBitDepth16U(bit_depth_));
   m_type = CV_MAKETYPE(bit_depth_ == 8 ? CV_8U : CV_16U, channels_);
   is_first_image_ = true;
   return true;
@@ -327,7 +349,7 @@ AvifEncoder::AvifEncoder() {
   m_support_metadata[(size_t)IMAGE_METADATA_XMP] = true;
   m_support_metadata[(size_t)IMAGE_METADATA_ICCP] = true;
   encoder_ = avifEncoderCreate();
-  m_supported_encode_key = { IMWRITE_AVIF_QUALITY, IMWRITE_AVIF_DEPTH, IMWRITE_AVIF_SPEED };
+  m_supported_encode_key = { IMWRITE_AVIF_QUALITY, IMWRITE_AVIF_DEPTH, IMWRITE_AVIF_SPEED, IMWRITE_AVIF_ALPHA_QUALITY };
 }
 
 AvifEncoder::~AvifEncoder() {
@@ -342,28 +364,28 @@ bool AvifEncoder::writeanimation(const Animation& animation,
                                  const std::vector<int> &params) {
   int bit_depth = 8;
   int speed = AVIF_SPEED_FASTEST;
+  int qualityColorWork = -1;
+  int qualityAlphaWork = -1;
   for (size_t i = 0; i < params.size(); i += 2) {
     const int value = params[i + 1];
     if (params[i] == IMWRITE_AVIF_QUALITY) {
-      const int quality = std::min(std::max(value, AVIF_QUALITY_WORST),
-                                   AVIF_QUALITY_BEST);
-      if (value != quality) {
-        CV_LOG_WARNING(nullptr, cv::format("The value(%d) for IMWRITE_AVIF_QUALITY must be between 0 to 100. It is fallbacked to %d", value, quality));
+      qualityColorWork = std::min(std::max(value, AVIF_QUALITY_WORST),
+                                  AVIF_QUALITY_BEST);
+      if (value != qualityColorWork) {
+        CV_LOG_WARNING(nullptr, cv::format("The value(%d) for IMWRITE_AVIF_QUALITY must be between 0 to 100. It is fallbacked to %d", value, qualityColorWork));
       }
-#if CV_AVIF_USE_QUALITY
-      encoder_->quality = quality;
-#else
-      encoder_->minQuantizer = encoder_->maxQuantizer =
-          (AVIF_QUANTIZER_BEST_QUALITY - AVIF_QUANTIZER_WORST_QUALITY) *
-              quality / (AVIF_QUALITY_BEST - AVIF_QUALITY_WORST) +
-          AVIF_QUANTIZER_WORST_QUALITY;
-#endif
+    } else if (params[i] == IMWRITE_AVIF_ALPHA_QUALITY) {
+      qualityAlphaWork = std::min(std::max(value, AVIF_QUALITY_WORST),
+                                  AVIF_QUALITY_BEST);
+      if (value != qualityAlphaWork) {
+        CV_LOG_WARNING(nullptr, cv::format("The value(%d) for IMWRITE_AVIF_ALPHA_QUALITY must be between 0 to 100. It is fallbacked to %d", value, qualityAlphaWork));
+      }
     } else if (params[i] == IMWRITE_AVIF_DEPTH) {
       bit_depth = value;
-      if ((bit_depth != 8) && (bit_depth !=10) && (bit_depth !=12))
+      if ((bit_depth != 8) && (!isSupportedBitDepth16U(bit_depth)))
       {
         bit_depth = 8;
-        CV_LOG_WARNING(nullptr, cv::format("The value(%d) for IMWRITE_AVIF_DEPTH must be 8, 10 or 12. It is fallbacked to %d", value, bit_depth));
+        CV_LOG_WARNING(nullptr, cv::format("The value(%d) for IMWRITE_AVIF_DEPTH must be 8, 10, 12 (or 16 with libavif v1.4.0+). It is fallbacked to %d", value, bit_depth));
       }
     } else if (params[i] == IMWRITE_AVIF_SPEED) {
       speed = std::min(std::max(value,0),10);
@@ -372,6 +394,43 @@ bool AvifEncoder::writeanimation(const Animation& animation,
       }
     }
   }
+
+  int quality = 95;
+  int qualityAlpha = 95;
+
+  if (qualityAlphaWork == -1) {
+    if (qualityColorWork == -1) {
+      // Both IMWRITE_AVIF_QUALITY and _ALPHA are not specified.
+      quality = 95;
+      qualityAlpha = 95;
+    } else {
+      // IMWRITE_AVIF_QUALITY is specified, but _ALPHA is not.
+      quality = qualityColorWork;
+      qualityAlpha = qualityColorWork;
+    }
+  } else {
+    if (qualityColorWork == -1) {
+      quality = 95;
+      qualityAlpha = qualityAlphaWork;
+    } else {
+      quality = qualityColorWork;
+      qualityAlpha = qualityAlphaWork;
+    }
+  }
+
+#if CV_AVIF_USE_QUALITY
+  encoder_->quality = quality;
+  encoder_->qualityAlpha = qualityAlpha;
+#else
+  encoder_->minQuantizer = encoder_->maxQuantizer =
+      (AVIF_QUANTIZER_BEST_QUALITY - AVIF_QUANTIZER_WORST_QUALITY) *
+          quality / (AVIF_QUALITY_BEST - AVIF_QUALITY_WORST) +
+      AVIF_QUANTIZER_WORST_QUALITY;
+  encoder_->minQuantizerAlpha = encoder_->maxQuantizerAlpha =
+      (AVIF_QUANTIZER_BEST_QUALITY - AVIF_QUANTIZER_WORST_QUALITY) *
+          qualityAlpha / (AVIF_QUALITY_BEST - AVIF_QUALITY_WORST) +
+      AVIF_QUANTIZER_WORST_QUALITY;
+#endif
 
   avifRWData output_ori = AVIF_DATA_EMPTY;
   std::unique_ptr<avifRWData, decltype(&avifRWDataFree)> output(&output_ori,
@@ -385,17 +444,29 @@ bool AvifEncoder::writeanimation(const Animation& animation,
 #endif
   encoder_->speed = speed;
 
+#ifdef OPENCV_IMGCODECS_AVIF_SUPPORT_16BIT
+  if(bit_depth == 16) {
+    // Encoding 16-bit AVIF animations should fail due to a libavif limitation.
+    CV_CheckEQ(animation.frames.size(), (size_t)1, "16-bit encoding only supports a single still image, not animation.");
+
+    encoder_->sampleTransformRecipe = (do_lossless)?
+                                      AVIF_SAMPLE_TRANSFORM_BIT_DEPTH_EXTENSION_12B_4B: // lossless
+                                      AVIF_SAMPLE_TRANSFORM_BIT_DEPTH_EXTENSION_12B_8B_OVERLAP_4B; // lossy
+  }
+#endif
+
   const avifAddImageFlags flag = (animation.frames.size() == 1)
                                      ? AVIF_ADD_IMAGE_FLAG_SINGLE
                                      : AVIF_ADD_IMAGE_FLAG_NONE;
   std::vector<AvifImageUniquePtr> images;
+
   for (const cv::Mat &img : animation.frames) {
     CV_CheckType(
         img.type(),
         (bit_depth == 8 && img.depth() == CV_8U) ||
-            ((bit_depth == 10 || bit_depth == 12) && img.depth() == CV_16U),
+            (isSupportedBitDepth16U(bit_depth) && img.depth() == CV_16U),
         "AVIF only supports bit depth of 8 with CV_8U input or "
-        "bit depth of 10 or 12 with CV_16U input");
+        "bit depth of 10, 12 (or 16 with libavif v1.4.0+) with CV_16U input");
 
     CV_Check(img.channels(),
              img.channels() == 1 || img.channels() == 3 || img.channels() == 4,

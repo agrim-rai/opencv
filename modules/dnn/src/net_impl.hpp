@@ -48,6 +48,13 @@ typedef std::unordered_map<std::string, int64_t> NamesHash;
 
 #ifdef HAVE_ONNXRUNTIME
 struct OrtNamesCache;
+
+#ifdef _WIN32
+typedef std::wstring OrtPathString;
+#else
+typedef std::string OrtPathString;
+#endif
+OrtPathString toOrtPath(const std::string& utf8Path);
 #endif
 
 /** @brief Single entry in a @ref PerfProfile.
@@ -109,11 +116,14 @@ struct Net::Impl : public detail::NetImplBase
     bool fusion;
     bool isAsync;  // FIXIT: drop
     bool useWinograd;
+    bool useTF32;
     bool useKVCache = false;
 
     std::vector<int64> layersTimings;
 
     std::string modelFileName;
+    // Why an importer gave up on the model; empty for every net that loaded.
+    std::string importFailure;
     ModelFormat modelFormat;
     DataLayout originalLayout;
     // int onnx_opset;
@@ -128,10 +138,14 @@ struct Net::Impl : public detail::NetImplBase
     std::vector<int> bufidxs;
     std::vector<Mat> buffers;
     std::vector<Mat> scratchBufs;
+    // interior tensors kept alive for forward-to-layer
+    // See https://github.com/opencv/opencv/issues/26349
+    std::vector<Arg> pinnedArgs;
     std::vector<Ptr<Graph> > allgraphs;
     KVCacheManager kvCacheManager;
 
     Ptr<Graph> mainGraph;
+    std::vector<int> mainGraphOutTypes;
     int globGraphIdx;
 
     int accuracy;
@@ -142,7 +156,20 @@ struct Net::Impl : public detail::NetImplBase
     int defaultC0;
     bool enableFP16, haveFP16;
     bool prepared; // need to rerun graph transformations/optimizations
-    bool finalizeLayers; // need to initialize each layer
+    bool finalized = false; // executors have been selected for the current backend/target
+    std::vector<MatShape> pinnedInputShapes;
+
+    // Post-fusion (pre block-layout) snapshot so finalize() can re-run from a clean
+    // state on a backend/target change; useBlockLayout() is destructive and must
+    // run after backend assignment (see deviceOp handling in graph_block_layout.cpp).
+    struct FusedGraphSnapshot {
+        Ptr<Graph> graph;
+        std::vector<Ptr<LayerInfo> > prog;
+        std::vector<std::vector<Arg> > inputs;
+        std::vector<std::vector<Arg> > outputs;
+    };
+    bool fusedSnapshotValid = false;
+    std::vector<FusedGraphSnapshot> fusedSnapshot;
     TracingMode tracingMode;
     ProfilingMode profilingMode;
     std::vector<int64_t> dimvalues;
@@ -268,18 +295,48 @@ struct Net::Impl : public detail::NetImplBase
 #ifdef HAVE_CUDA
     struct CudaInfo_t
     {
-        CudaInfo_t(cuda4dnn::csl::CSLContext ctxt, cuda4dnn::csl::Stream d2h_stream_)
+        CudaInfo_t(cuda4dnn::csl::CSLContext ctxt)
             : context(std::move(ctxt))
-            , d2h_stream(std::move(d2h_stream_))
-        {}
+        {
+            // zero-copy: kernels write it directly, the host reads it after the forward's sync
+            CUDA4DNN_CHECK_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&errorFlag), sizeof(int), cudaHostAllocMapped));
+            *errorFlag = 0;
+            CUDA4DNN_CHECK_CUDA(cudaHostGetDevicePointer(reinterpret_cast<void**>(&context.error_flag), errorFlag, 0));
+        }
+        ~CudaInfo_t() { cudaFreeHost(errorFlag); }
+        CudaInfo_t(const CudaInfo_t&) = delete;
+        CudaInfo_t& operator=(const CudaInfo_t&) = delete;
         cuda4dnn::csl::CSLContext context;
-        cuda4dnn::csl::Stream d2h_stream;
         cuda4dnn::csl::Workspace workspace;
+        int* errorFlag = nullptr;
     };
 
     std::unique_ptr<CudaInfo_t> cudaInfo;
 
-    void initCUDABackend(const std::vector<LayerPin>& blobsToKeep_);
+    void initCUDABackend();
+
+    // New graph engine: per-Arg device-resident tensors owned directly by the net (no backend
+    // wrappers). Sized lazily via UMat::fit() and reused across forwards. Dirty flags track
+    // which copy (host cv::Mat vs device UMat) is authoritative so transfers happen only at
+    // CPU<->CUDA boundaries; intermediates stay device-resident across consecutive CUDA ops.
+    std::vector<UMat> cudaArgBuffers;
+    std::vector<uchar> cudaArgHostDirty;    // 1: host copy is authoritative -> needs H2D before device read
+    std::vector<uchar> cudaArgDeviceDirty;  // 1: device copy is authoritative -> needs D2H before host read
+    std::vector<UMat> cudaTempBuffers;
+    bool cudaPoolTemps = false;
+    // the main graph's forward recorded as one CUDA Graph, and the input shapes it was recorded for
+    cudaGraphExec_t cudaGraphExec = nullptr;
+    std::vector<MatShape> cudaGraphInputShapes;
+    void cudaGraphReset();
+
+    // Device element type for a host tensor (half for float tensors under the FP16 target).
+    int cudaDeviceType(const Mat& hostMat) const;
+    // Returns the device buffer for @p arg, fit() to the host Mat's shape and device type.
+    UMat& getCudaArgBuffer(Arg arg, const Mat& hostMat);
+    UMat& cudaDeviceBuffer(Arg arg);
+    void cudaSetHostDirty(Arg arg);       // mark host authoritative (e.g. after a CPU op wrote it)
+    void cudaUploadArg(Arg arg, const Mat& hostMat);   // H2D if host dirty
+    void cudaDownloadArg(Arg arg, Mat& hostMat);       // D2H if device dirty
 #endif
 
     #ifdef HAVE_ONNXRUNTIME
@@ -306,6 +363,7 @@ struct Net::Impl : public detail::NetImplBase
 
     virtual void fuseLayers(const std::vector<LayerPin>& blobsToKeep_);
     void enableWinograd(bool useWinograd_);
+    void enableTF32(bool useTF32_);
 
     void allocateLayers(const std::vector<LayerPin>& blobsToKeep_);
 
@@ -410,6 +468,7 @@ struct Net::Impl : public detail::NetImplBase
 
     Arg newConstArg(const std::string& name, const Mat& m);
     Arg newConstScalarArg(const std::string& name, int type, const void* value);
+    void aliasArg(const std::string& name, Arg arg); // adds a name for an existing Arg, e.g. a shared constant
     Arg newArg(const std::string& name, ArgKind kind, bool allowEmptyName=false);
     bool isConstArg(Arg arg) const;
     Mat& argTensor(Arg arg) const;
@@ -420,12 +479,18 @@ struct Net::Impl : public detail::NetImplBase
     int findDim(const std::string& name, bool insert=false);
 
     void prepareForInference();
+    void finalize();
+    // Selects executors for a single graph (recursing into subgraphs).
+    void finalizeGraph(const Ptr<Graph>& graph, bool useCUDA);
+    // Save/restore the fused graph so finalize() is re-entrant across backend changes.
+    void saveFusedSnapshot();
+    void restoreFusedSnapshot();
 
     // pre-allocates memory for output tensors.
     // if useBufferPool==true, the method uses 'buffers'
     // for outputs (according to bufidxs)
     // instead of allocating fresh outputs
-    void allocateLayerOutputs(const Ptr<Layer>& layer,
+    void allocateLayerOutputs(const Ptr<LayerInfo>& layer,
                               const std::vector<int>& inpTypes,
                               const std::vector<MatShape>& inpShapes,
                               std::vector<int>& outTypes,
@@ -457,6 +522,9 @@ struct Net::Impl : public detail::NetImplBase
     // run the whole model, convenience wrapper
     void forwardWithMultipleOutputs(OutputArrayOfArrays outputBlobs,
                                     const std::vector<std::string>& outBlobNames);
+    // forward-to-layer: each name yields all outputs of the producing op
+    void forwardWithMultipleOutputsPerLayer(std::vector<std::vector<Mat> >& outputBlobs,
+                                            const std::vector<std::string>& outBlobNames);
     // try infer shapes; if some layers produce tensors with dynamic shapes, shape inference is impossible
     bool tryInferShapes(const std::vector<MatShape>& suggestedInpShapes,
                         const std::vector<MatType>& suggestedInpTypes,
@@ -493,8 +561,13 @@ struct Net::Impl : public detail::NetImplBase
     void inferShapes(bool symbolic);
     // sets certain buffer index for each intermediate argument (Arg)
     void assignBuffers();
-    // fuse batch norm, add bias and activation to convolution
-    void fuseBasic();
+    void pinInteriorArgs(const std::vector<Arg>& neededPins);
+    // collapse Reshape+InstanceNorm+Reshape+Mul+Add into InstanceNorm or GroupNormalization
+    void fuseInstanceNormAffine();
+    void fuseChains();
+    // fuseChains()'s chain pass limited to TransformLayout sinks; run
+    // after useBlockLayout(), which is what creates those nodes
+    void fuseTransformLayoutChains();
     // fuse ViT-style multi-head attention subgraphs
     void fuseAttention();
     // rewrite MatMul(A, const_B [, const_bias]) into Gemm so projection-style
@@ -510,6 +583,8 @@ struct Net::Impl : public detail::NetImplBase
     void fuseScaleSoftmax();
     // replace constant sub-expressions with their results
 
+    // widen FP16/BF16 constants to execution precision while the engine lacks half kernels
+    void widenHalfConstants();
     void fuseQDQ();
     void constFold();
     // make some operations (activation, batch norm, convolution) unary if
@@ -523,12 +598,12 @@ struct Net::Impl : public detail::NetImplBase
 
 };  // Net::Impl
 
-inline Net::Impl* getNetImpl(const Layer* layer)
+inline Net::Impl* getNetImpl(const LayerInfo* op)
 {
-    return reinterpret_cast<Net::Impl*>(layer->netimpl);
+    return reinterpret_cast<Net::Impl*>(op->netimpl);
 }
 
-Net readNetFromONNX2(const String&);
+Net readNetFromONNX2(const String&, bool mapExternalData);
 Net readNetFromONNX2(const char*, size_t);
 Net readNetFromONNX2(const std::vector<uchar>&);
 #ifdef HAVE_ONNXRUNTIME
@@ -537,8 +612,10 @@ Net readNetFromONNX2_ORT(const String& onnxFile);
 
 CV__DNN_INLINE_NS_END
 
+// residual (optional): added to the result in the same pass; see transform_layout_layer.cpp
 void transformLayout(const Mat& inp, Mat& out,
-                     DataLayout outlayout, DataLayout defaultLayout, int C0);
+                     DataLayout outlayout, DataLayout defaultLayout, int C0,
+                     const Mat& residual = Mat());
 
 }}  // namespace cv::dnn
 #endif  // __OPENCV_DNN_SRC_NET_IMPL_HPP__

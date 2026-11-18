@@ -17,8 +17,6 @@
 "test_einsum_batch_matmul",
 "test_einsum_sum",
 "test_einsum_transpose",
-"test_logsoftmax_large_number", // fp16 accuracy issue
-"test_logsoftmax_large_number_expanded", // fp16 accuracy issue
 "test_lppool_1d_default",
 "test_lppool_2d_default",
 "test_lppool_2d_dilations",
@@ -35,9 +33,13 @@
 "test_reduce_sum_square_keepdims_random", // fallback to cpu, accuracy
 "test_reduce_sum_square_negative_axes_keepdims_random", // fallback to cpu, accuracy
 "test_pow", // fp16 accuracy issue
+"test_tan", // fp16 accuracy issue
+"test_logsoftmax_large_number", // fp16 accuracy issue: 10001 is not representable in half
+"test_logsoftmax_large_number_expanded", // fp16 accuracy issue
 "test_softmax_large_number", // fp16 accuracy issue
 "test_softmax_large_number_expanded", // fp16 accuracy issue
-"test_tan", // fp16 accuracy issue
+"test_logsoftmax_large_number_expanded_ver18", // fp16 accuracy issue
+"test_softmax_large_number_expanded_ver18", // fp16 accuracy issue
 "test_dequantizelinear_blocked", // Issue https://github.com/opencv/opencv/issues/25999
 "test_quantizelinear", // Issue https://github.com/opencv/opencv/issues/25999
 "test_quantizelinear_axis", // Issue https://github.com/opencv/opencv/issues/25999
@@ -83,3 +85,33 @@
 "test_attention_4d_softcap",
 "test_attention_4d_attn_mask_bool",
 "test_attention_4d_attn_mask_bool_4d",
+// New-engine CUDA: arithmetic ops lack integer (int16/uint16/uint32/uint64) support and
+// standalone BatchNorm with non-const params; denylisted for now (pass on CPU, wrong on CUDA).
+"test_add_int16",
+"test_add_uint16",
+"test_add_uint32",
+"test_add_uint64",
+"test_sub_int16",
+"test_sub_uint16",
+"test_sub_uint32",
+"test_sub_uint64",
+"test_mul_int16",
+"test_mul_uint16",
+"test_mul_uint32",
+"test_mul_uint64",
+"test_div_int16",
+"test_div_uint16",
+"test_div_uint32",
+"test_div_uint64",
+"test_max_int16",
+"test_max_uint16",
+"test_max_uint32",
+"test_max_uint64",
+"test_min_int16",
+"test_min_uint16",
+"test_min_uint32",
+"test_min_uint64",
+"test_mod_mixed_sign_int16",
+"test_mod_uint16",
+"test_mod_uint32",
+"test_mod_uint64",
